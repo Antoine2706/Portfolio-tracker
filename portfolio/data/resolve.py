@@ -41,6 +41,7 @@ from __future__ import annotations
 import dataclasses
 import datetime as dt
 import enum
+from typing import Callable
 
 from ..core.models import Instrument
 from ..core.positions import (DEFAULT_FRESHNESS_BUSINESS_DAYS,
@@ -52,7 +53,8 @@ from .venues import (PRIMARY_VENUES, VenueClass, bloomberg_to_yahoo,
                      yahoo_suffix_to_mic)
 
 __all__ = ["Verdict", "Candidate", "Resolution", "resolve_isin",
-           "candidates_from_listings", "rank_candidates", "PREFERRED_CURRENCY"]
+           "resolve_from_listings", "candidates_from_listings", "rank_candidates",
+           "instrument_from_candidate", "PREFERRED_CURRENCY"]
 
 PREFERRED_CURRENCY = "EUR"
 
@@ -311,6 +313,42 @@ def rank_candidates(candidates: list[Candidate]) -> list[Candidate]:
 # The whole pipeline
 # --------------------------------------------------------------------------
 
+def resolve_from_listings(isin: str,
+                          listings: list[FigiListing],
+                          probe: "Callable[[str], ListingProbe]",
+                          lookback: int = DEFAULT_LOOKBACK,
+                          min_observations: int = MIN_OBSERVATIONS,
+                          max_candidates: int = 5,
+                          as_of: dt.date | None = None,
+                          max_stale_business_days: int = DEFAULT_FRESHNESS_BUSINESS_DAYS,
+                          ) -> Resolution:
+    """Steps 3-7 over listings already in hand, probing through `probe`.
+
+    Split out so a caching layer can supply cached listings and a cached probe
+    without importing private helpers. The filtering, gating and ranking stay
+    here, where they are tested; a caller that reimplemented them would be
+    exactly the logic leak this separation exists to prevent.
+    """
+    candidates, filtered = candidates_from_listings(isin, listings)
+    errors: list[str] = []
+    probed: list[Candidate] = []
+    for candidate in candidates:
+        try:
+            result = probe(candidate.yahoo_symbol)
+        except Exception as exc:
+            result = ListingProbe(symbol=candidate.yahoo_symbol, ok=False,
+                                  error=f"{type(exc).__name__}: {exc}")
+            errors.append(f"{candidate.yahoo_symbol}: {exc}")
+        probed.append(_apply_probe(candidate, result, lookback, min_observations,
+                                   as_of, max_stale_business_days))
+
+    refused = [c for c in probed if c.verdict is Verdict.REFUSED]
+    usable = rank_candidates([c for c in probed if c.verdict is not Verdict.REFUSED])
+    return Resolution(
+        isin=isin, candidates=usable[:max_candidates], refused=refused,
+        listings_seen=len(listings), filtered_by_class=filtered, errors=errors)
+
+
 def resolve_isin(isin: str,
                  identity: IdentityProvider,
                  prices: MarketDataProvider,
@@ -358,34 +396,13 @@ def resolve_isin(isin: str,
         return Resolution(isin=isin, candidates=[], refused=[],
                           errors=[f"{identity.name}: {type(exc).__name__}: {exc}"])
 
-    # Steps 3-4. Filter and translate.
-    candidates, filtered = candidates_from_listings(isin, listings)
-
-    # Step 5-6. Probe and gate. Probing costs a network call each, so only the
-    # already-filtered primary venues are probed -- typically a handful.
-    errors: list[str] = []
-    probed: list[Candidate] = []
-    for candidate in candidates:
-        try:
-            probe = prices.probe(candidate.yahoo_symbol, lookback)
-        except Exception as exc:
-            probe = ListingProbe(symbol=candidate.yahoo_symbol, ok=False,
-                                 error=f"{type(exc).__name__}: {exc}")
-            errors.append(f"{candidate.yahoo_symbol}: {exc}")
-        probed.append(_apply_probe(candidate, probe, lookback, min_observations,
-                                   as_of, max_stale_business_days))
-
-    refused = [c for c in probed if c.verdict is Verdict.REFUSED]
-    usable = rank_candidates([c for c in probed if c.verdict is not Verdict.REFUSED])
-
-    return Resolution(
-        isin=isin,
-        candidates=usable[:max_candidates],
-        refused=refused,
-        listings_seen=len(listings),
-        filtered_by_class=filtered,
-        errors=errors,
-    )
+    # Steps 3-7. Probing costs a network call each, so only the already-filtered
+    # primary venues are probed -- typically a handful.
+    return resolve_from_listings(
+        isin, listings, lambda symbol: prices.probe(symbol, lookback),
+        lookback=lookback, min_observations=min_observations,
+        max_candidates=max_candidates, as_of=as_of,
+        max_stale_business_days=max_stale_business_days)
 
 
 def instrument_from_candidate(candidate: Candidate, provider_name: str,

@@ -176,3 +176,26 @@ Rate limit, batch quote support, adjusted closes, and currency.
 
 That asymmetry is a finding in its own right, and it is the reason yfinance is
 treated as a coverage benchmark rather than assumed to be the production pick.
+
+---
+
+## Running the application
+
+```bash
+pip install -e ".[app,data,test]"
+streamlit run portfolio/app/main.py
+```
+
+Starts in **demo mode** on the seed data. Switch to your own data with the
+sidebar radio, or `PORTFOLIO_DATA_MODE=user`.
+
+Tests:
+
+```bash
+python -m pytest --ignore=portfolio/tests/test_app_smoke.py   # 345, no streamlit needed
+python -m pytest                                              # 356, includes UI smoke
+```
+
+The UI smoke tests take ~3 minutes because yfinance retries against a network
+it cannot reach; they are worth the wait, since they are what caught the FX
+failure that blanked the Holdings view.

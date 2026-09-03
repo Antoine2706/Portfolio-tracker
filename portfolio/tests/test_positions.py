@@ -204,3 +204,62 @@ class TestIncomeAndFees:
         p = derive_positions(txns)[A]
         assert p.realised_pnl == Money(Decimal("-12.00"), "EUR")
         assert p.cost_basis.amount == Decimal("100"), "a fee is not part of unit cost"
+
+
+class TestPartialDerivation:
+    """One unreachable FX rate must not blank a portfolio that is mostly EUR.
+
+    `core.money` still refuses to invent a rate -- that refusal is the point.
+    `strict` only decides how far it propagates.
+    """
+
+    GBP = "IE000IAXNM41"
+
+    def _ledger(self):
+        return [
+            Transaction(D(2025, 1, 10), A, T.BUY, Decimal("100"), Decimal("10"), "EUR"),
+            Transaction(D(2025, 5, 20), self.GBP, T.BUY, Decimal("90"),
+                        Decimal("742.50"), "GBp"),
+            Transaction(D(2025, 7, 1), self.GBP, T.SELL, Decimal("30"),
+                        Decimal("800.00"), "GBp"),
+        ]
+
+    def test_strict_still_raises(self):
+        with pytest.raises(Exception):
+            derive_positions(self._ledger(), rates=FxTable())
+
+    def test_non_strict_isolates_the_failure(self):
+        pos = derive_positions(self._ledger(), rates=FxTable(), strict=False)
+        assert pos[A].is_derivable
+        assert not pos[self.GBP].is_derivable
+
+    def test_unaffected_holding_is_still_fully_derived(self):
+        pos = derive_positions(self._ledger(), rates=FxTable(), strict=False)
+        assert pos[A].cost_basis == Money(Decimal("1000"), "EUR")
+
+    def test_quantity_survives_a_missing_rate(self):
+        """Quantity needs no conversion. Losing it would make the position read
+        as closed and vanish from the table -- a worse failure than the one
+        being handled."""
+        pos = derive_positions(self._ledger(), rates=FxTable(), strict=False)
+        assert pos[self.GBP].quantity == Decimal("60")
+        assert pos[self.GBP].is_open
+
+    def test_the_error_names_the_missing_pair(self):
+        pos = derive_positions(self._ledger(), rates=FxTable(), strict=False)
+        assert "GBP->EUR" in pos[self.GBP].error
+
+    def test_money_fields_are_not_shown_as_zero_facts(self):
+        pos = derive_positions(self._ledger(), rates=FxTable(), strict=False)
+        assert pos[self.GBP].cost_basis.amount == 0
+        assert not pos[self.GBP].is_derivable, "zero must be readable as 'unknown'"
+
+    def test_a_genuine_ledger_error_still_raises_even_when_not_strict(self):
+        """Overselling is a bug in the data, not a transient provider problem,
+        so it must not be swallowed by the same mechanism."""
+        bad = [
+            Transaction(D(2025, 1, 1), A, T.BUY, Decimal("10"), Decimal("10"), "EUR"),
+            Transaction(D(2025, 2, 1), A, T.SELL, Decimal("11"), Decimal("10"), "EUR"),
+        ]
+        with pytest.raises(InsufficientUnits):
+            derive_positions(bad, strict=False)

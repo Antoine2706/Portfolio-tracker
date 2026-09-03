@@ -22,6 +22,7 @@ import pytest
 
 CORE = pathlib.Path(__file__).resolve().parents[1] / "core"
 DATA = pathlib.Path(__file__).resolve().parents[1] / "data"
+APP = pathlib.Path(__file__).resolve().parents[1] / "app"
 
 FORBIDDEN_IN_CORE = {
     "streamlit",            # the UI layer must be replaceable
@@ -98,6 +99,47 @@ def test_core_imports_with_streamlit_unavailable():
     assert result.returncode == 0, (
         f"core/ failed to import without Streamlit:\n{result.stderr}")
     assert "core imported cleanly" in result.stdout
+
+
+# The other direction, and the one that actually erodes. The AST guard above
+# stops core importing UI; nothing stops arithmetic drifting into a view, where
+# it would be untested and invisible. This is a partial defence -- pandas is
+# allowed because building a display frame needs it -- so the real protection is
+# that core.report leaves views nothing to compute.
+FORBIDDEN_IN_APP = {
+    "numpy",        # the maths library: a view has no business importing it
+    "scipy",
+    "statistics",
+}
+
+APP_FILES = sorted(APP.rglob("*.py"))
+
+
+def test_app_has_modules_to_check():
+    assert APP_FILES, "no app modules found; the guard would pass vacuously"
+
+
+@pytest.mark.parametrize("path", APP_FILES, ids=lambda p: p.name)
+def test_app_does_not_import_maths_libraries(path):
+    offenders = imported_modules(path) & FORBIDDEN_IN_APP
+    assert not offenders, (
+        f"{path.name} imports {sorted(offenders)}. Views render; they do not "
+        f"compute. Move the calculation into core/ with a test.")
+
+
+@pytest.mark.parametrize("path", APP_FILES, ids=lambda p: p.name)
+def test_app_does_not_reach_into_private_helpers(path):
+    """A view importing a private function is logic leaking out of its module."""
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    private: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name.startswith("_"):
+                    private.add(alias.name)
+    assert not private, (
+        f"{path.name} imports private {sorted(private)}. If a view needs it, "
+        f"it belongs in the module's public interface.")
 
 
 def test_data_layer_may_use_the_network_but_core_may_not():

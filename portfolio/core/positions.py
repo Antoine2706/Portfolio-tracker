@@ -130,6 +130,14 @@ class Position:
     quote: PriceQuote | None = None
     instrument: Instrument | None = None
     transaction_count: int = 0
+    # Set when this position could not be fully derived -- currently only when
+    # an FX rate was unavailable. Quantity is still correct; the money fields
+    # are not, and must not be displayed as though they were.
+    error: str | None = None
+
+    @property
+    def is_derivable(self) -> bool:
+        return self.error is None
 
     @property
     def is_open(self) -> bool:
@@ -216,12 +224,24 @@ def derive_positions(transactions: list[Transaction],
                      instruments: dict[str, Instrument] | None = None,
                      rates: FxRates | None = None,
                      quotes: dict[str, PriceQuote] | None = None,
-                     base: str = BASE_CURRENCY) -> dict[str, Position]:
+                     base: str = BASE_CURRENCY,
+                     strict: bool = True) -> dict[str, Position]:
     """Replay the ledger into positions, oldest first.
 
     Instruments with no transactions are returned as empty positions rather
     than omitted -- that is the watchlist, and dropping them would hide exactly
     the instruments the what-if simulator needs.
+
+    `strict` controls what happens when one instrument cannot be derived, which
+    in practice means a missing FX rate. Strict raises, which is right for
+    tests and for any caller that needs a complete answer. Non-strict isolates
+    the failure: that instrument gets its `error` set and its money fields left
+    at zero, and every other holding still derives.
+
+    The distinction matters because an FX provider being unreachable should not
+    blank a portfolio that is mostly EUR. What it must never do is guess a rate
+    -- `core.money` raises rather than defaulting to parity, and this only
+    decides how far that refusal propagates.
     """
     instruments = instruments or {}
     quotes = quotes or {}
@@ -237,40 +257,72 @@ def derive_positions(transactions: list[Transaction],
     for isin, txns in by_isin.items():
         pos = positions.setdefault(isin, Position(isin=isin,
                                                   instrument=instruments.get(isin)))
-        for t in sorted(txns, key=lambda x: (x.date, x.id)):
-            pos.transaction_count += 1
-            fees_base = _to_base(t.fee_money, t.date, rates, base)
-            pos.fees_paid = pos.fees_paid + fees_base
-
-            if t.type is TransactionType.BUY:
-                gross_base = _to_base(t.gross, t.date, rates, base)
-                # Fees are capitalised into the basis: they are part of what the
-                # units cost you, and excluding them overstates every gain.
-                pos.cost_basis = pos.cost_basis + gross_base + fees_base
-                pos.quantity += t.quantity
-
-            elif t.type is TransactionType.SELL:
-                proceeds_base = _to_base(t.gross, t.date, rates, base)
-                _apply_sell(pos, t.quantity, proceeds_base, fees_base)
-
-            elif t.type is TransactionType.DIVIDEND:
-                gross = t.gross
-                if gross.amount == 0:
-                    gross = Money(t.price_per_unit, t.currency)
-                pos.dividends = pos.dividends + _to_base(gross, t.date, rates, base) - fees_base
-
-            elif t.type is TransactionType.FEE:
-                charge = _to_base(t.gross, t.date, rates, base)
-                pos.realised_pnl = pos.realised_pnl - fees_base - charge
-
+        try:
+            _replay(pos, txns, rates, base)
+        except (ValueError, LookupError) as exc:
+            if strict or isinstance(exc, InsufficientUnits):
+                raise
+            # Quantity needs no conversion, so derive it separately rather
+            # than keeping whatever the aborted replay left behind. Without
+            # this the position reads as closed and disappears from the table,
+            # which is a worse failure than the one being handled.
+            positions[isin] = Position(
+                isin=isin, quantity=_quantity_only(txns),
+                instrument=instruments.get(isin),
+                transaction_count=len(txns), error=str(exc))
         q = quotes.get(isin)
         if q is not None:
-            pos.quote = q
+            positions[isin].quote = q
 
     for isin, q in quotes.items():
         if isin in positions and positions[isin].quote is None:
             positions[isin].quote = q
     return positions
+
+
+def _quantity_only(txns: list[Transaction]) -> Decimal:
+    """Units held, ignoring money entirely.
+
+    Quantity is FX-free, so it survives a missing rate. Deriving it separately
+    is what keeps an unconvertible holding visible instead of reading as closed.
+    """
+    quantity = Decimal("0")
+    for t in sorted(txns, key=lambda x: (x.date, x.id)):
+        if t.type is TransactionType.BUY:
+            quantity += t.quantity
+        elif t.type is TransactionType.SELL:
+            quantity -= t.quantity
+    return quantity
+
+
+def _replay(pos: Position, txns: list[Transaction], rates: FxRates | None,
+            base: str) -> None:
+    """Apply one instrument's transactions to its position, in date order."""
+    for t in sorted(txns, key=lambda x: (x.date, x.id)):
+        pos.transaction_count += 1
+        fees_base = _to_base(t.fee_money, t.date, rates, base)
+        pos.fees_paid = pos.fees_paid + fees_base
+
+        if t.type is TransactionType.BUY:
+            gross_base = _to_base(t.gross, t.date, rates, base)
+            # Fees are capitalised into the basis: they are part of what the
+            # units cost you, and excluding them overstates every gain.
+            pos.cost_basis = pos.cost_basis + gross_base + fees_base
+            pos.quantity += t.quantity
+
+        elif t.type is TransactionType.SELL:
+            proceeds_base = _to_base(t.gross, t.date, rates, base)
+            _apply_sell(pos, t.quantity, proceeds_base, fees_base)
+
+        elif t.type is TransactionType.DIVIDEND:
+            gross = t.gross
+            if gross.amount == 0:
+                gross = Money(t.price_per_unit, t.currency)
+            pos.dividends = pos.dividends + _to_base(gross, t.date, rates, base) - fees_base
+
+        elif t.type is TransactionType.FEE:
+            charge = _to_base(t.gross, t.date, rates, base)
+            pos.realised_pnl = pos.realised_pnl - fees_base - charge
 
 
 def total_market_value(positions: dict[str, Position], rates: FxRates | None = None,
