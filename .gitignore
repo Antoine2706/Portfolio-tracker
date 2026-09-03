@@ -1,5 +1,8 @@
-# User data: transactions and instrument reference data are personal.
-data_store/
+# User data: real instruments and the real ledger. Never committed.
+# Seed data under data_store/seed/ IS committed -- it is the demo and test
+# fixture, and it is synthetic.
+portfolio/data_store/user/
+data_store/user/
 
 # Spike output: raw provider responses, may contain account-shaped metadata
 # and is regenerated on every run.
