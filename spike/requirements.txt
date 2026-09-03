@@ -1,0 +1,3 @@
+# Phase 0 spike only. Not the application's dependencies.
+requests>=2.31
+yfinance>=0.2.40

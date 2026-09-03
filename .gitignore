@@ -1,0 +1,14 @@
+# User data: transactions and instrument reference data are personal.
+data_store/
+
+# Spike output: raw provider responses, may contain account-shaped metadata
+# and is regenerated on every run.
+spike/results/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+.DS_Store
