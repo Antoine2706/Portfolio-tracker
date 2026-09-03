@@ -2,47 +2,51 @@
 """
 Phase 0 provider spike.
 
-Question this script answers: which market data provider can actually serve
-MY instruments -- small, European-listed, thematic UCITS ETFs and commodity
-ETCs -- with both a current quote and two years of daily history?
+The question: which market data provider can serve MY instruments -- small,
+European-listed, thematic UCITS ETFs and USD-denominated commodity ETCs -- with
+a current quote and two years of daily history, keyed on ISIN?
 
-Design notes (read these before the code):
+This is not production code. It imports nothing from the `portfolio` package,
+because that package does not exist yet and its provider interface should be
+designed from these results rather than ahead of them.
 
-1. This file is deliberately standalone and throwaway. It imports nothing from
-   the `portfolio` package, because the package does not exist yet and its
-   provider interface should be designed AFTER we see these results, not
-   before. Nothing here is production code.
+Five checks, not one. Coverage is only the first.
 
-2. The real output is not the pass/fail matrix alone. It is the resolved
-   symbol per provider per instrument -- the `provider_symbols` mapping that
-   the Instrument model needs. A provider that "works" but only by us guessing
-   the right exchange suffix by hand is a provider that will silently break.
+  1. COVERAGE     Quote + >=400 trading days for each of the ten instruments,
+                  resolved from its ISIN. Reported separately for ETFs and
+                  ETCs, because ETCs are collateralised notes rather than UCITS
+                  funds and several providers classify or omit them differently.
 
-3. Ticker collisions are the main hazard and this script treats them as such.
-   `WEAT` is WisdomTree Wheat in London and Teucrium Wheat Fund in New York.
-   `NATO` is a European defence ETF and also a US-listed product. A provider
-   that answers a bare ticker with the wrong listing is worse than a provider
-   that answers nothing, because it fails silently. So every resolution is
-   checked against the expected currency and an allowlist of European
-   exchanges, and anything else is reported as SUSPECT, never as PASS.
+  2. IDENTITY     Every symbol of an instrument must resolve to that
+                  instrument's ISIN. WDEF and EUDF are one fund. A provider
+                  that answers them with two different instruments has exactly
+                  the failure the ISIN-as-primary-key rule exists to prevent,
+                  and it is invisible unless you test for it.
 
-4. Where a provider has its own search endpoint we use it, because that is the
-   mechanism the production code will use to resolve ISIN -> provider symbol.
-   Yahoo has no such endpoint, so for yfinance we brute-force exchange
-   suffixes. That asymmetry is itself a finding worth seeing.
+  3. COLLISION    Five of these tickers collide with real US-listed products.
+                  We ask each provider for the bare ticker, the way a naive
+                  lookup would, and report the ISIN and exchange it hands back.
+                  WDEF is the dangerous case: same issuer, same theme, same
+                  ticker, different fund.
 
-5. Every raw response is written to spike/results/ as JSON. Free tiers have
-   daily caps; re-running the script to re-read a number you already fetched
-   is how you lose a day of quota. Use --offline to re-print the matrix from
-   the last run without touching the network.
+  4. LIVENESS     Two of these funds have liquidated predecessors still present
+                  in fund databases. Returning nothing is the correct answer. A
+                  provider that returns recent-looking history for a dead ISIN
+                  is serving stale data and is disqualified.
+
+  5. MECHANICS    Rate limit, batch quote support, adjusted closes, and base
+                  versus quote currency -- reported separately, because seven
+                  of these ten quote in a currency other than their base.
 
 Usage:
-    export TWELVEDATA_API_KEY=...      # optional, skipped if absent
-    export FMP_API_KEY=...             # optional, skipped if absent
-    export EODHD_API_KEY=...           # optional, skipped if absent
+    export TWELVEDATA_API_KEY=...      # optional; unkeyed providers are skipped
+    export FMP_API_KEY=...
+    export EODHD_API_KEY=...
+
     python spike/check_providers.py
-    python spike/check_providers.py --providers yfinance,twelvedata
-    python spike/check_providers.py --offline
+    python spike/check_providers.py --providers yfinance
+    python spike/check_providers.py --checks coverage,collision
+    python spike/check_providers.py --offline        # replay, spends no quota
 """
 
 from __future__ import annotations
@@ -55,111 +59,72 @@ import os
 import pathlib
 import sys
 import time
-from typing import Any, Callable, Iterable
+from typing import Any, Callable
 
 try:
     import requests
-except ImportError:  # pragma: no cover - spike script, fail loudly
-    sys.exit("pip install requests")
+except ImportError:  # pragma: no cover
+    sys.exit("pip install -r spike/requirements.txt")
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
+from instruments import (  # noqa: E402
+    BY_ISIN, COLLISIONS, DEAD_INSTRUMENTS, DEAD_LINE_STALE_DAYS, INSTRUMENTS,
+    VENUES, Collision, DeadInstrument, Listing, TestInstrument, alias_groups,
+)
 
 HERE = pathlib.Path(__file__).resolve().parent
 RESULTS_DIR = HERE / "results"
 RESULTS_DIR.mkdir(exist_ok=True)
 
 HISTORY_YEARS = 2
-# 2 years of European trading days is roughly 510. We call history a PASS at
-# 400+, which tolerates a listing that is a few months short of two full years
-# without tolerating a provider that hands back a stub of 30 rows.
+# ~510 European trading days in two years. 400 tolerates a listing a few months
+# short of two years without tolerating a 30-row stub.
 MIN_HISTORY_DAYS_PASS = 400
-# The covariance floor from the spec. Below this an instrument cannot enter the
-# risk model at all, so it is the hard fail line.
+# The covariance floor from the spec: below this an instrument cannot enter the
+# risk model at all.
 MIN_HISTORY_DAYS_USABLE = 60
 
-# Currencies and exchanges we expect to see for European listings. Anything
-# outside these sets means we probably resolved to a US ticker of the same
-# name, which is the failure mode this whole spike exists to catch.
-EXPECTED_CURRENCIES = {"EUR", "GBP", "GBp", "GBX", "CHF", "USD"}
-EUROPEAN_EXCHANGE_HINTS = {
-    "XETRA", "XETR", "GER", "FRA", "F", "DE", "DEU", "STU", "MUN", "BER", "DUS",
-    "HAM", "GETTEX", "EUR", "AMS", "AS", "EURONEXT", "XAMS", "PAR", "PA", "XPAR",
-    "MIL", "MI", "MTA", "XMIL", "BIT", "ETFPLUS", "LSE", "L", "LON", "XLON",
-    "SIX", "SW", "EBS", "VTX", "MAD", "BME", "STO", "CPH", "OSL", "VIE", "BRU",
-    "LIS", "IOB",
+US_EXCHANGE_MARKERS = {
+    "NYSE", "NASDAQ", "NMS", "NYQ", "NGM", "NCM", "ARCA", "PCX", "BATS",
+    "AMEX", "ASE", "US", "USA", "NYSEARCA", "CBOE",
 }
-# Currency of the *listing* we expect. USD is legitimate for some London-listed
-# commodity ETCs, so it is allowed above -- but a USD price on a US exchange is
-# not, and the exchange check catches that.
-US_EXCHANGE_MARKERS = {"NYSE", "NASDAQ", "NMS", "NYQ", "ARCA", "PCX", "BATS", "AMEX", "US"}
+EUROPEAN_MICS = set(VENUES)
+EUROPEAN_EXCHANGE_HINTS = {
+    "XETRA", "XETR", "GER", "FRA", "F", "DE", "DEU", "STU", "MUN", "BER",
+    "DUS", "HAM", "GETTEX", "AMS", "AS", "EURONEXT", "XAMS", "PAR", "PA",
+    "XPAR", "MIL", "MI", "MTA", "XMIL", "BIT", "ETFPLUS", "LSE", "L", "LON",
+    "XLON", "SIX", "SW", "EBS", "VTX", "SWX", "XSWX", "IOB", "MU", "XMUN",
+} | EUROPEAN_MICS
 
 
-# --------------------------------------------------------------------------
-# Instruments under test
-# --------------------------------------------------------------------------
+# ==========================================================================
+# Shared records
+# ==========================================================================
 
-@dataclasses.dataclass(frozen=True)
-class TestInstrument:
-    """One instrument to probe.
+@dataclasses.dataclass
+class Resolution:
+    """What a provider says an identifier refers to, before we fetch anything."""
+    symbol: str | None = None
+    exchange: str | None = None
+    currency: str | None = None
+    isin: str | None = None
+    name: str | None = None
+    method: str | None = None       # "isin" | "symbol-search" | "listing"
+    note: str | None = None
 
-    `isin` is intentionally optional and empty by default. I will not invent
-    ISINs: a wrong ISIN in the primary key column is a bug that propagates into
-    every later stage. Fill these in from your broker statement and the
-    ISIN-based resolution paths below start working -- they are already
-    implemented and will be exercised the moment an ISIN is present.
-    """
-    key: str                 # short internal label used in the matrix
-    name: str
-    ticker_hint: str
-    asset_class: str         # equity_etf | commodity_etc
-    isin: str = ""
-    # Exchange suffixes worth trying first for this instrument, most likely
-    # first. Used only by providers without a search endpoint (i.e. Yahoo).
-    suffix_hints: tuple[str, ...] = ()
-
-
-# Suffix orderings below are guesses about likely home listings, not
-# assertions. The script tries the full fallback list either way; the hint only
-# changes the order, which matters because we stop at the first good hit and
-# that saves quota.
-DEFAULT_SUFFIXES = (".DE", ".MI", ".AS", ".L", ".PA", ".SW", ".F", "")
-
-INSTRUMENTS: tuple[TestInstrument, ...] = (
-    TestInstrument("WDEF", "WisdomTree Europe Defence", "WDEF", "equity_etf",
-                   suffix_hints=(".DE", ".MI", ".L", ".AS")),
-    TestInstrument("DFEU", "iShares Europe Defence", "DFEU", "equity_etf",
-                   suffix_hints=(".DE", ".AS", ".MI", ".L")),
-    TestInstrument("ARMY", "Global defence exposure (ARMY)", "ARMY", "equity_etf",
-                   suffix_hints=(".DE", ".MI", ".L", ".AS")),
-    TestInstrument("NATO", "Global defence exposure (NATO)", "NATO", "equity_etf",
-                   suffix_hints=(".DE", ".MI", ".L", ".AS")),
-    TestInstrument("EUDF", "Global defence exposure (EUDF)", "EUDF", "equity_etf",
-                   suffix_hints=(".DE", ".MI", ".L", ".AS")),
-    TestInstrument("ISAG", "iShares Agribusiness", "ISAG", "equity_etf",
-                   suffix_hints=(".L", ".DE", ".AS", ".MI")),
-    TestInstrument("AIGG", "WisdomTree Grains", "AIGG", "commodity_etc",
-                   suffix_hints=(".L", ".MI", ".DE")),
-    TestInstrument("WEAT", "WisdomTree Wheat", "WEAT", "commodity_etc",
-                   suffix_hints=(".L", ".MI", ".DE")),
-    TestInstrument("AIGE", "WisdomTree Agriculture", "AIGE", "commodity_etc",
-                   suffix_hints=(".L", ".MI", ".DE")),
-    TestInstrument("ESIE", "Energy thematic (ESIE)", "ESIE", "equity_etf",
-                   suffix_hints=(".DE", ".MI", ".AS", ".L")),
-    TestInstrument("GLUX", "Amundi Global Luxury", "GLUX", "equity_etf",
-                   suffix_hints=(".MI", ".DE", ".PA", ".L")),
-)
-
-
-# --------------------------------------------------------------------------
-# Result record
-# --------------------------------------------------------------------------
 
 @dataclasses.dataclass
 class Probe:
+    """One instrument, one provider, all five checks' worth of evidence."""
     provider: str
-    instrument: str
+    isin: str
+    name: str = ""
+    asset_class: str = ""
+    base_currency: str = ""
 
     quote_ok: bool = False
     quote_price: float | None = None
+    quote_currency: str | None = None
     quote_timestamp: str | None = None
     observed_staleness_minutes: float | None = None
 
@@ -167,11 +132,13 @@ class Probe:
     history_days: int = 0
     first_date: str | None = None
     last_date: str | None = None
+    adjusted_close_available: bool | None = None
 
-    currency: str | None = None
-    exchange: str | None = None
     resolved_symbol: str | None = None
-    resolution_method: str | None = None   # "search" | "suffix" | "isin"
+    resolved_exchange: str | None = None
+    resolved_isin: str | None = None
+    resolution_method: str | None = None
+    isin_check: str = "unavailable"      # match | mismatch | unavailable
 
     suspect: bool = False
     suspect_reason: str | None = None
@@ -179,11 +146,10 @@ class Probe:
 
     @property
     def verdict(self) -> str:
-        """Three-state verdict.
+        """SUSPECT deliberately outranks PASS.
 
-        SUSPECT deliberately outranks PASS: data that arrived from the wrong
-        listing is a worse outcome than no data, so it must never be counted
-        as a pass in the summary.
+        Data from the wrong listing is worse than no data: it is confidently
+        wrong and it fails silently. It must never be counted as coverage.
         """
         if self.suspect:
             return "SUSPECT"
@@ -193,43 +159,57 @@ class Probe:
             return "PARTIAL"
         return "FAIL"
 
-    def flag_suspect(self, reason: str) -> None:
+    def flag(self, reason: str) -> None:
         self.suspect = True
         self.suspect_reason = reason
 
 
-def check_listing_plausible(probe: Probe, expected_european: bool = True) -> None:
-    """Reject a resolution that looks like the wrong listing.
-
-    This is the ISIN-is-the-primary-key constraint expressed as a runtime
-    check. We cannot verify the ISIN without one on file, so we verify the next
-    best thing: that the exchange we got back is a European one.
-    """
-    if not expected_european:
-        return
-    exch = (probe.exchange or "").upper()
-    if not exch:
-        return
-    tokens = {t for t in exch.replace("/", " ").replace("-", " ").split()} | {exch}
-    if tokens & US_EXCHANGE_MARKERS:
-        probe.flag_suspect(
-            f"resolved to a US listing ({probe.exchange}); "
-            f"likely a different fund sharing the ticker"
-        )
-        return
-    if not (tokens & EUROPEAN_EXCHANGE_HINTS):
-        probe.flag_suspect(f"unrecognised exchange {probe.exchange!r}; verify by hand")
+@dataclasses.dataclass
+class AliasResult:
+    provider: str
+    isin: str
+    symbol: str
+    resolved_isin: str | None
+    resolved_exchange: str | None
+    agrees: bool
+    note: str = ""
 
 
-# --------------------------------------------------------------------------
-# HTTP helper
-# --------------------------------------------------------------------------
+@dataclasses.dataclass
+class CollisionResult:
+    provider: str
+    symbol: str
+    expected_isin: str
+    us_name: str
+    naive_isin: str | None = None
+    naive_symbol: str | None = None
+    naive_exchange: str | None = None
+    naive_currency: str | None = None
+    outcome: str = "unknown"      # correct | wrong-fund | ambiguous | no-answer
+    note: str = ""
 
-def get_json(url: str, params: dict[str, Any] | None = None, timeout: int = 25) -> tuple[int, Any]:
-    """One place for every HTTP call so throttling and errors are uniform."""
+
+@dataclasses.dataclass
+class LivenessResult:
+    provider: str
+    dead_isin: str
+    shadows_isin: str
+    resolved_symbol: str | None = None
+    history_days: int = 0
+    last_date: str | None = None
+    outcome: str = "unknown"      # correct-dead | serving-stale | ambiguous | no-answer
+    note: str = ""
+
+
+# ==========================================================================
+# HTTP
+# ==========================================================================
+
+def get_json(url: str, params: dict[str, Any] | None = None,
+             timeout: int = 25) -> tuple[int, Any]:
     try:
         resp = requests.get(url, params=params, timeout=timeout,
-                            headers={"User-Agent": "portfolio-tracker-spike/0.1"})
+                            headers={"User-Agent": "portfolio-tracker-spike/0.2"})
     except requests.RequestException as exc:
         return 0, {"_transport_error": str(exc)}
     try:
@@ -238,24 +218,43 @@ def get_json(url: str, params: dict[str, Any] | None = None, timeout: int = 25) 
         return resp.status_code, {"_non_json_body": resp.text[:400]}
 
 
-def days_between(first: str, last: str) -> int:
+def looks_us(exchange: str | None) -> bool:
+    if not exchange:
+        return False
+    e = exchange.upper()
+    tokens = set(e.replace("/", " ").replace("-", " ").split()) | {e}
+    return bool(tokens & US_EXCHANGE_MARKERS)
+
+
+def looks_european(exchange: str | None) -> bool:
+    if not exchange:
+        return False
+    e = exchange.upper()
+    tokens = set(e.replace("/", " ").replace("-", " ").split()) | {e}
+    return bool(tokens & EUROPEAN_EXCHANGE_HINTS)
+
+
+def days_ago(iso_date: str | None) -> int | None:
+    if not iso_date:
+        return None
     try:
-        a = dt.date.fromisoformat(first[:10])
-        b = dt.date.fromisoformat(last[:10])
-        return (b - a).days
-    except Exception:
-        return 0
+        return (dt.date.today() - dt.date.fromisoformat(iso_date[:10])).days
+    except ValueError:
+        return None
 
 
-# --------------------------------------------------------------------------
+# ==========================================================================
 # Provider probes
-# --------------------------------------------------------------------------
+# ==========================================================================
 
 class ProviderProbe:
+    """Four primitives, and every check is built from them.
+
+    Splitting resolution from fetching is what makes the identity, collision
+    and liveness checks possible at all: they need to ask "what does this
+    provider *think* this identifier is" without paying for a price series.
+    """
     name = "abstract"
-    # These two fields are the second half of the Phase 0 question. Batching
-    # changes the caching design entirely: with batch quotes you cache one
-    # response per portfolio refresh, without them one per instrument.
     documented_rate_limit = "unknown"
     batch_quotes = "unknown"
     documented_delay = "unknown"
@@ -265,41 +264,54 @@ class ProviderProbe:
         return True, ""
 
     def measure_limits(self) -> dict[str, Any]:
-        """Ask the provider what our actual limits are, where it exposes that.
-
-        Documented limits go stale. A live usage endpoint is evidence.
-        """
         return {}
 
-    def probe(self, inst: TestInstrument) -> Probe:
+    def resolve_isin(self, isin: str) -> Resolution | None:
+        """The production path: ISIN in, provider symbol out."""
+        return None
+
+    def resolve_symbol_naive(self, symbol: str) -> Resolution | None:
+        """A bare ticker lookup with no venue hint, taking the provider's own
+        top answer without our re-ranking. This is the collision test: it
+        measures what you get if you trust the ticker, which is what a design
+        keyed on ticker would do."""
+        return None
+
+    def fetch(self, probe: Probe, symbol: str, listing: Listing | None) -> None:
+        """Populate quote and history fields on `probe` for a resolved symbol."""
         raise NotImplementedError
+
+    def provider_symbol(self, symbol: str, listing: Listing) -> str:
+        """Translate (symbol, venue) into this provider's symbol form."""
+        return symbol
 
     def throttle(self) -> None:
         if self.seconds_between_calls:
             time.sleep(self.seconds_between_calls)
 
 
+# --------------------------------------------------------------------------
+
 class YFinanceProbe(ProviderProbe):
     """yfinance -- the coverage benchmark, not necessarily the production pick.
 
-    Judgement call: I use the yfinance library rather than hand-rolling calls to
-    Yahoo's chart endpoint, because yfinance handles the cookie/crumb dance
-    that Yahoo now requires and that changes every few months. The alternative I
-    rejected was raw requests against query1.finance.yahoo.com: fewer
-    dependencies, but it breaks the week Yahoo changes auth, which defeats the
-    purpose of using it as a stable benchmark.
+    Judgement call: the yfinance library rather than raw requests against
+    Yahoo's chart endpoint. Rejected alternative: fewer dependencies, but Yahoo's
+    cookie/crumb auth changes every few months, and a benchmark that breaks is
+    not a benchmark. The cost is a dependency that is itself unofficial.
 
-    Yahoo has no usable symbol-search API for this purpose, so resolution here
-    is brute-force over exchange suffixes. That is a real cost: it is N calls
-    per instrument instead of one, and it is why yfinance being "free" is
-    misleading.
+    Yahoo has no dependable ISIN search, so resolution here works the other way
+    round: we build candidate symbols from the verified listing table and use
+    `Ticker.isin` to *verify* rather than to discover. That asymmetry is a real
+    finding -- it means yfinance can never resolve an instrument we have not
+    already catalogued by hand.
     """
     name = "yfinance"
-    documented_rate_limit = ("undocumented and unofficial; soft-throttled by IP, "
+    documented_rate_limit = ("undocumented, unofficial; IP soft-throttled, "
                              "roughly a few hundred requests/hour before 429s")
-    batch_quotes = ("yes for history via yf.download([...]) in one call; "
-                    "quotes via yf.Tickers are looped internally, not truly batched")
-    documented_delay = "15 minutes for most European exchanges (Yahoo does not state it per-call)"
+    batch_quotes = ("history yes, via yf.download([...]) in one call; "
+                    "quotes no -- yf.Tickers loops internally")
+    documented_delay = "~15 min on European venues; Yahoo does not state it per-call"
     seconds_between_calls = 0.4
 
     def available(self) -> tuple[bool, str]:
@@ -309,86 +321,100 @@ class YFinanceProbe(ProviderProbe):
             return False, "pip install yfinance"
         return True, ""
 
-    def probe(self, inst: TestInstrument) -> Probe:
-        import yfinance as yf
+    def provider_symbol(self, symbol: str, listing: Listing) -> str:
+        return f"{symbol}{listing.venue.yahoo_suffix}"
 
-        p = Probe(self.name, inst.key)
-        suffixes = list(dict.fromkeys(inst.suffix_hints + DEFAULT_SUFFIXES))
-        start = (dt.date.today() - dt.timedelta(days=365 * HISTORY_YEARS + 10)).isoformat()
-
-        best: tuple[int, str, Any] | None = None
-        for suffix in suffixes:
-            symbol = f"{inst.ticker_hint}{suffix}"
-            self.throttle()
-            try:
-                ticker = yf.Ticker(symbol)
-                hist = ticker.history(start=start, interval="1d", auto_adjust=False)
-            except Exception as exc:
-                p.errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
-                continue
-            if hist is None or hist.empty:
-                continue
-            n = len(hist)
-            # Keep the listing with the most history: for a fund cross-listed on
-            # several exchanges, the deepest series is the one worth using.
-            if best is None or n > best[0]:
-                best = (n, symbol, (ticker, hist))
-            if n >= MIN_HISTORY_DAYS_PASS:
-                break
-
-        if best is None:
-            p.errors.append("no suffix returned any history")
-            return p
-
-        n, symbol, (ticker, hist) = best
-        p.resolved_symbol = symbol
-        p.resolution_method = "suffix"
-        p.history_ok = n >= MIN_HISTORY_DAYS_PASS
-        p.history_days = n
-        p.first_date = str(hist.index[0].date())
-        p.last_date = str(hist.index[-1].date())
-
-        # We ask for auto_adjust=False above and check that an adjusted column
-        # exists, because the risk maths must run on adjusted closes. A provider
-        # that only offers raw closes will corrupt every return around a
-        # distribution, and these ETCs distribute.
-        if "Adj Close" not in hist.columns:
-            p.errors.append("no 'Adj Close' column -- returns would be corrupted by distributions")
-
+    def _isin_of(self, ticker: Any) -> str | None:
         try:
-            info = ticker.fast_info
-            p.currency = getattr(info, "currency", None)
-            p.exchange = getattr(info, "exchange", None)
+            val = ticker.isin
+        except Exception:
+            return None
+        if isinstance(val, str) and len(val) == 12 and val not in {"-", "N/A"}:
+            return val.upper()
+        return None
+
+    def resolve_isin(self, isin: str) -> Resolution | None:
+        import yfinance as yf
+        search = getattr(yf, "Search", None)
+        if search is None:
+            return Resolution(method="isin", note="yfinance build has no Search API")
+        self.throttle()
+        try:
+            quotes = search(isin, max_results=10).quotes or []
+        except Exception as exc:
+            return Resolution(method="isin", note=f"{type(exc).__name__}: {exc}")
+        if not quotes:
+            return None
+        top = quotes[0]
+        return Resolution(symbol=top.get("symbol"), exchange=top.get("exchange"),
+                          currency=top.get("currency"), name=top.get("shortname"),
+                          method="isin")
+
+    def resolve_symbol_naive(self, symbol: str) -> Resolution | None:
+        import yfinance as yf
+        self.throttle()
+        try:
+            t = yf.Ticker(symbol)          # bare ticker: Yahoo picks the venue
+            info = t.fast_info
+            exch = getattr(info, "exchange", None)
+            ccy = getattr(info, "currency", None)
+            price = getattr(info, "last_price", None)
+            if exch is None and price is None:
+                return None
+            return Resolution(symbol=symbol, exchange=exch, currency=ccy,
+                              isin=self._isin_of(t), method="symbol-search")
+        except Exception as exc:
+            return Resolution(method="symbol-search", note=f"{type(exc).__name__}: {exc}")
+
+    def fetch(self, probe: Probe, symbol: str, listing: Listing | None) -> None:
+        import yfinance as yf
+        start = (dt.date.today() - dt.timedelta(days=365 * HISTORY_YEARS + 10)).isoformat()
+        self.throttle()
+        t = yf.Ticker(symbol)
+        # auto_adjust=False so we can SEE whether an adjusted column exists.
+        # Unadjusted prices read a distribution as a large negative return and
+        # inflate measured volatility; these ETCs distribute, so this matters.
+        hist = t.history(start=start, interval="1d", auto_adjust=False)
+        if hist is None or hist.empty:
+            probe.errors.append(f"{symbol}: no history")
+            return
+        probe.history_days = len(hist)
+        probe.history_ok = len(hist) >= MIN_HISTORY_DAYS_PASS
+        probe.first_date = str(hist.index[0].date())
+        probe.last_date = str(hist.index[-1].date())
+        probe.adjusted_close_available = "Adj Close" in hist.columns
+        probe.resolved_isin = self._isin_of(t)
+        try:
+            info = t.fast_info
+            probe.quote_currency = getattr(info, "currency", None)
+            probe.resolved_exchange = getattr(info, "exchange", None)
             last = getattr(info, "last_price", None)
             if last is not None:
-                p.quote_ok = True
-                p.quote_price = float(last)
+                probe.quote_ok = True
+                probe.quote_price = float(last)
         except Exception as exc:
-            p.errors.append(f"fast_info: {type(exc).__name__}: {exc}")
+            probe.errors.append(f"fast_info: {type(exc).__name__}: {exc}")
+        if not probe.quote_ok:
+            # Last close, explicitly labelled. Never presented as a live quote.
+            probe.quote_price = float(hist["Close"].iloc[-1])
+            probe.quote_timestamp = probe.last_date
+            probe.errors.append("no live quote; last close only")
 
-        if not p.quote_ok:
-            # Fall back to the last close, and say so. Never present this as a
-            # live quote -- that is exactly the failure mode the spec forbids.
-            p.quote_price = float(hist["Close"].iloc[-1])
-            p.quote_timestamp = p.last_date
-            p.errors.append("no live quote; showing last close only")
 
-        check_listing_plausible(p)
-        return p
-
+# --------------------------------------------------------------------------
 
 class TwelveDataProbe(ProviderProbe):
     """Twelve Data free tier.
 
-    Has a real symbol_search endpoint that returns exchange and currency, which
-    is what we want for ISIN -> symbol resolution. Free tier credits are the
-    binding constraint.
+    Uses MIC codes rather than the provider's own exchange labels wherever it
+    accepts them, because MIC is the only venue identifier that is actually
+    standardised and it removes a whole class of ambiguity.
     """
     name = "twelvedata"
-    documented_rate_limit = "free tier: 8 API credits/minute, 800 credits/day (verify in dashboard)"
-    batch_quotes = "yes -- /quote?symbol=A,B,C, but each symbol costs one credit"
-    documented_delay = "free tier is end-of-day / delayed for most European venues; real-time needs a paid plan"
-    seconds_between_calls = 8.0  # 8 credits/minute means one call every ~7.5s
+    documented_rate_limit = "free: 8 credits/min, 800/day (verify via /api_usage)"
+    batch_quotes = "yes -- /quote?symbol=A,B,C, but one credit per symbol"
+    documented_delay = "free tier is delayed/EOD on European venues; real-time is paid"
+    seconds_between_calls = 8.0     # 8 credits/minute
 
     BASE = "https://api.twelvedata.com"
 
@@ -402,95 +428,81 @@ class TwelveDataProbe(ProviderProbe):
         code, body = get_json(f"{self.BASE}/api_usage", {"apikey": self.key})
         return {"http": code, "api_usage": body}
 
-    def _resolve(self, inst: TestInstrument) -> tuple[str | None, dict[str, Any] | None]:
+    def _search(self, query: str) -> list[dict[str, Any]]:
         self.throttle()
         code, body = get_json(f"{self.BASE}/symbol_search",
-                              {"symbol": inst.ticker_hint, "outputsize": 30})
+                              {"symbol": query, "outputsize": 30})
         if code != 200 or not isinstance(body, dict):
-            return None, None
-        candidates = body.get("data") or []
-        # Prefer a European venue; that preference is the whole point.
-        def score(row: dict[str, Any]) -> int:
-            exch = str(row.get("exchange", "")).upper()
-            country = str(row.get("country", "")).upper()
-            s = 0
-            if any(h in exch for h in EUROPEAN_EXCHANGE_HINTS):
-                s += 10
-            if country and country not in {"UNITED STATES", "US", "USA"}:
-                s += 5
-            if str(row.get("instrument_type", "")).upper() in {"ETF", "ETC", "FUND"}:
-                s += 2
-            return s
-        ranked = sorted(candidates, key=score, reverse=True)
-        if not ranked:
-            return None, None
-        return ranked[0].get("symbol"), ranked[0]
+            return []
+        return body.get("data") or []
 
-    def probe(self, inst: TestInstrument) -> Probe:
-        p = Probe(self.name, inst.key)
-        symbol, meta = self._resolve(inst)
-        if not symbol:
-            p.errors.append("symbol_search returned no candidates")
-            return p
-        p.resolved_symbol = symbol
-        p.resolution_method = "search"
-        exchange = (meta or {}).get("exchange")
-        p.exchange = exchange
-        p.currency = (meta or {}).get("currency")
+    def resolve_isin(self, isin: str) -> Resolution | None:
+        rows = self._search(isin)
+        if not rows:
+            return None
+        # Prefer a European venue among the ISIN's listings.
+        rows.sort(key=lambda r: 1 if looks_european(str(r.get("exchange", ""))) else 0,
+                  reverse=True)
+        top = rows[0]
+        return Resolution(symbol=top.get("symbol"), exchange=top.get("exchange"),
+                          currency=top.get("currency"), name=top.get("instrument_name"),
+                          method="isin")
 
-        params = {"symbol": symbol, "apikey": self.key}
-        if exchange:
-            params["exchange"] = exchange
+    def resolve_symbol_naive(self, symbol: str) -> Resolution | None:
+        rows = self._search(symbol)
+        if not rows:
+            return None
+        top = rows[0]                     # the provider's own ranking, unaided
+        return Resolution(symbol=top.get("symbol"), exchange=top.get("exchange"),
+                          currency=top.get("currency"), name=top.get("instrument_name"),
+                          method="symbol-search")
+
+    def fetch(self, probe: Probe, symbol: str, listing: Listing | None) -> None:
+        params: dict[str, Any] = {"symbol": symbol, "apikey": self.key}
+        if listing is not None:
+            params["mic_code"] = listing.venue.twelvedata_mic
 
         self.throttle()
         code, quote = get_json(f"{self.BASE}/quote", params)
         if code == 200 and isinstance(quote, dict) and quote.get("close") is not None:
-            p.quote_ok = True
-            p.quote_price = float(quote["close"])
+            probe.quote_ok = True
+            probe.quote_price = float(quote["close"])
+            probe.quote_currency = quote.get("currency")
+            probe.resolved_exchange = quote.get("exchange") or probe.resolved_exchange
             ts = quote.get("timestamp")
             if ts:
                 when = dt.datetime.fromtimestamp(int(ts), dt.timezone.utc)
-                p.quote_timestamp = when.isoformat()
-                p.observed_staleness_minutes = round(
+                probe.quote_timestamp = when.isoformat()
+                probe.observed_staleness_minutes = round(
                     (dt.datetime.now(dt.timezone.utc) - when).total_seconds() / 60, 1)
-            p.currency = quote.get("currency") or p.currency
-            p.exchange = quote.get("exchange") or p.exchange
         else:
-            p.errors.append(f"quote http={code} body={str(quote)[:180]}")
+            probe.errors.append(f"quote http={code} {str(quote)[:160]}")
 
         self.throttle()
-        hist_params = dict(params, interval="1day", outputsize=5000)
-        code, hist = get_json(f"{self.BASE}/time_series", hist_params)
+        code, hist = get_json(f"{self.BASE}/time_series",
+                              dict(params, interval="1day", outputsize=5000))
         values = hist.get("values") if isinstance(hist, dict) else None
         if code == 200 and values:
-            p.history_days = len(values)
-            # Twelve Data returns newest first.
-            p.last_date = values[0]["datetime"][:10]
-            p.first_date = values[-1]["datetime"][:10]
-            p.history_ok = p.history_days >= MIN_HISTORY_DAYS_PASS
-            # Note: the free tier serves unadjusted prices on /time_series.
-            # Adjusted series require the `adjust` parameter on a paid plan --
-            # if that is the case here, this provider cannot be used for the
-            # risk maths without corrupting returns around distributions.
-            p.errors.append("check whether these closes are dividend-adjusted before trusting returns")
+            probe.history_days = len(values)
+            probe.last_date = values[0]["datetime"][:10]      # newest first
+            probe.first_date = values[-1]["datetime"][:10]
+            probe.history_ok = probe.history_days >= MIN_HISTORY_DAYS_PASS
+            # The free tier's /time_series is unadjusted; `adjust` is a paid
+            # parameter. If that holds, this provider cannot drive the risk
+            # maths without corrupting returns around distributions.
+            probe.adjusted_close_available = False
+            probe.errors.append("free-tier /time_series is unadjusted -- confirm before trusting returns")
         else:
-            p.errors.append(f"time_series http={code} body={str(hist)[:180]}")
+            probe.errors.append(f"time_series http={code} {str(hist)[:160]}")
 
-        check_listing_plausible(p)
-        return p
 
+# --------------------------------------------------------------------------
 
 class FMPProbe(ProviderProbe):
-    """Financial Modeling Prep free tier.
-
-    FMP's European coverage is the open question. Its search endpoint accepts a
-    ticker and returns exchange plus currency, and it has an ISIN search path we
-    exercise as soon as ISINs are on file.
-    """
     name = "fmp"
-    documented_rate_limit = "free tier: 250 requests/day, US-only on some plans (verify in dashboard)"
-    batch_quotes = "yes -- /api/v3/quote/A,B,C in one request"
-    documented_delay = "free tier is end-of-day; intraday requires a paid plan"
+    documented_rate_limit = "free: 250 requests/day; some plans are US-only (verify in dashboard)"
+    batch_quotes = "yes -- /v3/quote/A,B,C in one request"
+    documented_delay = "free tier is end-of-day; intraday is paid"
     seconds_between_calls = 0.5
 
     BASE = "https://financialmodelingprep.com/api"
@@ -501,87 +513,83 @@ class FMPProbe(ProviderProbe):
     def available(self) -> tuple[bool, str]:
         return bool(self.key), "set FMP_API_KEY"
 
-    def _resolve(self, inst: TestInstrument) -> tuple[str | None, dict[str, Any] | None]:
-        # Path 1: ISIN, the correct key, used whenever we have one.
-        if inst.isin:
-            code, body = get_json(f"{self.BASE}/v4/search/isin",
-                                  {"isin": inst.isin, "apikey": self.key})
-            if code == 200 and isinstance(body, list) and body:
-                return body[0].get("symbol"), body[0]
-        # Path 2: ticker search, ranked toward European venues.
-        code, body = get_json(f"{self.BASE}/v3/search",
-                              {"query": inst.ticker_hint, "limit": 30, "apikey": self.key})
+    def provider_symbol(self, symbol: str, listing: Listing) -> str:
+        return f"{symbol}{listing.venue.fmp_suffix}"
+
+    def resolve_isin(self, isin: str) -> Resolution | None:
+        code, body = get_json(f"{self.BASE}/v4/search/isin",
+                              {"isin": isin, "apikey": self.key})
         if code != 200 or not isinstance(body, list) or not body:
-            return None, None
-        def score(row: dict[str, Any]) -> int:
-            exch = str(row.get("exchangeShortName") or row.get("stockExchange") or "").upper()
-            s = 10 if any(h in exch for h in EUROPEAN_EXCHANGE_HINTS) else 0
-            if exch in US_EXCHANGE_MARKERS:
-                s -= 10
-            if str(row.get("currency", "")).upper() in {"EUR", "GBP", "GBX", "CHF"}:
-                s += 5
-            return s
-        ranked = sorted(body, key=score, reverse=True)
-        return ranked[0].get("symbol"), ranked[0]
+            return None
+        top = body[0]
+        return Resolution(symbol=top.get("symbol"),
+                          exchange=top.get("exchangeShortName") or top.get("stockExchange"),
+                          currency=top.get("currency"), isin=isin,
+                          name=top.get("name"), method="isin")
 
-    def probe(self, inst: TestInstrument) -> Probe:
-        p = Probe(self.name, inst.key)
-        symbol, meta = self._resolve(inst)
-        if not symbol:
-            p.errors.append("search returned no candidates")
-            return p
-        p.resolved_symbol = symbol
-        p.resolution_method = "isin" if inst.isin else "search"
-        p.exchange = (meta or {}).get("exchangeShortName") or (meta or {}).get("stockExchange")
-        p.currency = (meta or {}).get("currency")
+    def resolve_symbol_naive(self, symbol: str) -> Resolution | None:
+        code, body = get_json(f"{self.BASE}/v3/search",
+                              {"query": symbol, "limit": 30, "apikey": self.key})
+        if code != 200 or not isinstance(body, list) or not body:
+            return None
+        top = body[0]
+        return Resolution(symbol=top.get("symbol"),
+                          exchange=top.get("exchangeShortName") or top.get("stockExchange"),
+                          currency=top.get("currency"), name=top.get("name"),
+                          method="symbol-search")
 
+    def fetch(self, probe: Probe, symbol: str, listing: Listing | None) -> None:
         self.throttle()
         code, quote = get_json(f"{self.BASE}/v3/quote/{symbol}", {"apikey": self.key})
-        if code == 200 and isinstance(quote, list) and quote:
+        if code == 200 and isinstance(quote, list) and quote and quote[0].get("price") is not None:
             row = quote[0]
-            p.quote_ok = row.get("price") is not None
-            p.quote_price = row.get("price")
-            p.exchange = row.get("exchange") or p.exchange
+            probe.quote_ok = True
+            probe.quote_price = row.get("price")
+            probe.resolved_exchange = row.get("exchange") or probe.resolved_exchange
             ts = row.get("timestamp")
             if ts:
                 when = dt.datetime.fromtimestamp(int(ts), dt.timezone.utc)
-                p.quote_timestamp = when.isoformat()
-                p.observed_staleness_minutes = round(
+                probe.quote_timestamp = when.isoformat()
+                probe.observed_staleness_minutes = round(
                     (dt.datetime.now(dt.timezone.utc) - when).total_seconds() / 60, 1)
         else:
-            p.errors.append(f"quote http={code} body={str(quote)[:180]}")
+            probe.errors.append(f"quote http={code} {str(quote)[:160]}")
 
         self.throttle()
         frm = (dt.date.today() - dt.timedelta(days=365 * HISTORY_YEARS + 10)).isoformat()
         code, hist = get_json(f"{self.BASE}/v3/historical-price-full/{symbol}",
-                              {"from": frm, "to": dt.date.today().isoformat(), "apikey": self.key})
+                              {"from": frm, "to": dt.date.today().isoformat(),
+                               "apikey": self.key})
         rows = hist.get("historical") if isinstance(hist, dict) else None
         if code == 200 and rows:
-            p.history_days = len(rows)
-            p.last_date = rows[0]["date"][:10]
-            p.first_date = rows[-1]["date"][:10]
-            p.history_ok = p.history_days >= MIN_HISTORY_DAYS_PASS
-            if "adjClose" not in rows[0]:
-                p.errors.append("no adjClose field -- returns would be corrupted by distributions")
+            probe.history_days = len(rows)
+            probe.last_date = rows[0]["date"][:10]
+            probe.first_date = rows[-1]["date"][:10]
+            probe.history_ok = probe.history_days >= MIN_HISTORY_DAYS_PASS
+            probe.adjusted_close_available = "adjClose" in rows[0]
         else:
-            p.errors.append(f"history http={code} body={str(hist)[:180]}")
+            probe.errors.append(f"history http={code} {str(hist)[:160]}")
 
-        check_listing_plausible(p)
-        return p
+        # FMP exposes the ISIN on the profile endpoint, which is how we close
+        # the loop and prove we fetched the fund we asked for.
+        self.throttle()
+        code, prof = get_json(f"{self.BASE}/v3/profile/{symbol}", {"apikey": self.key})
+        if code == 200 and isinstance(prof, list) and prof:
+            probe.resolved_isin = prof[0].get("isin")
+            probe.quote_currency = prof[0].get("currency") or probe.quote_currency
 
+
+# --------------------------------------------------------------------------
 
 class EODHDProbe(ProviderProbe):
-    """EODHD -- paid, but historically the strongest European ETF coverage.
-
-    The point of testing it on a trial is to decide whether paying is warranted.
-    Its search endpoint accepts an ISIN directly, which is exactly the
-    resolution path the architecture wants, so if the coverage holds up this is
-    the provider that fits the design best.
-    """
+    """EODHD -- paid, but its search endpoint takes an ISIN directly, which is
+    the only resolution model of the four that matches this architecture rather
+    than fighting it. The point of the trial is to decide whether that plus its
+    European coverage is worth paying for."""
     name = "eodhd"
-    documented_rate_limit = "free demo key: ~20 req/day and a fixed demo symbol list; paid plans 1000+/day (verify via /api/user)"
-    batch_quotes = "yes -- /api/real-time/AAA.US?s=BBB.LSE,CCC.MI"
-    documented_delay = "15-20 minutes on most European venues; end-of-day is T+1"
+    documented_rate_limit = "demo key: fixed symbol list; paid: 1000+/day (verify via /api/user)"
+    batch_quotes = "yes -- /real-time/AAA.XETRA?s=BBB.LSE,CCC.MI"
+    documented_delay = "15-20 min on European venues; EOD is T+1"
     seconds_between_calls = 1.0
 
     BASE = "https://eodhd.com/api"
@@ -590,7 +598,7 @@ class EODHDProbe(ProviderProbe):
         self.key = os.environ.get("EODHD_API_KEY", "")
 
     def available(self) -> tuple[bool, str]:
-        return bool(self.key), "set EODHD_API_KEY (a trial or demo key is fine)"
+        return bool(self.key), "set EODHD_API_KEY (trial or demo key is fine)"
 
     def measure_limits(self) -> dict[str, Any]:
         code, body = get_json(f"{self.BASE}/user", {"api_token": self.key, "fmt": "json"})
@@ -601,69 +609,65 @@ class EODHDProbe(ProviderProbe):
                     "subscription": body.get("subscriptionType")}
         return {"http": code, "body": str(body)[:200]}
 
-    def _resolve(self, inst: TestInstrument) -> tuple[str | None, dict[str, Any] | None]:
-        # EODHD's search takes an ISIN or a ticker on the same path, which is
-        # the cleanest ISIN-first resolution of the four providers.
-        query = inst.isin or inst.ticker_hint
+    def provider_symbol(self, symbol: str, listing: Listing) -> str:
+        return f"{symbol}.{listing.venue.eodhd_code}"
+
+    def _search(self, query: str) -> list[dict[str, Any]]:
+        self.throttle()
         code, body = get_json(f"{self.BASE}/search/{query}",
                               {"api_token": self.key, "fmt": "json", "limit": 30})
-        if code != 200 or not isinstance(body, list) or not body:
-            return None, None
-        def score(row: dict[str, Any]) -> int:
-            exch = str(row.get("Exchange", "")).upper()
-            s = 10 if any(h in exch for h in EUROPEAN_EXCHANGE_HINTS) else 0
-            if exch in US_EXCHANGE_MARKERS:
-                s -= 10
-            if str(row.get("Currency", "")).upper() in {"EUR", "GBP", "GBX", "CHF"}:
-                s += 5
-            return s
-        ranked = sorted(body, key=score, reverse=True)
-        top = ranked[0]
-        symbol = f"{top.get('Code')}.{top.get('Exchange')}"
-        return symbol, top
+        return body if code == 200 and isinstance(body, list) else []
 
-    def probe(self, inst: TestInstrument) -> Probe:
-        p = Probe(self.name, inst.key)
-        symbol, meta = self._resolve(inst)
-        if not symbol:
-            p.errors.append("search returned no candidates")
-            return p
-        p.resolved_symbol = symbol
-        p.resolution_method = "isin" if inst.isin else "search"
-        p.exchange = (meta or {}).get("Exchange")
-        p.currency = (meta or {}).get("Currency")
+    def resolve_isin(self, isin: str) -> Resolution | None:
+        rows = self._search(isin)
+        if not rows:
+            return None
+        rows.sort(key=lambda r: 1 if looks_european(str(r.get("Exchange", ""))) else 0,
+                  reverse=True)
+        top = rows[0]
+        return Resolution(symbol=f"{top.get('Code')}.{top.get('Exchange')}",
+                          exchange=top.get("Exchange"), currency=top.get("Currency"),
+                          isin=top.get("ISIN") or isin, name=top.get("Name"),
+                          method="isin")
 
+    def resolve_symbol_naive(self, symbol: str) -> Resolution | None:
+        rows = self._search(symbol)
+        if not rows:
+            return None
+        top = rows[0]
+        return Resolution(symbol=f"{top.get('Code')}.{top.get('Exchange')}",
+                          exchange=top.get("Exchange"), currency=top.get("Currency"),
+                          isin=top.get("ISIN"), name=top.get("Name"),
+                          method="symbol-search")
+
+    def fetch(self, probe: Probe, symbol: str, listing: Listing | None) -> None:
         self.throttle()
         code, quote = get_json(f"{self.BASE}/real-time/{symbol}",
                                {"api_token": self.key, "fmt": "json"})
         if code == 200 and isinstance(quote, dict) and quote.get("close") not in (None, "NA"):
-            p.quote_ok = True
-            p.quote_price = float(quote["close"])
+            probe.quote_ok = True
+            probe.quote_price = float(quote["close"])
             ts = quote.get("timestamp")
             if isinstance(ts, (int, float)):
                 when = dt.datetime.fromtimestamp(int(ts), dt.timezone.utc)
-                p.quote_timestamp = when.isoformat()
-                p.observed_staleness_minutes = round(
+                probe.quote_timestamp = when.isoformat()
+                probe.observed_staleness_minutes = round(
                     (dt.datetime.now(dt.timezone.utc) - when).total_seconds() / 60, 1)
         else:
-            p.errors.append(f"real-time http={code} body={str(quote)[:180]}")
+            probe.errors.append(f"real-time http={code} {str(quote)[:160]}")
 
         self.throttle()
         frm = (dt.date.today() - dt.timedelta(days=365 * HISTORY_YEARS + 10)).isoformat()
         code, hist = get_json(f"{self.BASE}/eod/{symbol}",
                               {"api_token": self.key, "fmt": "json", "period": "d", "from": frm})
         if code == 200 and isinstance(hist, list) and hist:
-            p.history_days = len(hist)
-            p.first_date = hist[0]["date"][:10]
-            p.last_date = hist[-1]["date"][:10]
-            p.history_ok = p.history_days >= MIN_HISTORY_DAYS_PASS
-            if "adjusted_close" not in hist[0]:
-                p.errors.append("no adjusted_close field -- returns would be corrupted by distributions")
+            probe.history_days = len(hist)
+            probe.first_date = hist[0]["date"][:10]
+            probe.last_date = hist[-1]["date"][:10]
+            probe.history_ok = probe.history_days >= MIN_HISTORY_DAYS_PASS
+            probe.adjusted_close_available = "adjusted_close" in hist[0]
         else:
-            p.errors.append(f"eod http={code} body={str(hist)[:180]}")
-
-        check_listing_plausible(p)
-        return p
+            probe.errors.append(f"eod http={code} {str(hist)[:160]}")
 
 
 PROVIDERS: dict[str, Callable[[], ProviderProbe]] = {
@@ -674,121 +678,414 @@ PROVIDERS: dict[str, Callable[[], ProviderProbe]] = {
 }
 
 
-# --------------------------------------------------------------------------
-# Reporting
-# --------------------------------------------------------------------------
+# ==========================================================================
+# Check 1: coverage
+# ==========================================================================
 
-VERDICT_GLYPH = {"PASS": "PASS", "PARTIAL": "PART", "SUSPECT": "SUSP", "FAIL": "FAIL"}
+def verify(probe: Probe, inst: TestInstrument) -> None:
+    """Decide whether we fetched the fund we asked for.
+
+    Three tests, strongest first. The ISIN round-trip is the only one that
+    proves identity; the other two are circumstantial and only used when the
+    provider does not return an ISIN at all.
+    """
+    if probe.resolved_isin:
+        if probe.resolved_isin.upper() == inst.isin.upper():
+            probe.isin_check = "match"
+        else:
+            probe.isin_check = "mismatch"
+            probe.flag(f"provider returned ISIN {probe.resolved_isin}, expected {inst.isin} "
+                       f"-- this is a DIFFERENT INSTRUMENT")
+            return
+    else:
+        probe.isin_check = "unavailable"
+
+    if looks_us(probe.resolved_exchange):
+        probe.flag(f"resolved to a US listing ({probe.resolved_exchange}); "
+                   f"likely the colliding US product, not {inst.isin}")
+        return
+
+    if probe.isin_check == "unavailable":
+        base = (probe.resolved_symbol or "").split(".")[0].upper()
+        if base and base not in {s.upper() for s in inst.symbols}:
+            probe.flag(f"symbol {probe.resolved_symbol!r} is not a known listing of "
+                       f"{inst.isin}, and no ISIN was returned to check it against")
+            return
+        if probe.resolved_exchange and not looks_european(probe.resolved_exchange):
+            probe.flag(f"unrecognised exchange {probe.resolved_exchange!r}, "
+                       f"and no ISIN was returned to check it against")
+
+
+def run_coverage(prov: ProviderProbe, instruments: tuple[TestInstrument, ...]) -> list[Probe]:
+    out: list[Probe] = []
+    for inst in instruments:
+        best: Probe | None = None
+
+        # Candidate 1: the production path -- resolve the ISIN.
+        candidates: list[tuple[str, str, Listing | None]] = []
+        res = prov.resolve_isin(inst.isin)
+        if res and res.symbol:
+            candidates.append(("isin", res.symbol, None))
+
+        # Candidates 2..n: known listings, EUR primary first. This is a
+        # fallback, and needing it is itself a finding: it means the provider
+        # cannot resolve an instrument we have not catalogued by hand.
+        for listing in inst.ordered_listings():
+            candidates.append(("listing", prov.provider_symbol(listing.symbol, listing), listing))
+
+        for method, symbol, listing in candidates:
+            p = Probe(prov.name, inst.isin, inst.name, inst.asset_class, inst.base_currency)
+            p.resolution_method = method
+            p.resolved_symbol = symbol
+            if method == "isin" and res:
+                p.resolved_exchange = res.exchange
+                p.resolved_isin = res.isin
+                p.quote_currency = res.currency
+            elif listing is not None:
+                p.resolved_exchange = listing.mic
+            try:
+                prov.fetch(p, symbol, listing)
+            except Exception as exc:
+                p.errors.append(f"{symbol}: {type(exc).__name__}: {exc}")
+            verify(p, inst)
+            # Keep the deepest usable series: for a cross-listed fund the
+            # longest history is the one worth putting in the risk model.
+            if best is None or (not best.history_ok and p.history_ok) or \
+               (best.history_ok == p.history_ok and p.history_days > best.history_days):
+                best = p
+            if p.history_ok and p.quote_ok and not p.suspect:
+                break
+
+        assert best is not None
+        out.append(best)
+    return out
+
+
+# ==========================================================================
+# Check 2: symbol identity -- do all of an instrument's symbols agree on ISIN?
+# ==========================================================================
+
+def run_identity(prov: ProviderProbe, groups: list[tuple[str, tuple[str, ...]]]) -> list[AliasResult]:
+    out: list[AliasResult] = []
+    for isin, symbols in groups:
+        for sym in symbols:
+            res = prov.resolve_symbol_naive(sym)
+            if res is None:
+                out.append(AliasResult(prov.name, isin, sym, None, None, False,
+                                       "no answer"))
+                continue
+            if not res.isin:
+                out.append(AliasResult(prov.name, isin, sym, None, res.exchange, False,
+                                       "provider returns no ISIN -- identity unverifiable"))
+                continue
+            out.append(AliasResult(prov.name, isin, sym, res.isin, res.exchange,
+                                   res.isin.upper() == isin.upper()))
+    return out
+
+
+# ==========================================================================
+# Check 3: ticker collisions with US-listed products
+# ==========================================================================
+
+def run_collision(prov: ProviderProbe) -> list[CollisionResult]:
+    out: list[CollisionResult] = []
+    for col in COLLISIONS:
+        r = CollisionResult(prov.name, col.symbol, col.our_isin, col.us_name)
+        res = prov.resolve_symbol_naive(col.symbol)
+        if res is None:
+            r.outcome = "no-answer"
+            out.append(r)
+            continue
+        r.naive_symbol, r.naive_exchange = res.symbol, res.exchange
+        r.naive_currency, r.naive_isin = res.currency, res.isin
+
+        if res.isin:
+            r.outcome = "correct" if res.isin.upper() == col.our_isin.upper() else "wrong-fund"
+            if r.outcome == "wrong-fund":
+                r.note = f"returned {res.isin} ({res.name or '?'})"
+        elif looks_us(res.exchange):
+            r.outcome = "wrong-fund"
+            r.note = f"US venue {res.exchange} -- almost certainly {col.us_name}"
+        elif looks_european(res.exchange):
+            r.outcome = "ambiguous"
+            r.note = "European venue but no ISIN returned; cannot confirm"
+        else:
+            r.outcome = "ambiguous"
+            r.note = f"exchange {res.exchange!r}, no ISIN"
+        out.append(r)
+    return out
+
+
+# ==========================================================================
+# Check 4: liveness -- liquidated ISINs must return nothing
+# ==========================================================================
+
+def run_liveness(prov: ProviderProbe) -> list[LivenessResult]:
+    out: list[LivenessResult] = []
+    for dead in DEAD_INSTRUMENTS:
+        r = LivenessResult(prov.name, dead.isin, dead.shadows_isin)
+        res = prov.resolve_isin(dead.isin)
+        if res is None or not res.symbol:
+            r.outcome = "correct-dead"
+            r.note = "no resolution -- provider does not carry the liquidated line"
+            out.append(r)
+            continue
+        r.resolved_symbol = res.symbol
+        scratch = Probe(prov.name, dead.isin, dead.name, "DEAD", "-")
+        try:
+            prov.fetch(scratch, res.symbol, None)
+        except Exception as exc:
+            scratch.errors.append(f"{type(exc).__name__}: {exc}")
+        r.history_days, r.last_date = scratch.history_days, scratch.last_date
+        age = days_ago(scratch.last_date)
+        if scratch.history_days == 0:
+            r.outcome = "correct-dead"
+            r.note = "resolves, but returns no price history"
+        elif age is not None and age <= DEAD_LINE_STALE_DAYS:
+            r.outcome = "serving-stale"
+            r.note = (f"quoting as of {scratch.last_date} ({age}d ago) for a liquidated "
+                      f"line -- this would silently enter the covariance matrix")
+        else:
+            r.outcome = "correct-dead"
+            r.note = f"history ends {scratch.last_date} ({age}d ago), consistent with liquidation"
+        out.append(r)
+    return out
+
+
+# ==========================================================================
+# Reporting
+# ==========================================================================
+
+GLYPH = {"PASS": "PASS", "PARTIAL": "PART", "SUSPECT": "SUSP", "FAIL": "FAIL"}
+RULE = "=" * 108
 
 
 def print_detail(provider: str, probes: list[Probe]) -> None:
-    print(f"\n{'=' * 100}")
-    print(f"PROVIDER: {provider}")
-    print("=" * 100)
-    head = (f"{'instrument':<10} {'symbol':<16} {'via':<7} {'quote':<6} {'days':>5} "
-            f"{'first':<11} {'last':<11} {'ccy':<5} {'exchange':<12} verdict")
-    print(head)
-    print("-" * len(head))
+    print(f"\n{RULE}\nPROVIDER: {provider}  --  coverage detail\n{RULE}")
+    head = (f"{'ISIN':<14}{'cls':<5}{'symbol':<14}{'via':<9}{'isin?':<13}"
+            f"{'quote':<7}{'days':>6} {'first':<11}{'last':<11}"
+            f"{'base':<6}{'quote$':<7}{'exchange':<10}verdict")
+    print(head + "\n" + "-" * len(head))
     for p in probes:
-        print(f"{p.instrument:<10} {(p.resolved_symbol or '-'):<16} "
-              f"{(p.resolution_method or '-'):<7} {('yes' if p.quote_ok else 'no'):<6} "
-              f"{p.history_days:>5} {(p.first_date or '-'):<11} {(p.last_date or '-'):<11} "
-              f"{(p.currency or '-'):<5} {(p.exchange or '-'):<12} {p.verdict}")
+        print(f"{p.isin:<14}{p.asset_class:<5}{(p.resolved_symbol or '-'):<14}"
+              f"{(p.resolution_method or '-'):<9}{p.isin_check:<13}"
+              f"{('yes' if p.quote_ok else 'no'):<7}{p.history_days:>6} "
+              f"{(p.first_date or '-'):<11}{(p.last_date or '-'):<11}"
+              f"{p.base_currency:<6}{(p.quote_currency or '-'):<7}"
+              f"{(p.resolved_exchange or '-'):<10}{p.verdict}")
     for p in probes:
         if p.suspect:
-            print(f"  ! {p.instrument}: {p.suspect_reason}")
+            print(f"  ! {p.isin} {p.name[:44]}: {p.suspect_reason}")
+        if p.adjusted_close_available is False:
+            print(f"  ~ {p.isin}: NO ADJUSTED CLOSE -- distributions would corrupt returns")
         for e in p.errors:
-            print(f"    - {p.instrument}: {e}")
+            print(f"    - {p.isin}: {e}")
 
 
 def print_matrix(results: dict[str, list[Probe]]) -> None:
     providers = list(results)
-    print(f"\n{'=' * 100}")
-    print("COVERAGE MATRIX  (PASS = quote + >=%d days history from a plausible European listing)"
-          % MIN_HISTORY_DAYS_PASS)
-    print("SUSP = data returned, but from a listing that looks wrong -- treat as a failure")
-    print("=" * 100)
-    width = max(12, max((len(p) for p in providers), default=12) + 2)
-    print(f"{'instrument':<12}" + "".join(f"{p:<{width}}" for p in providers))
-    print("-" * (12 + width * len(providers)))
-    for inst in INSTRUMENTS:
-        row = f"{inst.key:<12}"
+    print(f"\n{RULE}")
+    print(f"CHECK 1  COVERAGE MATRIX   PASS = quote + >={MIN_HISTORY_DAYS_PASS}d history, "
+          f"identity confirmed")
+    print("SUSP = data returned from a listing that looks wrong. Counted as a failure.")
+    print(RULE)
+    w = max(12, max((len(p) for p in providers), default=12) + 2)
+    print(f"{'instrument':<34}{'cls':<5}" + "".join(f"{p:<{w}}" for p in providers))
+    print("-" * (39 + w * len(providers)))
+
+    for asset_class in ("ETF", "ETC"):
+        group = [i for i in INSTRUMENTS if i.asset_class == asset_class]
+        for inst in group:
+            label = f"{inst.isin} {inst.name[:19]}"
+            row = f"{label:<34}{inst.asset_class:<5}"
+            for prov in providers:
+                pr = next((x for x in results[prov] if x.isin == inst.isin), None)
+                row += f"{(GLYPH[pr.verdict] if pr else '-'):<{w}}"
+            print(row)
+        # ETCs are collateralised notes, not UCITS funds. Several providers
+        # classify them separately or omit them, so a subtotal split by class
+        # is the difference between "works" and "works for the easy half".
+        sub = f"{f'  {asset_class} subtotal':<34}{'':<5}"
         for prov in providers:
-            probe = next((x for x in results[prov] if x.instrument == inst.key), None)
-            row += f"{(VERDICT_GLYPH[probe.verdict] if probe else '-'):<{width}}"
-        print(row)
-    print("-" * (12 + width * len(providers)))
-    score = f"{'PASS count':<12}"
+            n = sum(1 for x in results[prov]
+                    if x.verdict == "PASS" and BY_ISIN[x.isin].asset_class == asset_class)
+            sub += f"{f'{n}/{len(group)}':<{w}}"
+        print(sub)
+        print("-" * (39 + w * len(providers)))
+
+    total = f"{'TOTAL PASS':<34}{'':<5}"
     for prov in providers:
         n = sum(1 for x in results[prov] if x.verdict == "PASS")
-        score += f"{f'{n}/{len(INSTRUMENTS)}':<{width}}"
-    print(score)
+        total += f"{f'{n}/{len(INSTRUMENTS)}':<{w}}"
+    print(total)
 
 
-def print_limits(probes: dict[str, ProviderProbe], measured: dict[str, dict]) -> None:
-    print(f"\n{'=' * 100}")
-    print("RATE LIMITS AND BATCHING  (documented values -- verify against your own dashboard)")
-    print("=" * 100)
-    for name, prov in probes.items():
+def print_identity(results: dict[str, list[AliasResult]]) -> None:
+    print(f"\n{RULE}")
+    print("CHECK 2  SYMBOL IDENTITY   every symbol of a fund must resolve to its ISIN")
+    print("WDEF and EUDF are ONE fund. Two different answers is the failure ISIN keying prevents.")
+    print(RULE)
+    for prov, rows in results.items():
+        if not rows:
+            continue
+        print(f"\n{prov}")
+        by_isin: dict[str, list[AliasResult]] = {}
+        for r in rows:
+            by_isin.setdefault(r.isin, []).append(r)
+        for isin, group in by_isin.items():
+            inst = BY_ISIN.get(isin)
+            agree = sum(1 for r in group if r.agrees)
+            status = "OK" if agree == len(group) else "BROKEN"
+            print(f"  {status:<7}{isin}  {inst.name[:42] if inst else ''}")
+            for r in group:
+                mark = "ok " if r.agrees else "BAD"
+                print(f"      {mark} {r.symbol:<8}-> {(r.resolved_isin or '(no ISIN)'):<16}"
+                      f"{(r.resolved_exchange or '-'):<12}{r.note}")
+
+
+def print_collisions(results: dict[str, list[CollisionResult]]) -> None:
+    print(f"\n{RULE}")
+    print("CHECK 3  TICKER COLLISIONS   bare-ticker lookup, provider's own top answer")
+    print("This measures what a ticker-keyed design would have given you.")
+    print(RULE)
+    danger = {c.symbol: c.danger for c in COLLISIONS if c.danger}
+    for prov, rows in results.items():
+        if not rows:
+            continue
+        print(f"\n{prov}")
+        for r in rows:
+            mark = {"correct": "ok  ", "wrong-fund": "WRONG", "ambiguous": "?   ",
+                    "no-answer": "-   ", "unknown": "?   "}[r.outcome]
+            print(f"  {mark} {r.symbol:<6}-> {(r.naive_symbol or '-'):<14}"
+                  f"{(r.naive_exchange or '-'):<12}{(r.naive_currency or '-'):<5}"
+                  f"{(r.naive_isin or '(no ISIN)'):<14}")
+            print(f"        want {r.expected_isin}   collides with {r.us_name}")
+            if r.note:
+                print(f"        {r.note}")
+            if r.symbol in danger and r.outcome != "correct":
+                print(f"        >>> {danger[r.symbol]}")
+
+
+def print_liveness(results: dict[str, list[LivenessResult]]) -> None:
+    print(f"\n{RULE}")
+    print("CHECK 4  LIQUIDATED LINES   returning NOTHING is the correct answer")
+    print(RULE)
+    for prov, rows in results.items():
+        if not rows:
+            continue
+        print(f"\n{prov}")
+        for r in rows:
+            mark = {"correct-dead": "ok   ", "serving-stale": "STALE",
+                    "ambiguous": "?    ", "no-answer": "-    ", "unknown": "?    "}[r.outcome]
+            dead = next((d for d in DEAD_INSTRUMENTS if d.isin == r.dead_isin), None)
+            print(f"  {mark} {r.dead_isin}  shadows {r.shadows_isin}  "
+                  f"{r.history_days}d, last {r.last_date or '-'}")
+            print(f"        {dead.name if dead else ''}")
+            print(f"        {r.note}")
+
+
+def print_mechanics(live: dict[str, ProviderProbe], measured: dict[str, dict],
+                    coverage: dict[str, list[Probe]]) -> None:
+    print(f"\n{RULE}")
+    print("CHECK 5  MECHANICS   rate limits, batching, adjusted closes, currency")
+    print(RULE)
+    for name, prov in live.items():
         print(f"\n{name}")
         print(f"  rate limit : {prov.documented_rate_limit}")
         print(f"  batching   : {prov.batch_quotes}")
         print(f"  delay      : {prov.documented_delay}")
         if measured.get(name):
             print(f"  measured   : {json.dumps(measured[name])[:300]}")
+        probes = coverage.get(name, [])
+        if probes:
+            adj = [p for p in probes if p.adjusted_close_available is False]
+            if adj:
+                print(f"  ADJUSTED   : missing on {len(adj)}/{len(probes)} instruments "
+                      f"-- returns would be corrupted by distributions")
+            stale = [p.observed_staleness_minutes for p in probes
+                     if p.observed_staleness_minutes is not None]
+            if stale:
+                print(f"  observed staleness: min {min(stale)}m, max {max(stale)}m "
+                      f"(measured, not documented)")
+            fx = [p for p in probes
+                  if p.quote_currency and p.quote_currency.upper()[:3] != p.base_currency.upper()]
+            print(f"  FX needed  : {len(fx)}/{len(probes)} instruments quote in a currency "
+                  f"other than their base")
 
 
 def print_symbol_map(results: dict[str, list[Probe]]) -> None:
-    """The provider_symbols mapping, ready to paste into instruments.csv.
-
-    This is the deliverable that matters most after the matrix: it is the
-    bridge between ISIN as the primary key and each provider's own symbol.
-    """
-    print(f"\n{'=' * 100}")
-    print("RESOLVED provider_symbols (only non-suspect resolutions)")
-    print("=" * 100)
+    """The provider_symbols mapping, keyed by ISIN. This is the bridge between
+    ISIN-as-primary-key and each provider's own symbol, and it is the artefact
+    that gets pasted into instruments.csv."""
+    print(f"\n{RULE}\nRESOLVED provider_symbols  (ISIN -> provider -> symbol; "
+          f"suspect resolutions excluded)\n{RULE}")
     mapping: dict[str, dict[str, str]] = {}
     for prov, probes in results.items():
         for p in probes:
-            if p.resolved_symbol and not p.suspect:
-                mapping.setdefault(p.instrument, {})[prov] = p.resolved_symbol
+            if p.resolved_symbol and not p.suspect and p.history_days > 0:
+                mapping.setdefault(p.isin, {})[prov] = p.resolved_symbol
     print(json.dumps(mapping, indent=2))
+
+
+# ==========================================================================
+# Entry point
+# ==========================================================================
+
+ALL_CHECKS = ("coverage", "identity", "collision", "liveness")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--providers", default=",".join(PROVIDERS),
-                    help="comma-separated subset of: " + ", ".join(PROVIDERS))
-    ap.add_argument("--instruments", default="",
-                    help="comma-separated instrument keys; default is all")
+    ap.add_argument("--providers", default=",".join(PROVIDERS))
+    ap.add_argument("--checks", default=",".join(ALL_CHECKS),
+                    help="subset of: " + ", ".join(ALL_CHECKS))
+    ap.add_argument("--isins", default="", help="comma-separated ISINs; default all")
+    ap.add_argument("--alias-scope", default="collisions", choices=("collisions", "all"),
+                    help="identity check: only funds with colliding tickers (cheap), or every fund")
     ap.add_argument("--offline", action="store_true",
-                    help="re-print the last saved run without any network calls")
+                    help="replay the last saved run; spends no quota")
     args = ap.parse_args()
 
+    checks = {c.strip() for c in args.checks.split(",")}
+
     if args.offline:
-        latest = sorted(RESULTS_DIR.glob("run-*.json"))
-        if not latest:
+        saved_files = sorted(RESULTS_DIR.glob("run-*.json"))
+        if not saved_files:
             print("no saved run in spike/results/")
             return 1
-        saved = json.loads(latest[-1].read_text())
-        results = {prov: [Probe(**row) for row in rows] for prov, rows in saved["results"].items()}
-        for prov, probes in results.items():
+        saved = json.loads(saved_files[-1].read_text())
+        cov = {k: [Probe(**r) for r in v] for k, v in saved.get("coverage", {}).items()}
+        idn = {k: [AliasResult(**r) for r in v] for k, v in saved.get("identity", {}).items()}
+        col = {k: [CollisionResult(**r) for r in v] for k, v in saved.get("collision", {}).items()}
+        liv = {k: [LivenessResult(**r) for r in v] for k, v in saved.get("liveness", {}).items()}
+        for prov, probes in cov.items():
             print_detail(prov, probes)
-        print_matrix(results)
-        print_symbol_map(results)
-        print(f"\n(offline replay of {latest[-1].name})")
+        if cov:
+            print_matrix(cov)
+        if idn:
+            print_identity(idn)
+        if col:
+            print_collisions(col)
+        if liv:
+            print_liveness(liv)
+        if cov:
+            print_symbol_map(cov)
+        print(f"\n(offline replay of {saved_files[-1].name}, run at {saved.get('run_at')})")
         return 0
 
-    wanted_instruments = [i for i in INSTRUMENTS
-                          if not args.instruments or i.key in args.instruments.split(",")]
+    wanted = tuple(i for i in INSTRUMENTS
+                   if not args.isins or i.isin in args.isins.split(","))
+    groups = alias_groups(collisions_only=(args.alias_scope == "collisions"))
 
-    results: dict[str, list[Probe]] = {}
+    coverage: dict[str, list[Probe]] = {}
+    identity: dict[str, list[AliasResult]] = {}
+    collision: dict[str, list[CollisionResult]] = {}
+    liveness: dict[str, list[LivenessResult]] = {}
     live: dict[str, ProviderProbe] = {}
     measured: dict[str, dict] = {}
 
-    for name in args.providers.split(","):
-        name = name.strip()
+    for name in (n.strip() for n in args.providers.split(",")):
         if name not in PROVIDERS:
             print(f"unknown provider {name!r}, skipping")
             continue
@@ -799,35 +1096,53 @@ def main() -> int:
             continue
         live[name] = prov
         measured[name] = prov.measure_limits()
-        print(f"[run ] {name}: probing {len(wanted_instruments)} instruments "
-              f"(throttle {prov.seconds_between_calls}s/call)")
-        probes = []
-        for inst in wanted_instruments:
-            probe = prov.probe(inst)
-            probes.append(probe)
-            print(f"       {inst.key:<6} -> {probe.verdict}")
-        results[name] = probes
+        print(f"[run ] {name}  throttle={prov.seconds_between_calls}s/call")
 
-    if not results:
+        if "coverage" in checks:
+            print(f"       coverage: {len(wanted)} instruments")
+            coverage[name] = run_coverage(prov, wanted)
+            for p in coverage[name]:
+                print(f"         {p.isin} {p.asset_class}  {p.verdict}")
+        if "identity" in checks:
+            print(f"       identity: {sum(len(s) for _, s in groups)} symbols")
+            identity[name] = run_identity(prov, groups)
+        if "collision" in checks:
+            print(f"       collision: {len(COLLISIONS)} tickers")
+            collision[name] = run_collision(prov)
+        if "liveness" in checks:
+            print(f"       liveness: {len(DEAD_INSTRUMENTS)} liquidated ISINs")
+            liveness[name] = run_liveness(prov)
+
+    if not live:
         print("\nNo provider ran. Set at least one API key, or install yfinance.")
         return 1
 
-    for prov, probes in results.items():
+    for prov, probes in coverage.items():
         print_detail(prov, probes)
-    print_matrix(results)
-    print_limits(live, measured)
-    print_symbol_map(results)
+    if coverage:
+        print_matrix(coverage)
+    if identity:
+        print_identity(identity)
+    if collision:
+        print_collisions(collision)
+    if liveness:
+        print_liveness(liveness)
+    print_mechanics(live, measured, coverage)
+    if coverage:
+        print_symbol_map(coverage)
 
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     out = RESULTS_DIR / f"run-{stamp}.json"
     out.write_text(json.dumps({
         "run_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "results": {prov: [dataclasses.asdict(p) for p in probes]
-                    for prov, probes in results.items()},
+        "coverage": {k: [dataclasses.asdict(p) for p in v] for k, v in coverage.items()},
+        "identity": {k: [dataclasses.asdict(p) for p in v] for k, v in identity.items()},
+        "collision": {k: [dataclasses.asdict(p) for p in v] for k, v in collision.items()},
+        "liveness": {k: [dataclasses.asdict(p) for p in v] for k, v in liveness.items()},
         "measured_limits": measured,
     }, indent=2))
-    print(f"\nRaw results written to {out}")
-    print("Re-print without spending quota:  python spike/check_providers.py --offline")
+    print(f"\nRaw results -> {out}")
+    print("Replay without spending quota:  python spike/check_providers.py --offline")
     return 0
 
 
