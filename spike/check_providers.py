@@ -142,6 +142,7 @@ class Probe:
 
     suspect: bool = False
     suspect_reason: str | None = None
+    attempted: bool = True
     errors: list[str] = dataclasses.field(default_factory=list)
 
     @property
@@ -150,7 +151,13 @@ class Probe:
 
         Data from the wrong listing is worse than no data: it is confidently
         wrong and it fails silently. It must never be counted as coverage.
+
+        SKIPPED is kept distinct from FAIL because "the provider could not
+        serve this" and "we ran out of quota before asking" support opposite
+        conclusions about whether to pay for the provider.
         """
+        if not self.attempted:
+            return "SKIPPED"
         if self.suspect:
             return "SUSPECT"
         if self.quote_ok and self.history_ok:
@@ -253,12 +260,42 @@ class ProviderProbe:
     Splitting resolution from fetching is what makes the identity, collision
     and liveness checks possible at all: they need to ask "what does this
     provider *think* this identifier is" without paying for a price series.
+
+    Every call is counted against `daily_call_budget`. This is not bookkeeping
+    for its own sake: FMP's free tier is 250 requests/day, and an unguarded run
+    of all four checks over ten instruments with six listings each would spend
+    that in a single pass and leave you locked out until tomorrow with a
+    half-filled matrix. The spike stops at the budget and says so.
     """
     name = "abstract"
     documented_rate_limit = "unknown"
     batch_quotes = "unknown"
     documented_delay = "unknown"
     seconds_between_calls = 0.0
+    daily_call_budget: int | None = None    # None = no hard documented cap
+    calls_per_fetch = 2                     # for the pre-run cost estimate
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.budget_hit = False
+
+    def get(self, url: str, params: dict[str, Any] | None = None,
+            timeout: int = 25) -> tuple[int, Any]:
+        """Every HTTP call goes through here so the counter cannot drift."""
+        self.calls += 1
+        return get_json(url, params, timeout)
+
+    def note_call(self, n: int = 1) -> None:
+        """For yfinance, whose calls happen inside the library."""
+        self.calls += n
+
+    @property
+    def over_budget(self) -> bool:
+        if self.daily_call_budget is None:
+            return False
+        if self.calls >= self.daily_call_budget:
+            self.budget_hit = True
+        return self.calls >= self.daily_call_budget
 
     def available(self) -> tuple[bool, str]:
         return True, ""
@@ -313,6 +350,8 @@ class YFinanceProbe(ProviderProbe):
                     "quotes no -- yf.Tickers loops internally")
     documented_delay = "~15 min on European venues; Yahoo does not state it per-call"
     seconds_between_calls = 0.4
+    daily_call_budget = 300      # self-imposed: Yahoo 429s an IP well before this
+    calls_per_fetch = 1
 
     def available(self) -> tuple[bool, str]:
         try:
@@ -339,6 +378,7 @@ class YFinanceProbe(ProviderProbe):
         if search is None:
             return Resolution(method="isin", note="yfinance build has no Search API")
         self.throttle()
+        self.note_call()
         try:
             quotes = search(isin, max_results=10).quotes or []
         except Exception as exc:
@@ -353,6 +393,7 @@ class YFinanceProbe(ProviderProbe):
     def resolve_symbol_naive(self, symbol: str) -> Resolution | None:
         import yfinance as yf
         self.throttle()
+        self.note_call()
         try:
             t = yf.Ticker(symbol)          # bare ticker: Yahoo picks the venue
             info = t.fast_info
@@ -370,6 +411,7 @@ class YFinanceProbe(ProviderProbe):
         import yfinance as yf
         start = (dt.date.today() - dt.timedelta(days=365 * HISTORY_YEARS + 10)).isoformat()
         self.throttle()
+        self.note_call(2)                  # history + fast_info
         t = yf.Ticker(symbol)
         # auto_adjust=False so we can SEE whether an adjusted column exists.
         # Unadjusted prices read a distribution as a large negative return and
@@ -415,22 +457,25 @@ class TwelveDataProbe(ProviderProbe):
     batch_quotes = "yes -- /quote?symbol=A,B,C, but one credit per symbol"
     documented_delay = "free tier is delayed/EOD on European venues; real-time is paid"
     seconds_between_calls = 8.0     # 8 credits/minute
+    daily_call_budget = 800         # free tier credits/day
+    calls_per_fetch = 2
 
     BASE = "https://api.twelvedata.com"
 
     def __init__(self) -> None:
+        super().__init__()
         self.key = os.environ.get("TWELVEDATA_API_KEY", "")
 
     def available(self) -> tuple[bool, str]:
         return bool(self.key), "set TWELVEDATA_API_KEY"
 
     def measure_limits(self) -> dict[str, Any]:
-        code, body = get_json(f"{self.BASE}/api_usage", {"apikey": self.key})
+        code, body = self.get(f"{self.BASE}/api_usage", {"apikey": self.key})
         return {"http": code, "api_usage": body}
 
     def _search(self, query: str) -> list[dict[str, Any]]:
         self.throttle()
-        code, body = get_json(f"{self.BASE}/symbol_search",
+        code, body = self.get(f"{self.BASE}/symbol_search",
                               {"symbol": query, "outputsize": 30})
         if code != 200 or not isinstance(body, dict):
             return []
@@ -463,7 +508,7 @@ class TwelveDataProbe(ProviderProbe):
             params["mic_code"] = listing.venue.twelvedata_mic
 
         self.throttle()
-        code, quote = get_json(f"{self.BASE}/quote", params)
+        code, quote = self.get(f"{self.BASE}/quote", params)
         if code == 200 and isinstance(quote, dict) and quote.get("close") is not None:
             probe.quote_ok = True
             probe.quote_price = float(quote["close"])
@@ -479,7 +524,7 @@ class TwelveDataProbe(ProviderProbe):
             probe.errors.append(f"quote http={code} {str(quote)[:160]}")
 
         self.throttle()
-        code, hist = get_json(f"{self.BASE}/time_series",
+        code, hist = self.get(f"{self.BASE}/time_series",
                               dict(params, interval="1day", outputsize=5000))
         values = hist.get("values") if isinstance(hist, dict) else None
         if code == 200 and values:
@@ -504,10 +549,13 @@ class FMPProbe(ProviderProbe):
     batch_quotes = "yes -- /v3/quote/A,B,C in one request"
     documented_delay = "free tier is end-of-day; intraday is paid"
     seconds_between_calls = 0.5
+    daily_call_budget = 250         # the tightest cap of the four, by far
+    calls_per_fetch = 3             # quote + history + profile(ISIN)
 
     BASE = "https://financialmodelingprep.com/api"
 
     def __init__(self) -> None:
+        super().__init__()
         self.key = os.environ.get("FMP_API_KEY", "")
 
     def available(self) -> tuple[bool, str]:
@@ -517,7 +565,7 @@ class FMPProbe(ProviderProbe):
         return f"{symbol}{listing.venue.fmp_suffix}"
 
     def resolve_isin(self, isin: str) -> Resolution | None:
-        code, body = get_json(f"{self.BASE}/v4/search/isin",
+        code, body = self.get(f"{self.BASE}/v4/search/isin",
                               {"isin": isin, "apikey": self.key})
         if code != 200 or not isinstance(body, list) or not body:
             return None
@@ -528,7 +576,7 @@ class FMPProbe(ProviderProbe):
                           name=top.get("name"), method="isin")
 
     def resolve_symbol_naive(self, symbol: str) -> Resolution | None:
-        code, body = get_json(f"{self.BASE}/v3/search",
+        code, body = self.get(f"{self.BASE}/v3/search",
                               {"query": symbol, "limit": 30, "apikey": self.key})
         if code != 200 or not isinstance(body, list) or not body:
             return None
@@ -540,7 +588,7 @@ class FMPProbe(ProviderProbe):
 
     def fetch(self, probe: Probe, symbol: str, listing: Listing | None) -> None:
         self.throttle()
-        code, quote = get_json(f"{self.BASE}/v3/quote/{symbol}", {"apikey": self.key})
+        code, quote = self.get(f"{self.BASE}/v3/quote/{symbol}", {"apikey": self.key})
         if code == 200 and isinstance(quote, list) and quote and quote[0].get("price") is not None:
             row = quote[0]
             probe.quote_ok = True
@@ -557,7 +605,7 @@ class FMPProbe(ProviderProbe):
 
         self.throttle()
         frm = (dt.date.today() - dt.timedelta(days=365 * HISTORY_YEARS + 10)).isoformat()
-        code, hist = get_json(f"{self.BASE}/v3/historical-price-full/{symbol}",
+        code, hist = self.get(f"{self.BASE}/v3/historical-price-full/{symbol}",
                               {"from": frm, "to": dt.date.today().isoformat(),
                                "apikey": self.key})
         rows = hist.get("historical") if isinstance(hist, dict) else None
@@ -571,9 +619,13 @@ class FMPProbe(ProviderProbe):
             probe.errors.append(f"history http={code} {str(hist)[:160]}")
 
         # FMP exposes the ISIN on the profile endpoint, which is how we close
-        # the loop and prove we fetched the fund we asked for.
+        # the loop and prove we fetched the fund we asked for. Guarded: on a
+        # 250/day budget, spending a third call to identify a symbol that
+        # returned no history at all is pure waste.
+        if probe.history_days == 0 and not probe.quote_ok:
+            return
         self.throttle()
-        code, prof = get_json(f"{self.BASE}/v3/profile/{symbol}", {"apikey": self.key})
+        code, prof = self.get(f"{self.BASE}/v3/profile/{symbol}", {"apikey": self.key})
         if code == 200 and isinstance(prof, list) and prof:
             probe.resolved_isin = prof[0].get("isin")
             probe.quote_currency = prof[0].get("currency") or probe.quote_currency
@@ -591,17 +643,20 @@ class EODHDProbe(ProviderProbe):
     batch_quotes = "yes -- /real-time/AAA.XETRA?s=BBB.LSE,CCC.MI"
     documented_delay = "15-20 min on European venues; EOD is T+1"
     seconds_between_calls = 1.0
+    daily_call_budget = None        # plan-dependent; measured via /api/user
+    calls_per_fetch = 2
 
     BASE = "https://eodhd.com/api"
 
     def __init__(self) -> None:
+        super().__init__()
         self.key = os.environ.get("EODHD_API_KEY", "")
 
     def available(self) -> tuple[bool, str]:
         return bool(self.key), "set EODHD_API_KEY (trial or demo key is fine)"
 
     def measure_limits(self) -> dict[str, Any]:
-        code, body = get_json(f"{self.BASE}/user", {"api_token": self.key, "fmt": "json"})
+        code, body = self.get(f"{self.BASE}/user", {"api_token": self.key, "fmt": "json"})
         if isinstance(body, dict):
             return {"http": code,
                     "daily_rate_limit": body.get("dailyRateLimit"),
@@ -614,7 +669,7 @@ class EODHDProbe(ProviderProbe):
 
     def _search(self, query: str) -> list[dict[str, Any]]:
         self.throttle()
-        code, body = get_json(f"{self.BASE}/search/{query}",
+        code, body = self.get(f"{self.BASE}/search/{query}",
                               {"api_token": self.key, "fmt": "json", "limit": 30})
         return body if code == 200 and isinstance(body, list) else []
 
@@ -642,7 +697,7 @@ class EODHDProbe(ProviderProbe):
 
     def fetch(self, probe: Probe, symbol: str, listing: Listing | None) -> None:
         self.throttle()
-        code, quote = get_json(f"{self.BASE}/real-time/{symbol}",
+        code, quote = self.get(f"{self.BASE}/real-time/{symbol}",
                                {"api_token": self.key, "fmt": "json"})
         if code == 200 and isinstance(quote, dict) and quote.get("close") not in (None, "NA"):
             probe.quote_ok = True
@@ -658,7 +713,7 @@ class EODHDProbe(ProviderProbe):
 
         self.throttle()
         frm = (dt.date.today() - dt.timedelta(days=365 * HISTORY_YEARS + 10)).isoformat()
-        code, hist = get_json(f"{self.BASE}/eod/{symbol}",
+        code, hist = self.get(f"{self.BASE}/eod/{symbol}",
                               {"api_token": self.key, "fmt": "json", "period": "d", "from": frm})
         if code == 200 and isinstance(hist, list) and hist:
             probe.history_days = len(hist)
@@ -716,24 +771,39 @@ def verify(probe: Probe, inst: TestInstrument) -> None:
                        f"and no ISIN was returned to check it against")
 
 
-def run_coverage(prov: ProviderProbe, instruments: tuple[TestInstrument, ...]) -> list[Probe]:
+def safe_resolve(fn, arg: str) -> Resolution | None:
+    """A provider raising mid-run must not cost us the whole matrix."""
+    try:
+        return fn(arg)
+    except Exception as exc:
+        return Resolution(note=f"{type(exc).__name__}: {exc}")
+
+
+def run_coverage(prov: ProviderProbe, instruments: tuple[TestInstrument, ...],
+                 max_fallbacks: int = 4) -> list[Probe]:
     out: list[Probe] = []
     for inst in instruments:
         best: Probe | None = None
 
         # Candidate 1: the production path -- resolve the ISIN.
         candidates: list[tuple[str, str, Listing | None]] = []
-        res = prov.resolve_isin(inst.isin)
+        res = safe_resolve(prov.resolve_isin, inst.isin)
         if res and res.symbol:
             candidates.append(("isin", res.symbol, None))
 
         # Candidates 2..n: known listings, EUR primary first. This is a
         # fallback, and needing it is itself a finding: it means the provider
         # cannot resolve an instrument we have not catalogued by hand.
-        for listing in inst.ordered_listings():
+        #
+        # Capped, because the fallback is where quota goes to die: ten
+        # instruments times six listings times three calls is 180 requests
+        # against a 250/day cap, for one check.
+        for listing in inst.ordered_listings()[:max_fallbacks]:
             candidates.append(("listing", prov.provider_symbol(listing.symbol, listing), listing))
 
         for method, symbol, listing in candidates:
+            if prov.over_budget:
+                break
             p = Probe(prov.name, inst.isin, inst.name, inst.asset_class, inst.base_currency)
             p.resolution_method = method
             p.resolved_symbol = symbol
@@ -756,8 +826,22 @@ def run_coverage(prov: ProviderProbe, instruments: tuple[TestInstrument, ...]) -
             if p.history_ok and p.quote_ok and not p.suspect:
                 break
 
-        assert best is not None
+        if best is None:                 # budget ran out before any attempt
+            best = Probe(prov.name, inst.isin, inst.name, inst.asset_class,
+                         inst.base_currency)
+            best.errors.append("not attempted: provider call budget exhausted")
         out.append(best)
+        if prov.over_budget:
+            # Record the rest explicitly. "-" in the matrix would be
+            # indistinguishable from "this provider failed", and the two mean
+            # very different things when you are choosing a provider.
+            for skipped in instruments[len(out):]:
+                stub = Probe(prov.name, skipped.isin, skipped.name,
+                             skipped.asset_class, skipped.base_currency)
+                stub.attempted = False
+                stub.errors.append("NOT ATTEMPTED: provider call budget exhausted")
+                out.append(stub)
+            break
     return out
 
 
@@ -769,7 +853,9 @@ def run_identity(prov: ProviderProbe, groups: list[tuple[str, tuple[str, ...]]])
     out: list[AliasResult] = []
     for isin, symbols in groups:
         for sym in symbols:
-            res = prov.resolve_symbol_naive(sym)
+            if prov.over_budget:
+                return out
+            res = safe_resolve(prov.resolve_symbol_naive, sym)
             if res is None:
                 out.append(AliasResult(prov.name, isin, sym, None, None, False,
                                        "no answer"))
@@ -791,7 +877,9 @@ def run_collision(prov: ProviderProbe) -> list[CollisionResult]:
     out: list[CollisionResult] = []
     for col in COLLISIONS:
         r = CollisionResult(prov.name, col.symbol, col.our_isin, col.us_name)
-        res = prov.resolve_symbol_naive(col.symbol)
+        if prov.over_budget:
+            return out
+        res = safe_resolve(prov.resolve_symbol_naive, col.symbol)
         if res is None:
             r.outcome = "no-answer"
             out.append(r)
@@ -824,7 +912,9 @@ def run_liveness(prov: ProviderProbe) -> list[LivenessResult]:
     out: list[LivenessResult] = []
     for dead in DEAD_INSTRUMENTS:
         r = LivenessResult(prov.name, dead.isin, dead.shadows_isin)
-        res = prov.resolve_isin(dead.isin)
+        if prov.over_budget:
+            return out
+        res = safe_resolve(prov.resolve_isin, dead.isin)
         if res is None or not res.symbol:
             r.outcome = "correct-dead"
             r.note = "no resolution -- provider does not carry the liquidated line"
@@ -856,7 +946,8 @@ def run_liveness(prov: ProviderProbe) -> list[LivenessResult]:
 # Reporting
 # ==========================================================================
 
-GLYPH = {"PASS": "PASS", "PARTIAL": "PART", "SUSPECT": "SUSP", "FAIL": "FAIL"}
+GLYPH = {"PASS": "PASS", "PARTIAL": "PART", "SUSPECT": "SUSP", "FAIL": "FAIL",
+         "SKIPPED": "skip"}
 RULE = "=" * 108
 
 
@@ -888,6 +979,7 @@ def print_matrix(results: dict[str, list[Probe]]) -> None:
     print(f"CHECK 1  COVERAGE MATRIX   PASS = quote + >={MIN_HISTORY_DAYS_PASS}d history, "
           f"identity confirmed")
     print("SUSP = data returned from a listing that looks wrong. Counted as a failure.")
+    print("skip = not attempted, provider call budget exhausted. NOT a provider failure.")
     print(RULE)
     w = max(12, max((len(p) for p in providers), default=12) + 2)
     print(f"{'instrument':<34}{'cls':<5}" + "".join(f"{p:<{w}}" for p in providers))
@@ -994,6 +1086,11 @@ def print_mechanics(live: dict[str, ProviderProbe], measured: dict[str, dict],
         print(f"  rate limit : {prov.documented_rate_limit}")
         print(f"  batching   : {prov.batch_quotes}")
         print(f"  delay      : {prov.documented_delay}")
+        cap = prov.daily_call_budget
+        used = f"{prov.calls} calls made" + (f" of {cap}/day budget" if cap else "")
+        print(f"  usage      : {used}"
+              + ("   *** BUDGET EXHAUSTED -- results are incomplete ***"
+                 if prov.budget_hit else ""))
         if measured.get(name):
             print(f"  measured   : {json.dumps(measured[name])[:300]}")
         probes = coverage.get(name, [])
@@ -1034,6 +1131,32 @@ def print_symbol_map(results: dict[str, list[Probe]]) -> None:
 ALL_CHECKS = ("coverage", "identity", "collision", "liveness")
 
 
+def estimate_calls(prov: ProviderProbe, n_instruments: int, n_alias_symbols: int,
+                   checks: set[str], max_fallbacks: int) -> tuple[int, int]:
+    """Worst- and best-case call count for a run, before spending anything.
+
+    Worth printing up front because two of these free tiers are tight enough
+    that a full run can exhaust a day's quota, and finding that out halfway
+    through leaves you with a half-filled matrix and no way to finish it until
+    tomorrow.
+    """
+    cpf = prov.calls_per_fetch
+    worst = best = 0
+    if "coverage" in checks:
+        worst += n_instruments * (1 + (1 + max_fallbacks) * cpf)
+        best += n_instruments * (1 + cpf)          # ISIN resolves first time
+    if "identity" in checks:
+        worst += n_alias_symbols
+        best += n_alias_symbols
+    if "collision" in checks:
+        worst += len(COLLISIONS)
+        best += len(COLLISIONS)
+    if "liveness" in checks:
+        worst += len(DEAD_INSTRUMENTS) * (1 + cpf)
+        best += len(DEAD_INSTRUMENTS)              # dead ISIN does not resolve
+    return best, worst
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1043,6 +1166,11 @@ def main() -> int:
     ap.add_argument("--isins", default="", help="comma-separated ISINs; default all")
     ap.add_argument("--alias-scope", default="collisions", choices=("collisions", "all"),
                     help="identity check: only funds with colliding tickers (cheap), or every fund")
+    ap.add_argument("--max-fallbacks", type=int, default=4,
+                    help="max listings tried per instrument when ISIN resolution "
+                         "fails; the main driver of quota use (default 4)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print the estimated call cost per provider and stop")
     ap.add_argument("--offline", action="store_true",
                     help="replay the last saved run; spends no quota")
     args = ap.parse_args()
@@ -1094,13 +1222,23 @@ def main() -> int:
         if not ok:
             print(f"[skip] {name}: {why}")
             continue
+        n_alias = sum(len(sy) for _, sy in groups)
+        lo, hi = estimate_calls(prov, len(wanted), n_alias, checks, args.max_fallbacks)
+        cap = prov.daily_call_budget
+        budget_note = f", budget {cap}/day" if cap else ""
+        warn = "  <-- MAY EXHAUST DAILY QUOTA" if cap and hi > cap else ""
+        print(f"[cost] {name}: {lo}-{hi} calls{budget_note}{warn}")
+        if args.dry_run:
+            continue
+
         live[name] = prov
         measured[name] = prov.measure_limits()
-        print(f"[run ] {name}  throttle={prov.seconds_between_calls}s/call")
+        print(f"[run ] {name}  throttle={prov.seconds_between_calls}s/call, "
+              f"est. {hi * prov.seconds_between_calls / 60:.0f} min worst case")
 
         if "coverage" in checks:
             print(f"       coverage: {len(wanted)} instruments")
-            coverage[name] = run_coverage(prov, wanted)
+            coverage[name] = run_coverage(prov, wanted, args.max_fallbacks)
             for p in coverage[name]:
                 print(f"         {p.isin} {p.asset_class}  {p.verdict}")
         if "identity" in checks:
@@ -1112,6 +1250,10 @@ def main() -> int:
         if "liveness" in checks:
             print(f"       liveness: {len(DEAD_INSTRUMENTS)} liquidated ISINs")
             liveness[name] = run_liveness(prov)
+
+    if args.dry_run:
+        print("\n--dry-run: nothing was fetched. Drop the flag to run for real.")
+        return 0
 
     if not live:
         print("\nNo provider ran. Set at least one API key, or install yfinance.")

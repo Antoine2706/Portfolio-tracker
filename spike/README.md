@@ -22,15 +22,49 @@ python spike/check_providers.py
 Useful flags:
 
 ```bash
+python spike/check_providers.py --dry-run                    # cost it first, fetch nothing
 python spike/check_providers.py --providers yfinance         # one provider
 python spike/check_providers.py --checks coverage,collision  # subset of checks
 python spike/check_providers.py --isins IE0002Y8CX98         # one instrument
 python spike/check_providers.py --alias-scope all            # identity-check every fund
+python spike/check_providers.py --max-fallbacks 2            # cheaper, less thorough
 python spike/check_providers.py --offline                    # replay, spends no quota
 ```
 
 Raw responses land in `spike/results/run-<timestamp>.json` (gitignored). Free
 tiers have daily caps — read that file rather than re-running.
+
+## Quota: run `--dry-run` first
+
+Two of these free tiers are tight enough that one careless run costs you the
+day. `--dry-run` prints the cost and fetches nothing:
+
+```
+[cost] yfinance:   41-83  calls, budget 300/day
+[cost] twelvedata: 51-135 calls, budget 800/day
+[cost] fmp:        61-187 calls, budget 250/day
+[cost] eodhd:      51-135 calls
+```
+
+**FMP is the binding constraint** at 250 requests/day and three calls per fetch
+(quote, history, profile-for-ISIN). Raising `--max-fallbacks` to 6 takes the
+worst case to 247 of 250; adding `--alias-scope all` takes it to 258 and the
+run warns you before it starts. The default of 4 fallbacks keeps a full
+four-check run inside every provider's cap.
+
+**Twelve Data is the slow one**, not the expensive one: 8 credits/minute means
+a 135-call run takes about 18 minutes of wall clock. The run prints its own
+worst-case duration up front.
+
+Three guards, because a half-finished matrix is worse than a cheap one:
+
+- Every call is counted; a provider stops at its budget rather than failing
+  mid-instrument with an unexplained blank.
+- Instruments not reached are marked **`skip`**, kept distinct from `FAIL`.
+  "The provider cannot serve this" and "we ran out of quota before asking"
+  point to opposite conclusions about whether to pay for it.
+- A provider that raises is caught per-instrument. One misbehaving provider
+  costs you its own column, not the whole matrix.
 
 ## Two files
 
