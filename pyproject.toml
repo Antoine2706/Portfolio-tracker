@@ -4,14 +4,14 @@ version = "0.1.0"
 description = "Personal investment portfolio tracker with real risk analytics"
 requires-python = ">=3.11"
 
-# core/ deliberately needs nothing beyond the standard library today. numpy and
-# pandas arrive with returns.py and risk.py; streamlit only ever with app/.
-dependencies = []
+# core/ needs numpy and pandas for the risk mathematics and nothing else.
+# streamlit appears only under [app]: core must import without it.
+dependencies = ["numpy>=1.26", "pandas>=2.2"]
 
 [project.optional-dependencies]
 # The test suite must run with these alone -- no streamlit, no network client.
 test = ["pytest>=8.0"]
-app = ["streamlit>=1.36", "pandas>=2.2", "numpy>=1.26"]
+app = ["streamlit>=1.36"]
 data = ["requests>=2.31"]
 
 [tool.pytest.ini_options]

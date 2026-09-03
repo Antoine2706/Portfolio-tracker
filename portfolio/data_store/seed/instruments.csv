@@ -1,11 +1,11 @@
 isin,name,issuer,asset_class,base_currency,primary_symbol,exchange,quote_currency,provider_symbols,active,manual_overrides,note
-GB00B15KYB02,WisdomTree Energy,WisdomTree,ETC,USD,OD7W,XETR,EUR,,true,,"seed reference data; listings: OD7W@XETR, AIGE@XLON, AIGE@XMIL"
-GB00B15KYL00,WisdomTree Grains,WisdomTree,ETC,USD,D7Y0,XETR,EUR,,true,,"seed reference data; listings: D7Y0@XETR, AIGG@XLON, AIGG@XMIL, AGGP@XLON"
-IE0002Y8CX98,WisdomTree Europe Defence UCITS ETF EUR Acc,WisdomTree,ETF,EUR,EUDF,XETR,EUR,,true,,"seed reference data; listings: EUDF@XETR, WDEF@XLON, WDEF@XMIL, WDEF@XPAR, WDEF@XSWX, WDEP@XLON"
-IE000I7E6HL0,HANetf Future of European Defence Screened UCITS ETF Acc,HANetf,ETF,USD,8RMY,XETR,EUR,,true,,"seed reference data; listings: 8RMY@XETR, ARMY@XPAR, ARMY@XLON, ARMY@XSWX, ARMI@XMIL, NAVY@XLON"
-IE000IAXNM41,iShares Europe Defence UCITS ETF EUR Acc,iShares,ETF,EUR,DFNC,XETR,EUR,,true,,"seed reference data; listings: DFNC@XETR, DFEU@XAMS, DFEU@XLON, DFEU@XSWX"
-IE000OJ5TQP4,HANetf Future of Defence UCITS ETF,HANetf,ETF,USD,ASWC,XETR,EUR,,true,,"seed reference data; listings: ASWC@XETR, NATO@XPAR, NATO@XMIL, NATO@XLON, NATO@XSWX, NATP@XLON"
-IE00B6R52143,iShares Agribusiness UCITS ETF,iShares,ETF,USD,ISAE,XAMS,EUR,,true,,"seed reference data; listings: ISAE@XAMS, ISAG@XMIL, ISAG@XLON, SPAG@XLON, IS0C@XMUN"
-IE00BMW42637,iShares MSCI Europe Energy Sector UCITS ETF EUR Acc,iShares,ETF,EUR,ESIE,XETR,EUR,,true,,"seed reference data; listings: ESIE@XETR, ESIE@XLON"
-JE00BN7KB664,WisdomTree Wheat,WisdomTree,ETC,USD,OD7S,XETR,EUR,,true,,"seed reference data; listings: OD7S@XETR, WEAT@XLON, WEAT@XMIL, WEAP@XLON, WEATP@XPAR"
-LU1681048630,Amundi Global Luxury UCITS ETF EUR Acc,Amundi,ETF,EUR,GLUX,XETR,EUR,,true,,"seed reference data; listings: GLUX@XETR, GLUX@XPAR, GLUX@XMIL, GLUX@XSWX"
+GB00B15KYB02,WisdomTree Energy,WisdomTree,ETC,USD,AIGE,XMIL,EUR,yfinance=AIGE.MI,true,,yfinance venue validated 2026-09-03: 503d history. Rejected: AIGE.L THIN (2d); OD7W.DE absent
+GB00B15KYL00,WisdomTree Grains,WisdomTree,ETC,USD,AIGG,XMIL,EUR,yfinance=AIGG.MI,true,,yfinance venue validated 2026-09-03: 503d history. Rejected: AIGG.L THIN (2d); D7Y0.DE absent
+IE0002Y8CX98,WisdomTree Europe Defence UCITS ETF EUR Acc,WisdomTree,ETF,EUR,EUDF,XETR,EUR,yfinance=EUDF.DE,true,,yfinance venue validated 2026-09-03: 377d history. Rejected: WDEF.SW quotes USD
+IE000I7E6HL0,HANetf Future of European Defence Screened UCITS ETF Acc,HANetf,ETF,USD,8RMY,XETR,EUR,yfinance=8RMY.DE,true,,yfinance venue validated 2026-09-03: 356d history. Rejected: ARMY.L quotes USD
+IE000IAXNM41,iShares Europe Defence UCITS ETF EUR Acc,iShares,ETF,EUR,DFNC,XETR,EUR,yfinance=DFNC.DE,true,,yfinance venue validated 2026-09-03: 320d history. Rejected: DFEU.L quotes GBP; DFEU.SW errors
+IE000OJ5TQP4,HANetf Future of Defence UCITS ETF,HANetf,ETF,USD,ASWC,XETR,EUR,yfinance=ASWC.DE,true,,yfinance venue validated 2026-09-03: 505d history. Rejected: NATO.PA only 315 days
+IE00B6R52143,iShares Agribusiness UCITS ETF,iShares,ETF,USD,ISAE,XAMS,EUR,yfinance=ISAE.AS,true,,yfinance venue validated 2026-09-03: 508d history. Rejected: ISAG.L quotes USD; IS0C.SG THIN (172d)
+IE00BMW42637,iShares MSCI Europe Energy Sector UCITS ETF EUR Acc,iShares,ETF,EUR,ESIE,XETR,EUR,yfinance=ESIE.DE,true,,yfinance venue validated 2026-09-03: 490d history. Rejected: ESIE.L quotes GBP
+JE00BN7KB664,WisdomTree Wheat,WisdomTree,ETC,USD,WEAT,XMIL,EUR,yfinance=WEAT.MI,true,,yfinance venue validated 2026-09-03: 503d history. Rejected: OD7S.DE absent
+LU1681048630,Amundi Global Luxury UCITS ETF EUR Acc,Amundi,ETF,EUR,GLUX,XPAR,EUR,yfinance=GLUX.PA,true,,yfinance venue validated 2026-09-03: 508d history. Rejected: all venues work; PAR longest
