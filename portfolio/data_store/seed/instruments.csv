@@ -1,6 +1,6 @@
 isin,name,issuer,asset_class,base_currency,primary_symbol,exchange,quote_currency,provider_symbols,active,manual_overrides,note
 GB00B15KYB02,WisdomTree Energy,WisdomTree,ETC,USD,AIGE,XMIL,EUR,yfinance=AIGE.MI,true,,yfinance venue validated 2026-09-03: 503d history. Rejected: AIGE.L THIN (2d); OD7W.DE absent
-GB00B15KYL00,WisdomTree Grains,WisdomTree,ETC,USD,AIGG,XMIL,EUR,yfinance=AIGG.MI,true,,yfinance venue validated 2026-09-03: 503d history. Rejected: AIGG.L THIN (2d); D7Y0.DE absent
+GB00B15KYL00,WisdomTree Grains,WisdomTree,ETC,USD,AIGG,XMIL,EUR,yfinance=AIGG.MI,true,,yfinance venue validated 2026-09-03: 503d history. Rejected: AIGG.L THIN (2d); OD7Y.DE absent (retested; also no history)
 IE0002Y8CX98,WisdomTree Europe Defence UCITS ETF EUR Acc,WisdomTree,ETF,EUR,EUDF,XETR,EUR,yfinance=EUDF.DE,true,,yfinance venue validated 2026-09-03: 377d history. Rejected: WDEF.SW quotes USD
 IE000I7E6HL0,HANetf Future of European Defence Screened UCITS ETF Acc,HANetf,ETF,USD,8RMY,XETR,EUR,yfinance=8RMY.DE,true,,yfinance venue validated 2026-09-03: 356d history. Rejected: ARMY.L quotes USD
 IE000IAXNM41,iShares Europe Defence UCITS ETF EUR Acc,iShares,ETF,EUR,DFNC,XETR,EUR,yfinance=DFNC.DE,true,,yfinance venue validated 2026-09-03: 320d history. Rejected: DFEU.L quotes GBP; DFEU.SW errors

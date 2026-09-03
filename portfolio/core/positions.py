@@ -36,7 +36,47 @@ from decimal import Decimal
 from .models import Instrument, Transaction, TransactionType
 from .money import BASE_CURRENCY, FxRates, Money, convert
 
-__all__ = ["Position", "PriceQuote", "derive_positions", "InsufficientUnits"]
+__all__ = ["Position", "PriceQuote", "derive_positions", "InsufficientUnits",
+           "DEFAULT_FRESHNESS_BUSINESS_DAYS", "business_days_since", "is_outdated"]
+
+# A price older than this many trading days is not a current price.
+#
+# Five is a week of trading, which tolerates a long weekend, a public holiday
+# and a provider that lags a day, without tolerating a series that has stopped
+# updating. It is deliberately generous: the failure this catches is a listing
+# frozen months ago, not one that missed yesterday.
+#
+# Business days, not calendar days, because a Monday check against a Friday
+# close must not read as three days stale. Public holidays are not modelled --
+# a market closed for a week would need the threshold raised rather than the
+# rule weakened.
+DEFAULT_FRESHNESS_BUSINESS_DAYS = 5
+
+
+def business_days_since(last: dt.date, as_of: dt.date | None = None) -> int:
+    """Trading days between `last` and `as_of`, weekends excluded."""
+    import numpy as np
+    end = as_of or dt.date.today()
+    if last > end:
+        return 0
+    return int(np.busday_count(last, end))
+
+
+def is_outdated(last: dt.date | dt.datetime | None,
+                as_of: dt.date | None = None,
+                max_business_days: int = DEFAULT_FRESHNESS_BUSINESS_DAYS) -> bool:
+    """True if a price this old must not be shown as current.
+
+    The motivating case: IS0C.DE resolves on a European venue, quotes EUR, and
+    returns exactly 252 rows -- a full lookback window, so no row-count check
+    fires. Its last observation is a year old. Every existing check passes it.
+    Only the date betrays it.
+    """
+    if last is None:
+        return False
+    if isinstance(last, dt.datetime):
+        last = last.date()
+    return business_days_since(last, as_of) > max_business_days
 
 
 class InsufficientUnits(ValueError):
@@ -56,6 +96,26 @@ class PriceQuote:
     source: str = ""
     delay_minutes: int | None = None
     is_stale: bool = False          # True when this is a fallback last close
+
+    def is_outdated(self, as_of: dt.date | None = None,
+                    max_business_days: int = DEFAULT_FRESHNESS_BUSINESS_DAYS) -> bool:
+        """Too old to present as a current price, whatever its provenance.
+
+        Checked at fetch time as well as at resolution, because a listing that
+        was fresh when it was chosen can stop updating afterwards.
+        """
+        return is_outdated(self.as_of, as_of, max_business_days)
+
+    def staleness_note(self, as_of: dt.date | None = None,
+                       max_business_days: int = DEFAULT_FRESHNESS_BUSINESS_DAYS
+                       ) -> str | None:
+        """The sentence the Holdings row must carry when the price is old."""
+        if not self.is_outdated(as_of, max_business_days):
+            return None
+        when = self.as_of.date() if isinstance(self.as_of, dt.datetime) else self.as_of
+        days = business_days_since(when, as_of)
+        return (f"last observation {when} is {days} trading days old - "
+                f"this is NOT a current price")
 
 
 @dataclasses.dataclass

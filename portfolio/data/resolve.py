@@ -43,10 +43,12 @@ import datetime as dt
 import enum
 
 from ..core.models import Instrument
+from ..core.positions import (DEFAULT_FRESHNESS_BUSINESS_DAYS,
+                              business_days_since, is_outdated)
 from ..core.returns import DEFAULT_LOOKBACK, MIN_OBSERVATIONS
 from .provider import FigiListing, IdentityProvider, ListingProbe, MarketDataProvider
 from .venues import (PRIMARY_VENUES, VenueClass, bloomberg_to_yahoo,
-                     classify_bloomberg_code, is_us_yahoo_exchange,
+                     classify_bloomberg_code, refused_exchange_reason,
                      yahoo_suffix_to_mic)
 
 __all__ = ["Verdict", "Candidate", "Resolution", "resolve_isin",
@@ -57,10 +59,11 @@ PREFERRED_CURRENCY = "EUR"
 
 class Verdict(str, enum.Enum):
     """Ordered by desirability; `REFUSED` is a wall, not a low score."""
-    PASS = "PASS"        # primary European venue, history at or above lookback
-    THIN = "THIN"        # resolves, but fewer rows than the lookback window
+    PASS = "PASS"        # primary European venue, current, history at/above lookback
+    THIN = "THIN"        # resolves and is current, but too few rows
+    STALE = "STALE"      # resolves with enough rows, but the series has stopped
     FAILED = "FAILED"    # no usable data returned
-    REFUSED = "REFUSED"  # hard gate: US or non-allowlisted venue
+    REFUSED = "REFUSED"  # hard gate: US venue, or no nameable venue at all
 
 
 @dataclasses.dataclass
@@ -85,10 +88,11 @@ class Candidate:
     def selectable_as_primary(self) -> bool:
         """Only a PASS may be chosen automatically.
 
-        A THIN candidate is still offered on the confirm screen, but the user
-        has to pick it deliberately -- it never becomes the primary listing by
-        default, because a two-row series that silently becomes the price source
-        would poison the covariance matrix.
+        A THIN or STALE candidate is still offered on the confirm screen, but
+        the user has to pick it deliberately. Neither becomes the primary
+        listing by default: a two-row series would poison the covariance matrix,
+        and a year-old one would price the portfolio against a mark from last
+        September while looking entirely healthy.
         """
         return self.verdict is Verdict.PASS
 
@@ -143,13 +147,23 @@ class Resolution:
                     f"({venues}). This is refused regardless of how complete the price "
                     f"history looks: a ticker collision returns a real security with a "
                     f"clean series for the wrong fund.")
+        stale = [c for c in self.candidates if c.verdict is Verdict.STALE]
         thin = [c for c in self.candidates if c.verdict is Verdict.THIN]
         if thin:
             best = max(thin, key=lambda c: c.observations)
+            extra = (f" {len(stale)} further listing(s) have enough rows but have "
+                     f"stopped updating." if stale else "")
             return (f"{self.isin} resolves, but no listing has enough history to enter "
                     f"the risk model. The longest is {best.yahoo_symbol} with "
                     f"{best.observations} observations. You can select it deliberately, "
-                    f"but it will not be chosen for you.")
+                    f"but it will not be chosen for you.{extra}")
+        if stale:
+            best = max(stale, key=lambda c: c.last_date or dt.date.min)
+            return (f"{self.isin} resolves with enough history, but every listing has "
+                    f"stopped updating. The most recent is {best.yahoo_symbol}, last "
+                    f"observed {best.last_date}. Selecting it would price this holding "
+                    f"against a stale mark and compute risk from a window that has "
+                    f"already ended.")
         return f"No usable listing for {self.isin}."
 
     def _filter_summary(self) -> str:
@@ -202,7 +216,10 @@ def candidates_from_listings(isin: str, listings: list[FigiListing],
 
 
 def _apply_probe(candidate: Candidate, probe: ListingProbe,
-                 lookback: int, min_observations: int) -> Candidate:
+                 lookback: int, min_observations: int,
+                 as_of: dt.date | None = None,
+                 max_stale_business_days: int = DEFAULT_FRESHNESS_BUSINESS_DAYS,
+                 ) -> Candidate:
     """Turn a probe result into a verdict. The gate is applied first."""
     candidate.reported_exchange = probe.exchange
     candidate.currency = probe.currency or candidate.currency
@@ -213,16 +230,27 @@ def _apply_probe(candidate: Candidate, probe: ListingProbe,
 
     # The hard gate. Before any quality assessment, because quality is exactly
     # what makes a colliding US listing dangerous.
-    if is_us_yahoo_exchange(probe.exchange):
+    refusal = refused_exchange_reason(probe.exchange)
+    if refusal:
         candidate.verdict = Verdict.REFUSED
-        candidate.reasons.append(
-            f"refused: {probe.exchange} is a US venue. The series may look "
-            f"complete and still be a different fund sharing the ticker.")
+        candidate.reasons.append(f"refused: {refusal}")
         return candidate
 
     if not probe.ok or probe.observations == 0:
         candidate.verdict = Verdict.FAILED
         candidate.reasons.append(probe.error or "no data returned")
+        return candidate
+
+    # Freshness is checked BEFORE row count, because a stale series is the more
+    # deceptive failure: IS0C.DE returned exactly 252 rows -- a full lookback --
+    # ending a year earlier. Every row-count check passes it. Only the date does not.
+    if is_outdated(probe.last_date, as_of, max_stale_business_days):
+        candidate.verdict = Verdict.STALE
+        days = business_days_since(probe.last_date, as_of)
+        candidate.reasons.append(
+            f"last observation {probe.last_date} is {days} trading days old; "
+            f"the series has stopped updating. {probe.observations} rows is a "
+            f"full-looking window that ended {probe.last_date}.")
         return candidate
 
     if probe.observations < min_observations:
@@ -252,13 +280,27 @@ def _apply_probe(candidate: Candidate, probe: ListingProbe,
 
 
 def rank_candidates(candidates: list[Candidate]) -> list[Candidate]:
-    """PASS above THIN, preferred currency above foreign, longer history first.
+    """PASS above THIN above STALE; preferred currency above foreign; then length.
 
-    Currency outranks history deliberately: an EUR listing with 320 days is
-    better for this portfolio than a USD one with 500, because the FX conversion
-    is a second source of error on every value the UI shows.
+    Currency outranks history length by a wide margin, and the reason is
+    analytical rather than convenience. A USD-quoted line of a EUR-base fund
+    produces a *different return series*, because it embeds EURUSD movement.
+    Volatility computed on it measures the fund's variance plus currency
+    variance. For a EUR-reporting investor the EUR-quoted line is not merely
+    tidier, it is the correct series: it is the return actually realised.
+
+    So a 320-day EUR listing beats a 500-day USD one, and not as a tiebreak.
+
+    Worth noting and explicitly not built for v1: a long foreign line can be
+    converted to EUR historically using daily FX, yielding a valid and longer
+    EUR series. That is a real enhancement, but it needs a full daily FX history
+    and its own error handling, so it is not attempted here.
     """
-    order = {Verdict.PASS: 0, Verdict.THIN: 1, Verdict.FAILED: 2, Verdict.REFUSED: 3}
+    # THIN above STALE: a short but current series still prices the holding
+    # correctly and merely drops out of the covariance. A stale one prices it
+    # wrongly, which is worse.
+    order = {Verdict.PASS: 0, Verdict.THIN: 1, Verdict.STALE: 2,
+             Verdict.FAILED: 3, Verdict.REFUSED: 4}
     return sorted(candidates, key=lambda c: (order[c.verdict],
                                              0 if c.is_preferred_currency else 1,
                                              -c.observations,
@@ -275,7 +317,10 @@ def resolve_isin(isin: str,
                  known: dict[str, Instrument] | None = None,
                  lookback: int = DEFAULT_LOOKBACK,
                  min_observations: int = MIN_OBSERVATIONS,
-                 max_candidates: int = 5) -> Resolution:
+                 max_candidates: int = 5,
+                 as_of: dt.date | None = None,
+                 max_stale_business_days: int = DEFAULT_FRESHNESS_BUSINESS_DAYS,
+                 ) -> Resolution:
     """Resolve an ISIN to ranked candidate listings for the confirm screen.
 
     Nothing is written. The caller presents `Resolution.candidates`, the user
@@ -298,7 +343,8 @@ def resolve_isin(isin: str,
                 verdict=Verdict.FAILED, name=inst.name,
                 currency=inst.quote_currency or None,
             )
-            candidate = _apply_probe(candidate, probe, lookback, min_observations)
+            candidate = _apply_probe(candidate, probe, lookback, min_observations,
+                                     as_of, max_stale_business_days)
             if inst.is_overridden(f"provider_symbols.{prices.name}"):
                 candidate.reasons.append(
                     "symbol was set by hand; re-resolution will not overwrite it")
@@ -326,7 +372,8 @@ def resolve_isin(isin: str,
             probe = ListingProbe(symbol=candidate.yahoo_symbol, ok=False,
                                  error=f"{type(exc).__name__}: {exc}")
             errors.append(f"{candidate.yahoo_symbol}: {exc}")
-        probed.append(_apply_probe(candidate, probe, lookback, min_observations))
+        probed.append(_apply_probe(candidate, probe, lookback, min_observations,
+                                   as_of, max_stale_business_days))
 
     refused = [c for c in probed if c.verdict is Verdict.REFUSED]
     usable = rank_candidates([c for c in probed if c.verdict is not Verdict.REFUSED])

@@ -60,7 +60,19 @@ PROBES: dict[str, ListingProbe] = {
                          474, D(2024, 11, 3), D(2026, 9, 3), adjusted=True),
     "WEAT.MI": ListingProbe("WEAT.MI", True, "MIL", "EUR", "WisdomTree Wheat",
                             503, D(2024, 9, 3), D(2026, 9, 3), adjusted=True),
+    # Trap 4, observed: resolves, EUR, exactly 252 rows -- a full lookback --
+    # ending a year early. YHD is Yahoo's placeholder for "no nameable venue".
+    "IS0C.DE": ListingProbe("IS0C.DE", True, "YHD", "EUR", "",
+                            252, D(2024, 9, 3), D(2025, 9, 10), adjusted=True),
+    # The same series on a venue Yahoo can name, to isolate the date test from
+    # the YHD refusal.
+    "ISAG.SW": ListingProbe("ISAG.SW", True, "EBS", "EUR", "iShares Agribusiness",
+                            252, D(2024, 9, 3), D(2025, 9, 10), adjusted=True),
+    "ISAE.AS": ListingProbe("ISAE.AS", True, "AMS", "EUR", "iShares Agribusiness",
+                            508, D(2024, 9, 3), D(2026, 9, 3), adjusted=True),
 }
+
+TODAY = D(2026, 9, 3)
 
 
 class FakeIdentity(IdentityProvider):
@@ -307,3 +319,98 @@ class TestConfirmScreenPayload:
         res = resolve_isin(WDEF_ISIN, FakeIdentity(), FakePrices())
         inst = instrument_from_candidate(res.recommended, "yfinance", base_currency="USD")
         assert inst.base_currency == "USD" and inst.quote_currency == "EUR"
+
+
+class TestStaleVerdict:
+    """Trap 4. IS0C.DE resolves on a European venue, quotes EUR, and returns
+    exactly 252 rows -- a full lookback window. Its last observation is a year
+    old. No row-count check catches it; only the date does."""
+
+    AGRI = "IE00B6R52143"
+
+    def _resolve(self, listings, **kw):
+        return resolve_isin(self.AGRI, FakeIdentity(listings), FakePrices(),
+                            as_of=TODAY, **kw)
+
+    def test_full_window_but_a_year_old_is_not_a_pass(self):
+        res = self._resolve([FigiListing("A", "ISAG", "SW")])
+        assert res.candidates[0].verdict is Verdict.STALE
+        assert res.candidates[0].observations == 252, "row count alone looks healthy"
+
+    def test_stale_is_never_selectable_as_primary(self):
+        res = self._resolve([FigiListing("A", "ISAG", "SW")])
+        assert not res.candidates[0].selectable_as_primary
+        assert res.recommended is None and res.blocked
+
+    def test_reason_names_the_last_observation_date(self):
+        res = self._resolve([FigiListing("A", "ISAG", "SW")])
+        reason = res.candidates[0].reasons[0]
+        assert "2025-09-10" in reason and "trading days old" in reason
+
+    def test_block_reason_explains_the_stale_mark(self):
+        res = self._resolve([FigiListing("A", "ISAG", "SW")])
+        assert "stopped updating" in res.block_reason()
+        assert "stale mark" in res.block_reason()
+
+    def test_a_current_listing_outranks_a_stale_one(self):
+        res = self._resolve([FigiListing("A", "ISAG", "SW"), FigiListing("B", "ISAE", "NA")])
+        assert res.recommended.yahoo_symbol == "ISAE.AS"
+
+    def test_thin_outranks_stale(self):
+        """A short current series prices the holding correctly and merely drops
+        out of the covariance; a stale one prices it wrongly."""
+        from portfolio.data.resolve import Candidate
+        thin = Candidate(self.AGRI, "AIGG", "LN", "AIGG.L", "London", "XLON",
+                         Verdict.THIN, observations=2, currency="EUR")
+        stale = Candidate(self.AGRI, "ISAG", "SW", "ISAG.SW", "SIX", "XSWX",
+                          Verdict.STALE, observations=252, currency="EUR")
+        assert rank_candidates([stale, thin])[0] is thin
+
+    def test_yhd_is_refused_outright(self):
+        """Yahoo's placeholder for a venue it cannot name. Refused on its own
+        merits, before the date check -- a source that cannot name its venue
+        cannot be verified against the ISIN."""
+        res = self._resolve([FigiListing("A", "IS0C", "GR")])
+        assert res.refused and res.refused[0].verdict is Verdict.REFUSED
+        assert "not a real exchange" in res.refused[0].reasons[0]
+
+    def test_freshness_threshold_is_configurable(self):
+        listings = [FigiListing("A", "ISAE", "NA")]        # last obs 2026-09-03
+        fresh = resolve_isin(self.AGRI, FakeIdentity(listings), FakePrices(),
+                             as_of=D(2026, 9, 12))
+        assert fresh.candidates[0].verdict is Verdict.STALE
+        loose = resolve_isin(self.AGRI, FakeIdentity(listings), FakePrices(),
+                             as_of=D(2026, 9, 12), max_stale_business_days=30)
+        assert loose.candidates[0].verdict is Verdict.PASS
+
+    def test_boundary_is_exactly_five_trading_days(self):
+        listings = [FigiListing("A", "ISAE", "NA")]        # last obs 2026-09-03
+        at_five = resolve_isin(self.AGRI, FakeIdentity(listings), FakePrices(),
+                               as_of=D(2026, 9, 10))
+        at_six = resolve_isin(self.AGRI, FakeIdentity(listings), FakePrices(),
+                              as_of=D(2026, 9, 11))
+        assert at_five.candidates[0].verdict is Verdict.PASS
+        assert at_six.candidates[0].verdict is Verdict.STALE
+
+
+class TestFreshnessAtFetchTime:
+    """A listing can go stale after it was chosen, so the check runs on the
+    quote too, not only at resolution."""
+
+    def test_quote_reports_its_own_staleness(self):
+        from decimal import Decimal
+        from portfolio.core.money import Money
+        from portfolio.core.positions import PriceQuote
+        old = PriceQuote(Money(Decimal("10"), "EUR"), as_of=D(2025, 9, 10),
+                         source="yfinance", delay_minutes=15)
+        assert old.is_outdated(TODAY)
+        assert "NOT a current price" in old.staleness_note(TODAY)
+
+    def test_a_recent_quote_is_not_flagged(self):
+        from decimal import Decimal
+        from portfolio.core.money import Money
+        from portfolio.core.positions import PriceQuote
+        recent = PriceQuote(Money(Decimal("10"), "EUR"), as_of=D(2026, 9, 2),
+                            source="yfinance", delay_minutes=15)
+        assert not recent.is_outdated(TODAY)
+        assert recent.staleness_note(TODAY) is None

@@ -26,8 +26,8 @@ import enum
 
 __all__ = [
     "VenueClass", "Venue", "PRIMARY_VENUES", "US_YAHOO_EXCHANGES",
-    "classify_bloomberg_code", "bloomberg_to_yahoo", "yahoo_suffix_to_mic",
-    "is_us_yahoo_exchange",
+    "NON_VENUE_EXCHANGES", "classify_bloomberg_code", "bloomberg_to_yahoo",
+    "yahoo_suffix_to_mic", "is_us_yahoo_exchange", "refused_exchange_reason",
 ]
 
 
@@ -79,6 +79,30 @@ US_YAHOO_EXCHANGES = frozenset({
     "PCX", "NGM", "NYQ", "NMS", "PNK", "NCM", "NIM", "ASE", "BTS", "OTC",
     "NYSE", "NASDAQ", "ARCA", "NYSEARCA", "AMEX", "BATS", "CBOE", "OPR",
 })
+
+
+# Yahoo labels a listing YHD when it has no real venue to name -- a generic
+# marker rather than an exchange. IS0C.DE came back as YHD with 252 rows of
+# EUR prices ending a year earlier: a full-looking window on a line Yahoo
+# itself cannot place. The staleness check catches that case on the date, but
+# the marker is reason enough on its own, because a price source that cannot
+# name its venue cannot be verified against the ISIN.
+NON_VENUE_EXCHANGES = frozenset({"YHD", "CCY", "CCC", "FGI"})
+
+
+def refused_exchange_reason(exchange: str | None) -> str | None:
+    """Why this exchange is refused outright, or None if it is acceptable.
+
+    One place for the hard gate, so resolution and price-fetch cannot drift.
+    """
+    if is_us_yahoo_exchange(exchange):
+        return (f"{exchange} is a US venue. The series may look complete and "
+                f"still be a different fund sharing the ticker.")
+    if exchange and exchange.strip().upper() in NON_VENUE_EXCHANGES:
+        return (f"{exchange} is not a real exchange, it is a placeholder Yahoo "
+                f"uses when it cannot name a venue. A price source that cannot "
+                f"name its venue cannot be checked against the ISIN.")
+    return None
 
 
 def classify_bloomberg_code(code: str) -> VenueClass:
