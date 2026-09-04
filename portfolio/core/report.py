@@ -194,6 +194,16 @@ class DivergenceRow:
     divergence: float
 
     @property
+    def divergence_pp(self) -> float:
+        """Divergence in percentage points.
+
+        The difference of two percentages is measured in percentage points, not
+        percent, and the unit lets the column show an explicit sign. Here rather
+        than in the view because it is a unit conversion on a reported figure.
+        """
+        return self.divergence * 100.0
+
+    @property
     def direction(self) -> str:
         if self.divergence > 0:
             return "carries more risk than capital"

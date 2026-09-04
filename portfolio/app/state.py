@@ -66,15 +66,15 @@ def mode_banner() -> None:
 
     Demo data shown as real, and real data shown while the user believes they
     are in demo, are both bad enough to justify a coloured block rather than a
-    caption. `st.error` is used for demo mode not because it is an error but
-    because it is the loudest thing Streamlit offers.
+    caption. Demo mode uses the warning colour rather than the error colour:
+    red is reserved for loss throughout this application, and spending it on a
+    mode indicator would weaken it where it carries meaning.
     """
     if current_mode() is DataMode.SEED:
-        st.error("**DEMO DATA** - seed instruments and a synthetic ledger. "
-                 "These are not your positions.", icon=":material/science:")
+        st.warning("**DEMO DATA** - seed instruments and a synthetic ledger. "
+                   "These are not your positions.")
     else:
-        st.success(f"**LIVE DATA** - your instruments and ledger from "
-                   f"`{store().directory}`", icon=":material/lock:")
+        st.success("**LIVE DATA** - your own instruments and ledger.")
 
 
 # --------------------------------------------------------------------------

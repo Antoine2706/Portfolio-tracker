@@ -1,11 +1,12 @@
 """Risk view.
 
-Order is the design. The divergence table is first because it is the reason
-this application exists; the alignment line sits directly above the numbers it
-produced; the correlation sentences precede the heatmap because a sentence
-naming two funds beats a matrix cell the reader has to locate.
+The product is the gap between an instrument's share of the money and its share
+of the risk. Everything else on this page is supporting evidence, and the
+layout says so: the headline first, then anything that qualifies it, then the
+divergence chart, then the table, then the measures, then the correlation grid
+last as detail.
 
-Every number here comes from `core`. This module formats and lays out.
+Every number comes from `core`. This module formats and lays out.
 """
 
 from __future__ import annotations
@@ -25,11 +26,10 @@ from ...core.risk import (HIGH_CORRELATION_THRESHOLD, beta, concentration,
                           portfolio_value_series, risk_decomposition,
                           standalone_volatilities)
 from ...data.benchmarks import BENCHMARKS, DEFAULT_BENCHMARK
-from .. import state
+from .. import charts, state
 
 
 def render() -> None:
-    st.header("Risk")
     store = state.store()
     instruments = store.load_instruments()
     transactions = store.load_transactions()
@@ -37,29 +37,23 @@ def render() -> None:
     quotes, _ = state.load_quotes(instruments)
     rates = state.fx_table()
     positions = derive_positions(transactions, instruments, rates=rates,
-                             quotes=quotes, strict=False)
+                                 quotes=quotes, strict=False)
     held = weights(positions, rates)
 
     if len(held) < 2:
+        st.subheader("Risk")
         st.info(
-            f"**Not enough holdings for a risk model.** You have {len(held)} "
-            f"priced position(s); covariance needs at least two.\n\n"
-            f"A single holding has no diversification to measure, so these "
-            f"figures would be zeros rather than answers.")
+            f"Not enough holdings for a risk model. You have {len(held)} priced "
+            f"position(s); covariance needs at least two. A single holding has "
+            f"no diversification to measure, so these figures would be zeros "
+            f"rather than answers.")
         return
 
-    lookback = st.number_input(
-        "Lookback window (trading days)", min_value=60, max_value=1000,
-        value=DEFAULT_LOOKBACK, step=21,
-        help="252 is one trading year. The window shortens automatically if "
-             "your newest holding has less history, and says so.")
-
-    series = {}
-    missing = []
+    series, missing = {}, []
     for isin in held:
         symbol = instruments[isin].provider_symbols.get("yfinance")
         if not symbol:
-            missing.append(instruments[isin].name)
+            missing.append(f"{instruments[isin].name}: no symbol stored")
             continue
         try:
             series[isin] = state.fetch_history(symbol)
@@ -67,14 +61,16 @@ def render() -> None:
             missing.append(f"{instruments[isin].name}: {exc}")
 
     if len(series) < 2:
+        st.subheader("Risk")
         st.error("Could not load price history for at least two holdings. "
                  + "; ".join(missing))
         return
 
     try:
-        returns, alignment = align_returns(series, lookback=int(lookback))
+        returns, alignment = align_returns(series, lookback=DEFAULT_LOOKBACK)
     except InsufficientHistory as exc:
-        st.error(f"**No covariance matrix can be built.** {exc}")
+        st.subheader("Risk")
+        st.error(f"No covariance matrix can be built. {exc}")
         return
 
     used = [i for i in returns.columns if i in held]
@@ -85,37 +81,66 @@ def render() -> None:
 
     cov = covariance_matrix(returns[used])
     decomposition = risk_decomposition(w, cov)
-
-    # ---- 1. The headline -------------------------------------------------
-    st.subheader("Capital share against risk share")
-    st.caption("The gap between what a holding is worth and what it costs you "
-               "in risk. Sorted by the size of the gap, largest first.")
     rows = divergence_rows(decomposition, instruments)
-    st.dataframe(pd.DataFrame([{
-        "Instrument": r.name,
-        "Capital weight": f"{r.weight:.2%}",
-        "Risk contribution": f"{r.risk_share:.2%}",
-        "Divergence": f"{r.divergence:+.2%}",
-    } for r in rows]), hide_index=True, width="stretch")
-    if rows:
-        st.markdown(f"**{rows[0].sentence()}**")
+    stats = concentration(list(w.values()))
 
-    # ---- 2. Alignment, directly above the numbers it produced -------------
+    # ---- 1. The headline, largest on the page -----------------------------
+    if rows:
+        st.metric("Largest gap between capital and risk",
+                  f"{rows[0].divergence:+.1%}",
+                  delta=rows[0].name, delta_color="off")
+        st.markdown(f"**{rows[0].sentence()}**")
     st.caption(f"Window used: {alignment.summary()}")
-    for warning in alignment.warnings:
-        st.warning(warning, icon=":material/warning:")
+
+    # ---- 2. Exceptions, immediately after ----------------------------------
+    corr = correlation_matrix(cov)
+    pairs = high_correlation_pairs(corr)
+    sentences = correlation_sentences(pairs, instruments)
+
+    exceptions = list(alignment.warnings)
     if alignment.excluded:
         names = ", ".join(
             f"{instruments[e.isin].name if e.isin in instruments else e.isin} "
             f"({e.observations} obs)" for e in alignment.excluded)
-        st.warning(f"Excluded from the risk model, still shown in Holdings: "
-                   f"{names}", icon=":material/warning:")
-    for note in missing:
-        st.warning(f"No price history: {note}", icon=":material/warning:")
+        exceptions.append(f"Excluded from the risk model, still shown in "
+                          f"Holdings: {names}")
+    exceptions += [f"No price history: {note}" for note in missing]
+    exceptions += sentences
 
-    # ---- 3. Headline metrics, each with its plain sentence ---------------
+    if exceptions:
+        with st.container(border=True):
+            st.markdown("**Needs attention**")
+            for note in exceptions:
+                st.warning(note)
+
+    # ---- 3. One chart: the divergence -------------------------------------
+    st.subheader("Capital share against risk share")
+    st.caption("How far each holding's share of the risk sits from its share "
+               "of the money. Bars at zero are behaving as expected.")
+    st.altair_chart(
+        charts.divergence_bars([(r.name, r.divergence) for r in rows]),
+        use_container_width=True)
+
+    # ---- 4. The dense table ------------------------------------------------
+    st.dataframe(
+        pd.DataFrame([{
+            "Instrument": r.name,
+            "Capital weight": r.weight,
+            "Risk contribution": r.risk_share,
+            "Divergence (pp)": r.divergence_pp,
+        } for r in rows]),
+        hide_index=True, width="stretch",
+        column_config={
+            "Instrument": st.column_config.TextColumn(width="large"),
+            "Capital weight": st.column_config.NumberColumn(format="percent"),
+            "Risk contribution": st.column_config.NumberColumn(format="percent"),
+            # Percentage points, signed: this column is the product, so the
+            # direction should be readable without comparing two other columns.
+            "Divergence (pp)": st.column_config.NumberColumn(format="%+.2f"),
+        })
+
+    # ---- 5. Measures -------------------------------------------------------
     st.subheader("Portfolio measures")
-
     benchmark = st.selectbox(
         "Benchmark for beta", BENCHMARKS,
         index=BENCHMARKS.index(DEFAULT_BENCHMARK),
@@ -128,72 +153,57 @@ def render() -> None:
     beta_value = None
     portfolio_returns = portfolio_return_series(returns[used], w)
     try:
-        benchmark_prices = state.fetch_history(benchmark.symbol)
-        beta_value = beta(portfolio_returns, simple_returns(benchmark_prices))
+        beta_value = beta(portfolio_returns,
+                          simple_returns(state.fetch_history(benchmark.symbol)))
     except Exception as exc:
-        st.warning(f"Beta not shown: could not load {benchmark.symbol} "
-                   f"({exc}). A beta without its benchmark series is not a "
-                   f"number worth guessing at.", icon=":material/warning:")
+        st.warning(f"Beta not shown: could not load {benchmark.symbol} ({exc}). "
+                   f"A beta without its benchmark series is not a number worth "
+                   f"guessing at.")
 
-    dd = drawdown(portfolio_value_series(returns[used], w))
     metrics = risk_metrics(
-        decomposition, diversification_ratio(w, cov),
-        concentration(list(w.values())), drawdown_stats=dd,
+        decomposition, diversification_ratio(w, cov), stats,
+        drawdown_stats=drawdown(portfolio_value_series(returns[used], w)),
         beta_value=beta_value,
         benchmark_name=benchmark.label if beta_value is not None else None)
 
-    # Effective holdings is given the most weight of the three concentration
-    # readings: it is the only one that sees a cluster of holdings all making
-    # the same bet. Pairwise correlation reports edges and structurally cannot
-    # see the group.
+    # Effective holdings leads: it is the only reading that sees a cluster of
+    # holdings all making the same bet. Pairwise correlation reports edges and
+    # structurally cannot see the group.
     lead = next(m for m in metrics if m.label == "Effective holdings")
     st.metric(lead.label, lead.value)
     st.markdown(f"**{lead.sentence}**")
-    st.divider()
 
     for metric in metrics:
         if metric is lead:
             continue
-        st.metric(metric.label, metric.value)
-        st.caption(metric.sentence)
-        if metric.warning:
-            st.warning(metric.warning, icon=":material/warning:")
+        with st.container(border=True):
+            st.metric(metric.label, metric.value)
+            st.caption(metric.sentence)
+            if metric.warning:
+                st.warning(metric.warning)
 
+    # ---- 6. Detail ---------------------------------------------------------
     st.subheader("How volatile each holding is on its own")
     st.caption("A broad European equity index typically sits near 15% a year. "
                "Most thematic ETFs run two to three times that, and that is "
                "what the concentration costs.")
-    st.dataframe(pd.DataFrame(
-        [{"Instrument": name, "Annualised volatility": value,
-          "Times a broad European index": multiple}
-         for name, value, multiple in
-         volatility_context(standalone_volatilities(cov), instruments)],
-    ), hide_index=True, width="stretch")
+    st.dataframe(
+        pd.DataFrame([{"Instrument": name, "Annualised volatility": vol,
+                       "Times a broad index": mult}
+                      for name, vol, mult in
+                      volatility_context(standalone_volatilities(cov), instruments)]),
+        hide_index=True, width="stretch",
+        column_config={"Instrument": st.column_config.TextColumn(width="medium")})
 
-    # ---- 4. Correlation as sentences, before the matrix -------------------
-    corr = correlation_matrix(cov)
-    pairs = high_correlation_pairs(corr)
-    st.subheader("Holdings that may be duplicating each other")
-    st.caption(f"Pairs correlating above {HIGH_CORRELATION_THRESHOLD:.2f}. "
-               f"This is a pairwise measure: it reports one edge at a time and "
-               f"cannot see a group of holdings that all make the same bet. "
-               f"For that, read the effective holdings figure above.")
-    sentences = correlation_sentences(pairs, instruments)
-    if sentences:
-        for sentence in sentences:
-            st.warning(sentence, icon=":material/content_copy:")
-    else:
-        st.caption(f"No pair moves together above "
-                   f"{HIGH_CORRELATION_THRESHOLD:.2f}. Nothing here looks like "
-                   f"the same exposure held twice.")
-
-    # ---- 5. The heatmap, as supporting detail ----------------------------
-    st.subheader("Correlation matrix")
-    labels = [instruments[i].name[:24] if i in instruments else i for i in used]
-    display = corr.copy()
-    display.index = labels
-    display.columns = labels
-    # Diverging scale centred on zero: correlation runs -1 to +1 and zero is
-    # meaningful, so a sequential scale would misrepresent the midpoint.
-    st.dataframe(display.style.background_gradient(cmap="RdBu_r", vmin=-1, vmax=1)
-                 .format("{:.2f}"), width="stretch")
+    st.subheader("Correlation")
+    st.caption(
+        f"Pairs above {HIGH_CORRELATION_THRESHOLD:.2f} are listed under Needs "
+        f"attention. This grid is a pairwise measure: it shows one edge at a "
+        f"time and cannot see a group of holdings that all make the same bet. "
+        f"The scale stays centred on zero even when every value sits on one "
+        f"arm, because nothing on the cool side means nothing here hedges "
+        f"anything else, and that is itself the finding.")
+    st.altair_chart(
+        charts.correlation_heatmap(
+            corr, [instruments[i].name if i in instruments else i for i in used]),
+        use_container_width=True)

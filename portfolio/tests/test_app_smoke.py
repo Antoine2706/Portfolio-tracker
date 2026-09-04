@@ -48,7 +48,14 @@ class TestAppShell:
         """Real data shown while the user believes they are in demo, and demo
         data shown as real, are both bad enough to warrant a coloured block."""
         at = run()
-        assert any("DEMO DATA" in e.value for e in at.error)
+        assert any("DEMO DATA" in w.value for w in at.warning)
+
+    def test_the_mode_banner_does_not_spend_the_loss_colour(self):
+        """Red means loss throughout this application. Using it for a mode
+        indicator would weaken it exactly where it carries meaning, so the
+        banner is a warning rather than an error."""
+        at = run()
+        assert not any("DEMO DATA" in e.value for e in at.error)
 
     def test_refresh_button_exists(self):
         at = run()

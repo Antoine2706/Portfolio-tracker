@@ -1,0 +1,136 @@
+# Presentation lives here, not in CSS.
+#
+# No custom CSS anywhere in this application. Native theming applies
+# consistently across every element and survives Streamlit upgrades; CSS
+# selectors target internal class names that change without notice.
+#
+# Every option name below was verified against the installed Streamlit build
+# rather than against documentation.
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[client]
+# Hide the hamburger menu and footer chrome. This is a tool for reading
+# numbers, not a Streamlit demo.
+toolbarMode = "minimal"
+showSidebarNavigation = false
+
+[ui]
+hideTopBar = true
+
+[theme]
+base = "dark"
+
+# Blue is the interface's own colour: links, focus rings, the single hue the
+# charts use for magnitude. It is deliberately absent from anything that
+# encodes profit or loss.
+primaryColor = "#3987e5"
+backgroundColor = "#121211"
+secondaryBackgroundColor = "#1e1e1c"
+textColor = "#f7f6f3"
+borderColor = "#302f2c"
+linkColor = "#3987e5"
+
+showWidgetBorder = true
+showSidebarBorder = true
+baseRadius = "0.5rem"
+buttonRadius = "0.5rem"
+
+# Tables are the primary reading surface, so their edges are quiet: a border
+# a shade above the background, and a header that separates by tone rather
+# than by a rule.
+dataframeBorderColor = "#302f2c"
+dataframeHeaderBackgroundColor = "#1e1e1c"
+
+# Editorial typography. Headings sit close to body size -- a financial tool
+# does not need a masthead -- and the numerals carry the emphasis instead.
+baseFontSize = 15
+baseFontWeight = 400
+headingFontSizes = ["1.55rem", "1.25rem", "1.05rem", "0.95rem", "0.9rem", "0.85rem"]
+headingFontWeights = [600, 600, 600, 500, 500, 500]
+
+# The primary position should be the largest thing on the page.
+metricValueFontSize = "2.4rem"
+metricValueFontWeight = 500
+
+# --------------------------------------------------------------------------
+# Chart palettes. Set once here, obeyed by every Altair and Vega-Lite chart.
+# --------------------------------------------------------------------------
+
+# Categorical: identity. Barely used in this application -- three of its four
+# visuals encode polarity or magnitude, not identity -- but validated so that
+# anything which does need identity is legible.
+chartCategoricalColors = [
+    "#3987e5", "#d95926", "#199e70", "#c98500",
+    "#d55181", "#008300", "#9085e9", "#e66767",
+]
+
+# Sequential: magnitude. One hue, near-surface to bright on a dark ground.
+# Streamlit requires exactly 10 stops here and for diverging (verified in
+# app_session.py). The validated 9-stop ramp is resampled to 10 with its
+# endpoints preserved exactly; only intermediate stops are interpolated.
+chartSequentialColors = [
+    "#104281",
+    "#174e93",
+    "#1b59a6",
+    "#2265b8",
+    "#2872cc",
+    "#317fdd",
+    "#428de6",
+    "#5a9be8",
+    "#70a9ec",
+    "#86b6ef",
+]
+
+# Diverging: polarity. Two poles with a neutral grey midpoint, never a hue in
+# the middle -- a holding sitting at zero divergence should be visually silent.
+# Expanded from the validated 3 stops to the required 10, symmetric about grey.
+chartDivergingColors = [
+    "#3987e5",
+    "#3975be",
+    "#396497",
+    "#385270",
+    "#384149",
+    "#4b3d3b",
+    "#724846",
+    "#995251",
+    "#bf5d5c",
+    "#e66767",
+]
+
+# --------------------------------------------------------------------------
+# Semantic colours. Reserved for state, never spent on decoration.
+#
+# These drive st.success / st.warning / st.error and coloured text, so the
+# status vocabulary is set once and cannot drift between views. Green and red
+# mean profit and loss here and nothing else.
+# --------------------------------------------------------------------------
+greenColor = "#199e70"          # gain, PASS
+greenTextColor = "#199e70"
+yellowColor = "#c98500"         # warning, THIN
+yellowTextColor = "#c98500"
+orangeColor = "#d95926"         # serious, STALE
+orangeTextColor = "#d95926"
+redColor = "#e66767"            # loss, REFUSED, FAILED
+redTextColor = "#e66767"
+grayColor = "#8a8880"
+
+# --------------------------------------------------------------------------
+# Font. Inter has true tabular figures, which is the whole reason for it:
+# digits must align in a column or a table of numbers cannot be scanned.
+# fontFaces requires a server restart, not just a rerun.
+# --------------------------------------------------------------------------
+font = "Inter, ui-sans-serif, system-ui, sans-serif"
+headingFont = "Inter, ui-sans-serif, system-ui, sans-serif"
+codeFont = "ui-monospace, SFMono-Regular, Menlo, monospace"
+
+# Variable weight face: one file covers 400-600, so no second request.
+[[theme.fontFaces]]
+family = "Inter"
+url = "https://fonts.gstatic.com/s/inter/v20/UcC73FwrK3iLTeHuS_nVMrMxCp50SjIa1ZL7W0Q5nw.woff2"
+weight = "100 900"
+style = "normal"

@@ -16,13 +16,6 @@ from ...data.resolve import (Resolution, Verdict, instrument_from_candidate,
                              resolve_from_listings)
 from .. import state
 
-VERDICT_ICON = {Verdict.PASS: ":material/check_circle:",
-                Verdict.THIN: ":material/warning:",
-                Verdict.STALE: ":material/schedule:",
-                Verdict.FAILED: ":material/block:",
-                Verdict.REFUSED: ":material/dangerous:"}
-
-
 def _probe_from_cache(symbol: str, lookback: int) -> ListingProbe:
     import datetime as dt
     raw = state.probe_symbol(symbol, lookback)
@@ -89,14 +82,14 @@ def _add_form() -> None:
 
     for candidate in refused:
         st.error(f"**{candidate.yahoo_symbol}** refused - "
-                 + " ".join(candidate.reasons), icon=":material/dangerous:")
+                 + " ".join(candidate.reasons))
 
     selectable = [c for c in usable if c.verdict is not Verdict.FAILED]
     if not selectable:
         st.error(resolution.block_reason() or "Every listing failed to return data.")
         return
     if resolution.blocked:
-        st.warning(resolution.block_reason(), icon=":material/warning:")
+        st.warning(resolution.block_reason())
 
     st.markdown("**Choose the listing to use.** Check the ISIN and exchange, not "
                 "just the name: two different funds can share a ticker, an issuer "
@@ -108,11 +101,10 @@ def _add_form() -> None:
 
     chosen = selectable[choice]
     for reason in chosen.reasons:
-        st.warning(reason, icon=VERDICT_ICON[chosen.verdict])
+        st.warning(reason)
     if not chosen.selectable_as_primary:
         st.warning(f"**{chosen.verdict.value}** listings are never chosen for you. "
-                   f"Selecting this one is a deliberate choice.",
-                   icon=":material/warning:")
+                   f"Selecting this one is a deliberate choice.")
 
     with st.form("confirm_instrument"):
         st.write("**Confirm before saving**")
