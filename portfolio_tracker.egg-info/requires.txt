@@ -1,0 +1,13 @@
+numpy>=1.26
+pandas>=2.2
+
+[app]
+streamlit>=1.36
+altair>=5.0
+
+[data]
+requests>=2.31
+yfinance>=0.2.40
+
+[test]
+pytest>=8.0

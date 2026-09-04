@@ -1,0 +1,68 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    # The architectural constraint, enforced by the environment rather than by
+    # a test that could pass on a machine which happens to have Streamlit.
+    name: core tests without streamlit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install core only
+        run: pip install -e ".[test]"
+      - name: Confirm the UI and network libraries really are absent
+        run: |
+          python - <<'PY'
+          import importlib.util as u
+          for module in ("streamlit", "yfinance", "requests"):
+              assert u.find_spec(module) is None, f"{module} must not be installed here"
+          print("clean: no streamlit, no network client")
+          PY
+      - name: Run the suite
+        run: pytest --ignore=portfolio/tests/test_app_smoke.py
+
+  install:
+    # A clean clone must install and launch. Nobody had ever verified this, and
+    # for a while it did not: setuptools refused the flat layout, and yfinance
+    # was missing from the data extra, so every price fetch failed on a fresh
+    # install with "yfinance is not installed".
+    name: clean clone installs and launches
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install exactly as the README instructs
+        run: pip install -e ".[app,data,test]"
+      - name: Every declared provider dependency is importable
+        run: |
+          python - <<'PY'
+          import yfinance, streamlit, altair, requests
+          from portfolio.data.providers.yahoo import YahooProvider
+          from portfolio.data.providers.openfigi import OpenFIGIProvider
+          # Not a network call: this only proves the library is present, which
+          # is the failure a fresh install actually hit.
+          YahooProvider()._ticker("AAPL")
+          print("providers import and can construct their clients")
+          PY
+      - name: Launch the app and check it serves
+        run: |
+          streamlit run portfolio/app/main.py --server.port 8501 --server.headless true &
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8501/_stcore/health > /dev/null; then
+              echo "app is serving"; exit 0
+            fi
+            sleep 2
+          done
+          echo "app failed to start"; exit 1
+      - name: UI smoke tests
+        run: pytest portfolio/tests/test_app_smoke.py
