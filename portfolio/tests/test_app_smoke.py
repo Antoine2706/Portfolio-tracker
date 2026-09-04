@@ -44,18 +44,23 @@ class TestAppShell:
         assert at.sidebar.radio[0].options == ["Holdings", "Risk", "Instruments",
                                                "Transactions"]
 
-    def test_demo_mode_is_the_default_and_is_loud(self):
+    def test_demo_mode_is_the_default_and_is_announced(self):
         """Real data shown while the user believes they are in demo, and demo
-        data shown as real, are both bad enough to warrant a coloured block."""
+        data shown as real, are both bad enough to state on every view."""
         at = run()
-        assert any("DEMO DATA" in w.value for w in at.warning)
+        assert any("DEMO DATA" in m.value for m in at.markdown)
 
     def test_the_mode_banner_does_not_spend_the_loss_colour(self):
         """Red means loss throughout this application. Using it for a mode
-        indicator would weaken it exactly where it carries meaning, so the
-        banner is a warning rather than an error."""
+        indicator would weaken it exactly where it carries meaning."""
         at = run()
         assert not any("DEMO DATA" in e.value for e in at.error)
+
+    def test_the_mode_banner_is_not_a_filled_block(self):
+        """It cannot change without a deliberate click, so full weight on every
+        view only pushes the first real content down the page."""
+        at = run()
+        assert not any("DEMO DATA" in w.value for w in at.warning)
 
     def test_refresh_button_exists(self):
         at = run()

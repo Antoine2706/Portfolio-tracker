@@ -24,6 +24,22 @@ from ..provider import ListingProbe, MarketDataProvider, ProviderError, Quote
 __all__ = ["YahooProvider"]
 
 
+def _explain(exc: Exception) -> str:
+    """A readable sentence for a library exception.
+
+    yfinance surfaces network trouble as its own internal errors -- a
+    `TypeError` from parsing a response that never arrived, for instance -- so
+    the raw message is often about iteration rather than about the network.
+    Naming the exception type keeps it diagnosable without pretending the
+    underlying text is an explanation.
+    """
+    text = str(exc).strip()
+    if not text or "NoneType" in text:
+        return (f"the provider returned nothing usable ({type(exc).__name__}). "
+                f"This is usually an unreachable network or an unknown symbol.")
+    return f"{type(exc).__name__}: {text}"
+
+
 class YahooProvider(MarketDataProvider):
     name = "yfinance"
     # Yahoo does not state a per-call delay. 15 minutes is the conventional
@@ -77,25 +93,42 @@ class YahooProvider(MarketDataProvider):
 
     def history(self, symbol: str, start: dt.date | None = None) -> pd.Series:
         ticker = self._ticker(symbol)
-        # auto_adjust=True: the risk mathematics must run on adjusted closes.
-        hist = ticker.history(start=start.isoformat() if start else None,
-                              period=None if start else "2y",
-                              interval="1d", auto_adjust=True)
+        try:
+            # auto_adjust=True: the risk mathematics must run on adjusted closes.
+            hist = ticker.history(start=start.isoformat() if start else None,
+                                  period=None if start else "2y",
+                                  interval="1d", auto_adjust=True)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                self.name,
+                f"could not load history for {symbol}: {_explain(exc)}") from exc
         if hist is None or hist.empty:
-            raise ProviderError(self.name, f"no history for {symbol}")
+            raise ProviderError(self.name, f"no history returned for {symbol}")
         series = hist["Close"].astype(float)
         series.index = pd.DatetimeIndex([d.date() for d in series.index])
         series.name = symbol
         return series
 
     def quote(self, symbol: str) -> Quote:
+        """Latest price, or a clearly-marked last close.
+
+        Every failure leaves here as a `ProviderError` carrying a sentence. An
+        unwrapped library exception -- yfinance raising `TypeError: argument of
+        type 'NoneType' is not iterable` deep inside its own parsing, say --
+        would surface a Python internal to someone reading their portfolio,
+        which is the one thing every other failure path in this project avoids.
+        """
         ticker = self._ticker(symbol)
+        currency = "EUR"
         try:
             info = ticker.fast_info
             price = getattr(info, "last_price", None)
             currency = getattr(info, "currency", None) or "EUR"
         except Exception:
-            price, currency = None, "EUR"
+            # A missing live quote is ordinary; fall through to the last close.
+            price = None
 
         if price is not None:
             return Quote(symbol=symbol, price=Decimal(str(round(float(price), 6))),
@@ -104,9 +137,17 @@ class YahooProvider(MarketDataProvider):
                          delay_minutes=self.documented_delay_minutes)
 
         # Fall back to the last close, explicitly marked. Never presented as live.
-        hist = ticker.history(period="5d", interval="1d", auto_adjust=True)
+        try:
+            hist = ticker.history(period="5d", interval="1d", auto_adjust=True)
+        except Exception as exc:
+            raise ProviderError(
+                self.name,
+                f"no price available for {symbol}: {_explain(exc)}") from exc
         if hist is None or hist.empty:
-            raise ProviderError(self.name, f"no quote or recent close for {symbol}")
+            raise ProviderError(
+                self.name,
+                f"no quote and no recent close for {symbol}. The symbol may be "
+                f"wrong, or the provider may be unreachable.")
         return Quote(symbol=symbol,
                      price=Decimal(str(round(float(hist["Close"].iloc[-1]), 6))),
                      currency=currency, as_of=hist.index[-1].date(),

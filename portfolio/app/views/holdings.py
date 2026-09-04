@@ -13,7 +13,7 @@ import streamlit as st
 
 from ...core.positions import derive_positions
 from ...core.report import holdings_table
-from .. import charts, state
+from .. import charts, notices, state
 
 
 def _num(value) -> float | None:
@@ -56,39 +56,31 @@ def render() -> None:
 
     # ---- 1. Primary position, largest thing on the page ------------------
     # Colour means state: green is gain, red is loss. A zero P&L is neither, so
-    # the delta is rendered neutral rather than picking up the default green.
+    # the delta is omitted entirely rather than shown neutral -- st.metric always
+    # draws an arrow alongside a delta, and zero has no direction.
     unrealised = table.total_unrealised.amount
-    st.metric("Portfolio value",
-              f"{table.total_value.amount:,.2f} EUR",
-              delta=f"{unrealised:+,.2f} EUR unrealised",
-              delta_color="normal" if unrealised != 0 else "off")
+    st.metric("Portfolio value", f"{table.total_value.amount:,.2f} EUR",
+              delta=(f"{unrealised:+,.2f} EUR unrealised" if unrealised else None))
+    if not unrealised:
+        st.caption("no unrealised profit or loss")
     st.caption(state.last_refresh_text() + " - prices are delayed, never real time")
 
     # ---- 2. Exceptions, immediately after ---------------------------------
-    exceptions: list[str] = []
-    for row in table.rows:
-        for warning in row.warnings:
-            exceptions.append(f"**{row.name}** - {warning}")
-    if table.unpriced:
-        names = ", ".join(instruments[i].name if i in instruments else i
-                          for i in table.unpriced)
-        exceptions.append(
-            f"Excluded from the total because no price was returned: {names}. "
-            f"The total above is therefore incomplete.")
-    if exceptions or failures:
-        with st.container(border=True):
-            st.markdown("**Needs attention**")
-            for note in exceptions:
-                st.warning(note)
-            # Fetch failures are collapsed into one line. Ten near-identical
-            # warnings is not ten pieces of information, and an exception panel
-            # long enough to fill the page stops being read at all.
-            if failures:
-                st.warning(f"{len(failures)} price fetch(es) failed. Values "
-                           f"below are incomplete.")
-                with st.expander(f"Show the {len(failures)} failures"):
-                    for failure in failures:
-                        st.caption(failure)
+    # One summary line, then quiet detail. No paragraph re-listing the excluded
+    # holdings: the individual lines already name them, and stating the same
+    # thing four times is not four pieces of information.
+    problems = [f"**{row.name}** - {warning}"
+                for row in table.rows for warning in row.warnings]
+    if problems:
+        incomplete = (" The total above is therefore incomplete."
+                      if table.unpriced else "")
+        notices.notices(
+            f"{len(problems)} holding{'s' if len(problems) != 1 else ''} could "
+            f"not be valued.{incomplete}", problems)
+    if failures:
+        notices.notices(
+            f"{len(failures)} price fetch{'es' if len(failures) != 1 else ''} "
+            f"failed.", failures, detail_label="Show the rest")
 
     # ---- 3. One chart ------------------------------------------------------
     st.subheader("Weight by holding")
@@ -110,6 +102,13 @@ def render() -> None:
         "P&L %": _num(r.unrealised_pct),
         "Weight": _num(r.weight),
     } for r in table.rows])
+
+    # Coerce to float so missing values are NaN rather than None. A column
+    # holding only None stays object dtype and Streamlit prints the literal
+    # string "None" in every cell, which reads as data.
+    for column in ("Quantity", "Avg cost", "Price", "Value", "P&L", "P&L %",
+                   "Weight"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
     st.dataframe(
         frame, hide_index=True, width="stretch",

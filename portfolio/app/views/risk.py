@@ -26,7 +26,7 @@ from ...core.risk import (HIGH_CORRELATION_THRESHOLD, beta, concentration,
                           portfolio_value_series, risk_decomposition,
                           standalone_volatilities)
 from ...data.benchmarks import BENCHMARKS, DEFAULT_BENCHMARK
-from .. import charts, state
+from .. import charts, notices, state
 
 
 def render() -> None:
@@ -108,10 +108,10 @@ def render() -> None:
     exceptions += sentences
 
     if exceptions:
-        with st.container(border=True):
-            st.markdown("**Needs attention**")
-            for note in exceptions:
-                st.warning(note)
+        n = len(exceptions)
+        notices.notices(
+            f"{n} thing{'s' if n != 1 else ''} qualif{'y' if n != 1 else 'ies'} "
+            f"the figures below.", exceptions)
 
     # ---- 3. One chart: the divergence -------------------------------------
     st.subheader("Capital share against risk share")

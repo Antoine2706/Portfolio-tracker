@@ -11,8 +11,17 @@ dependencies = ["numpy>=1.26", "pandas>=2.2"]
 [project.optional-dependencies]
 # The test suite must run with these alone -- no streamlit, no network client.
 test = ["pytest>=8.0"]
-app = ["streamlit>=1.36"]
-data = ["requests>=2.31"]
+app = ["streamlit>=1.36", "altair>=5.0"]
+# yfinance is not optional to this extra: YahooProvider imports it directly, so
+# installing `data` without it produces an application that cannot fetch a
+# single price. requests alone was never enough.
+data = ["requests>=2.31", "yfinance>=0.2.40"]
+
+# Without this, a flat-layout clone fails to install: setuptools finds both
+# `portfolio` and `spike` at the top level and refuses to guess. `spike/` is
+# throwaway validation scripts and is deliberately not packaged.
+[tool.setuptools.packages.find]
+include = ["portfolio*"]
 
 [tool.pytest.ini_options]
 testpaths = ["portfolio/tests", "portfolio/core"]

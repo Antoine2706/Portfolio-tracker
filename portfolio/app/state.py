@@ -69,12 +69,17 @@ def mode_banner() -> None:
     caption. Demo mode uses the warning colour rather than the error colour:
     red is reserved for loss throughout this application, and spending it on a
     mode indicator would weaken it where it carries meaning.
+
+    A single coloured line rather than a filled block. The mode cannot change
+    without a deliberate click, so it does not need to be re-announced at full
+    weight on every view -- and a heavy banner pushes the first real content
+    down the page on every one of them.
     """
     if current_mode() is DataMode.SEED:
-        st.warning("**DEMO DATA** - seed instruments and a synthetic ledger. "
-                   "These are not your positions.")
+        st.markdown(":orange[**DEMO DATA** - seed instruments and a synthetic "
+                    "ledger. These are not your positions.]")
     else:
-        st.success("**LIVE DATA** - your own instruments and ledger.")
+        st.markdown(":green[**LIVE DATA** - your own instruments and ledger.]")
 
 
 # --------------------------------------------------------------------------
