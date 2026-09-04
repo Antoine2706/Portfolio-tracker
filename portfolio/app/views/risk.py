@@ -86,9 +86,11 @@ def render() -> None:
 
     # ---- 1. The headline, largest on the page -----------------------------
     if rows:
+        # No delta: st.metric always draws a direction arrow beside one, and an
+        # arrow next to a fund name means nothing. The name is in the sentence
+        # below, where it reads as language rather than as a metric.
         st.metric("Largest gap between capital and risk",
-                  f"{rows[0].divergence:+.1%}",
-                  delta=rows[0].name, delta_color="off")
+                  f"{rows[0].divergence:+.1%}")
         st.markdown(f"**{rows[0].sentence()}**")
     st.caption(f"Window used: {alignment.summary()}")
 
@@ -119,7 +121,7 @@ def render() -> None:
                "of the money. Bars at zero are behaving as expected.")
     st.altair_chart(
         charts.divergence_bars([(r.name, r.divergence) for r in rows]),
-        use_container_width=True)
+        width="stretch")
 
     # ---- 4. The dense table ------------------------------------------------
     st.dataframe(
@@ -206,4 +208,4 @@ def render() -> None:
     st.altair_chart(
         charts.correlation_heatmap(
             corr, [instruments[i].name if i in instruments else i for i in used]),
-        use_container_width=True)
+        width="stretch")
