@@ -8,6 +8,14 @@ data_store/user/
 # and is regenerated on every run.
 spike/results/
 
+# Build artefacts. portfolio_tracker.egg-info/ was committed by accident while
+# verifying the packaging fix, and its SOURCES.txt is rewritten by every
+# `pip install -e`, so it shows up as a spurious diff on any machine that has
+# installed the project.
+*.egg-info/
+build/
+dist/
+
 __pycache__/
 *.py[cod]
 .venv/
