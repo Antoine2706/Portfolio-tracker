@@ -86,9 +86,11 @@ def render() -> None:
 
     # ---- 1. The headline, largest on the page -----------------------------
     if rows:
+        # No delta: st.metric always draws a direction arrow beside one, and an
+        # arrow next to a fund name means nothing. The name is in the sentence
+        # below, where it reads as language rather than as a metric.
         st.metric("Largest gap between capital and risk",
-                  f"{rows[0].divergence:+.1%}",
-                  delta=rows[0].name, delta_color="off")
+                  f"{rows[0].divergence:+.1%}")
         st.markdown(f"**{rows[0].sentence()}**")
     st.caption(f"Window used: {alignment.summary()}")
 
