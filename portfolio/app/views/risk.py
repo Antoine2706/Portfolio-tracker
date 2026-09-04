@@ -14,11 +14,17 @@ import pandas as pd
 import streamlit as st
 
 from ...core.positions import derive_positions, weights
-from ...core.report import (correlation_sentences, divergence_rows, risk_metrics)
-from ...core.returns import DEFAULT_LOOKBACK, InsufficientHistory, align_returns
-from ...core.risk import (concentration, correlation_matrix, covariance_matrix,
+from ...core.report import (correlation_sentences, divergence_rows, risk_metrics,
+                            volatility_context)
+from ...core.returns import (DEFAULT_LOOKBACK, InsufficientHistory,
+                             align_returns, simple_returns)
+from ...core.risk import (HIGH_CORRELATION_THRESHOLD, beta, concentration,
+                          correlation_matrix, covariance_matrix,
                           diversification_ratio, drawdown, high_correlation_pairs,
-                          risk_decomposition)
+                          normalise_weights, portfolio_return_series,
+                          portfolio_value_series, risk_decomposition,
+                          standalone_volatilities)
+from ...data.benchmarks import BENCHMARKS, DEFAULT_BENCHMARK
 from .. import state
 
 
@@ -71,16 +77,11 @@ def render() -> None:
         st.error(f"**No covariance matrix can be built.** {exc}")
         return
 
-    used = [i for i in held if i in returns.columns]
-    w = {i: float(held[i]) for i in used}
-    scale = sum(w.values())
-    if scale <= 0:
+    used = [i for i in returns.columns if i in held]
+    w = normalise_weights({i: float(held[i]) for i in held}, used)
+    if not w:
         st.error("Excluded holdings carry all the weight; nothing left to model.")
         return
-    # Renormalising over the surviving instruments is arithmetic, but it is the
-    # one thing a view legitimately owns: it is choosing what to display, not
-    # deriving a risk figure. The weights themselves come from core.
-    w = {k: v / scale for k, v in w.items()}
 
     cov = covariance_matrix(returns[used])
     decomposition = risk_decomposition(w, cov)
@@ -114,33 +115,77 @@ def render() -> None:
 
     # ---- 3. Headline metrics, each with its plain sentence ---------------
     st.subheader("Portfolio measures")
-    dd = None
-    portfolio_returns = (returns[used] * pd.Series(w)).sum(axis=1)
-    value_series = (1.0 + portfolio_returns).cumprod()
-    dd = drawdown(value_series)
 
+    benchmark = st.selectbox(
+        "Benchmark for beta", BENCHMARKS,
+        index=BENCHMARKS.index(DEFAULT_BENCHMARK),
+        format_func=lambda b: f"{b.index} - {b.name} ({b.symbol})",
+        help="Named on screen because a beta without a stated benchmark is "
+             "meaningless. All options are EUR-quoted, so the beta is not "
+             "measuring a currency as well as an index.")
+    st.caption(benchmark.note)
+
+    beta_value = None
+    portfolio_returns = portfolio_return_series(returns[used], w)
+    try:
+        benchmark_prices = state.fetch_history(benchmark.symbol)
+        beta_value = beta(portfolio_returns, simple_returns(benchmark_prices))
+    except Exception as exc:
+        st.warning(f"Beta not shown: could not load {benchmark.symbol} "
+                   f"({exc}). A beta without its benchmark series is not a "
+                   f"number worth guessing at.", icon=":material/warning:")
+
+    dd = drawdown(portfolio_value_series(returns[used], w))
     metrics = risk_metrics(
         decomposition, diversification_ratio(w, cov),
-        concentration(list(w.values())), drawdown_stats=dd)
+        concentration(list(w.values())), drawdown_stats=dd,
+        beta_value=beta_value,
+        benchmark_name=benchmark.label if beta_value is not None else None)
+
+    # Effective holdings is given the most weight of the three concentration
+    # readings: it is the only one that sees a cluster of holdings all making
+    # the same bet. Pairwise correlation reports edges and structurally cannot
+    # see the group.
+    lead = next(m for m in metrics if m.label == "Effective holdings")
+    st.metric(lead.label, lead.value)
+    st.markdown(f"**{lead.sentence}**")
+    st.divider()
+
     for metric in metrics:
+        if metric is lead:
+            continue
         st.metric(metric.label, metric.value)
         st.caption(metric.sentence)
         if metric.warning:
             st.warning(metric.warning, icon=":material/warning:")
-    st.caption("Beta needs a benchmark series; none is configured yet, so it is "
-               "not shown. A beta without a named benchmark is meaningless.")
+
+    st.subheader("How volatile each holding is on its own")
+    st.caption("A broad European equity index typically sits near 15% a year. "
+               "Most thematic ETFs run two to three times that, and that is "
+               "what the concentration costs.")
+    st.dataframe(pd.DataFrame(
+        [{"Instrument": name, "Annualised volatility": value,
+          "Times a broad European index": multiple}
+         for name, value, multiple in
+         volatility_context(standalone_volatilities(cov), instruments)],
+    ), hide_index=True, width="stretch")
 
     # ---- 4. Correlation as sentences, before the matrix -------------------
     corr = correlation_matrix(cov)
     pairs = high_correlation_pairs(corr)
     st.subheader("Holdings that may be duplicating each other")
+    st.caption(f"Pairs correlating above {HIGH_CORRELATION_THRESHOLD:.2f}. "
+               f"This is a pairwise measure: it reports one edge at a time and "
+               f"cannot see a group of holdings that all make the same bet. "
+               f"For that, read the effective holdings figure above.")
     sentences = correlation_sentences(pairs, instruments)
     if sentences:
         for sentence in sentences:
             st.warning(sentence, icon=":material/content_copy:")
     else:
-        st.caption("No pair moves together above 0.90. Nothing here looks like "
-                   "the same exposure held twice.")
+        st.caption(f"No pair moves together above "
+                   f"{HIGH_CORRELATION_THRESHOLD:.2f}. Nothing here looks like "
+                   f"the same exposure held twice.")
 
     # ---- 5. The heatmap, as supporting detail ----------------------------
     st.subheader("Correlation matrix")

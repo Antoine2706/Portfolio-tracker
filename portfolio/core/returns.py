@@ -133,12 +133,18 @@ class AlignmentReport:
         return base
 
 
-def simple_returns(prices: pd.DataFrame) -> pd.DataFrame:
+def simple_returns(prices: "pd.DataFrame | pd.Series"):
     """r_t = P_t / P_{t-1} - 1, dropping the undefined first row.
+
+    Accepts a Series as well as a frame so a single benchmark series can be
+    converted here rather than in a view. Returning the same type it was given
+    keeps the caller from having to unwrap anything.
 
     >>> import pandas as pd
     >>> px = pd.DataFrame({"A": [100.0, 110.0, 99.0]})
     >>> [round(r, 10) for r in simple_returns(px)["A"]]
+    [0.1, -0.1]
+    >>> [round(r, 10) for r in simple_returns(pd.Series([100.0, 110.0, 99.0]))]
     [0.1, -0.1]
     """
     return prices.astype(float).pct_change().iloc[1:]

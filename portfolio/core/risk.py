@@ -37,11 +37,29 @@ __all__ = [
     "covariance_matrix", "portfolio_volatility", "annualise_volatility",
     "risk_decomposition", "diversification_ratio", "concentration",
     "correlation_matrix", "high_correlation_pairs", "drawdown", "beta",
-    "HIGH_CORRELATION_THRESHOLD",
+    "portfolio_return_series", "portfolio_value_series", "normalise_weights",
+    "standalone_volatilities", "HIGH_CORRELATION_THRESHOLD",
+    "BROAD_EUROPEAN_EQUITY_VOLATILITY",
 ]
 
 # Above this, two holdings are likely the same exposure wearing two tickers.
-HIGH_CORRELATION_THRESHOLD = 0.90
+#
+# Lowered from 0.90 to 0.85 on measured evidence. On the real portfolio over
+# 300 aligned days, five defence pairs sit between 0.77 and 0.99 and only one
+# crosses 0.90 -- so a book holding four defence ETFs would raise a single
+# warning while carrying essentially one bet across four lines. 0.85 also
+# catches Grains against Wheat at 0.848, which is nearly the same trade.
+#
+# This is a threshold on a pairwise measure, and pairwise comparison
+# structurally cannot see a mutually correlated cluster: it can only report
+# edges, never the group. Effective number of holdings is the metric that
+# captures that, which is why the interface gives it more weight than this list.
+HIGH_CORRELATION_THRESHOLD = 0.85
+
+# Rough annualised volatility of a broad European equity index. Not computed,
+# not a claim about any particular index -- a reference point so a 44% thematic
+# ETF reads as what it is rather than as an ordinary number.
+BROAD_EUROPEAN_EQUITY_VOLATILITY = 0.15
 
 
 def _as_weight_vector(weights, columns) -> np.ndarray:
@@ -63,6 +81,55 @@ def _as_weight_vector(weights, columns) -> np.ndarray:
                 f"weights has shape {w.shape}, expected ({len(columns)},) to match "
                 f"the covariance matrix")
     return w
+
+
+def normalise_weights(weights: dict[str, float],
+                      keys: "list[str] | None" = None) -> dict[str, float]:
+    """Rescale weights over a subset so they sum to 1.
+
+    Needed whenever an instrument is excluded from the risk model but still
+    held: the remaining weights must be re-based or every risk figure is
+    computed against a portfolio that does not exist. It lives here rather than
+    in a view because it is arithmetic, and arithmetic in a view is untested.
+    """
+    subset = {k: float(v) for k, v in weights.items()
+              if keys is None or k in set(keys)}
+    total = sum(subset.values())
+    if total <= 0:
+        return {}
+    return {k: v / total for k, v in subset.items()}
+
+
+def portfolio_return_series(returns: pd.DataFrame,
+                            weights: dict[str, float]) -> pd.Series:
+    """Daily portfolio return, the weighted sum of its holdings' returns.
+
+    This is where simple returns earn their place: the portfolio return really
+    is the weighted sum of simple returns, which is not true of log returns.
+    Weights are applied by name, never by column position.
+    """
+    aligned = _as_weight_vector(weights, returns.columns)
+    return (returns.astype(float) * aligned).sum(axis=1)
+
+
+def portfolio_value_series(returns: pd.DataFrame, weights: dict[str, float],
+                           start: float = 1.0) -> pd.Series:
+    """Cumulative value of one unit invested, for drawdown."""
+    return start * (1.0 + portfolio_return_series(returns, weights)).cumprod()
+
+
+def standalone_volatilities(cov: pd.DataFrame,
+                            trading_days: int = TRADING_DAYS_PER_YEAR
+                            ) -> pd.Series:
+    """Annualised volatility of each holding on its own.
+
+    Shown beside the portfolio figure because the contrast is the point: a
+    thematic ETF at two to three times a broad index is what concentration
+    costs, and it is invisible if only the portfolio number is displayed.
+    """
+    daily = np.sqrt(np.diag(cov.to_numpy()))
+    return pd.Series(daily * np.sqrt(trading_days), index=cov.columns
+                     ).sort_values(ascending=False)
 
 
 def covariance_matrix(returns: pd.DataFrame) -> pd.DataFrame:

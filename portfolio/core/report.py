@@ -29,12 +29,14 @@ from .models import Instrument
 from .money import BASE_CURRENCY, FxRates, Money
 from .positions import Position
 from .returns import AlignmentReport
-from .risk import (ConcentrationStats, CorrelationPair, DrawdownStats,
-                   RiskDecomposition, annualise_volatility)
+from .risk import (BROAD_EUROPEAN_EQUITY_VOLATILITY, ConcentrationStats,
+                   CorrelationPair, DrawdownStats, RiskDecomposition,
+                   annualise_volatility)
 
 __all__ = [
     "HoldingRow", "HoldingsTable", "DivergenceRow", "Metric", "RiskReport",
     "holdings_table", "divergence_rows", "risk_metrics", "correlation_sentences",
+    "volatility_context",
 ]
 
 
@@ -248,10 +250,20 @@ def risk_metrics(decomposition: RiskDecomposition,
                  trading_days: int = 252) -> list[Metric]:
     """Headline metrics, each with a plain-language explanation."""
     annual = annualise_volatility(decomposition.portfolio_volatility, trading_days)
+    # A volatility figure means little without something to measure it against.
+    # A broad European equity index sits near 15%; most thematic ETFs here run
+    # two to three times that, and that is what the concentration costs.
+    multiple = annual / BROAD_EUROPEAN_EQUITY_VOLATILITY
+    comparison = (f" That is about {multiple:.1f} times a broad European equity "
+                  f"index, which typically sits near "
+                  f"{BROAD_EUROPEAN_EQUITY_VOLATILITY:.0%}."
+                  if multiple >= 1.15 else
+                  f" A broad European equity index typically sits near "
+                  f"{BROAD_EUROPEAN_EQUITY_VOLATILITY:.0%}.")
     out = [
         Metric("Annualised volatility", f"{annual:.2%}",
                f"In a typical year this portfolio moves about {annual:.1%} "
-               f"either way."),
+               f"either way." + comparison),
         Metric("Diversification ratio", f"{diversification:.2f}",
                f"Your holdings are about {diversification:.1f} times as "
                f"diversified as owning just one of them. 1.0 would mean they "
@@ -261,7 +273,8 @@ def risk_metrics(decomposition: RiskDecomposition,
                f"of {concentration_stats.actual_holdings}",
                f"{concentration_stats.actual_holdings} positions behaving like "
                f"about {concentration_stats.effective_holdings:.0f} independent "
-               f"ones."),
+               f"ones. This is the measure that sees a cluster of holdings all "
+               f"making the same bet; comparing pairs one at a time cannot."),
     ]
     if drawdown_stats is not None:
         out.append(Metric(
@@ -272,12 +285,28 @@ def risk_metrics(decomposition: RiskDecomposition,
     if beta_value is not None:
         name = benchmark_name or "the benchmark"
         out.append(Metric(
-            "Beta", f"{beta_value:.2f}",
+            f"Beta vs {name}" if benchmark_name else "Beta", f"{beta_value:.2f}",
             f"When {name} moves 1%, this portfolio has moved about "
             f"{beta_value:.2f}% in the same direction.",
             warning=None if benchmark_name else
             "no benchmark named; a beta without one is meaningless"))
     return out
+
+
+def volatility_context(standalone: pd.Series,
+                       instruments: dict[str, Instrument]) -> list[tuple[str, str, str]]:
+    """Each holding's own annualised volatility, against a broad index.
+
+    Returned as (name, value, comparison) so the view formats and does not
+    compute. The contrast is the point: a 44% thematic ETF beside a 15%
+    reference is what thematic concentration costs, stated plainly.
+    """
+    rows = []
+    for isin, vol in standalone.items():
+        name = instruments[isin].name if isin in instruments else str(isin)
+        multiple = float(vol) / BROAD_EUROPEAN_EQUITY_VOLATILITY
+        rows.append((name, f"{float(vol):.1%}", f"{multiple:.1f}x"))
+    return rows
 
 
 def correlation_sentences(pairs: list[CorrelationPair],

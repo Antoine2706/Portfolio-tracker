@@ -14,7 +14,9 @@ from portfolio.core.risk import (HIGH_CORRELATION_THRESHOLD, annualise_volatilit
                                  beta, concentration, correlation_matrix,
                                  covariance_matrix, diversification_ratio,
                                  drawdown, high_correlation_pairs,
-                                 portfolio_volatility, risk_decomposition)
+                                 normalise_weights, portfolio_return_series,
+                                 portfolio_value_series, portfolio_volatility,
+                                 risk_decomposition, standalone_volatilities)
 
 A, B, C = "IE0002Y8CX98", "IE000IAXNM41", "LU1681048630"
 
@@ -266,3 +268,121 @@ class TestCovarianceRefusals:
     def test_no_instruments_refused(self):
         with pytest.raises(ValueError, match="at least one instrument"):
             covariance_matrix(pd.DataFrame(index=[0, 1]))
+
+
+class TestPortfolioSeries:
+    """Moved out of the Risk view: arithmetic in a view is arithmetic nothing tests."""
+
+    def _returns(self):
+        rng = np.random.default_rng(5)
+        return pd.DataFrame(rng.normal(0, 0.01, (100, 3)),
+                            columns=[A, B, C],
+                            index=pd.bdate_range("2026-01-01", periods=100))
+
+    def test_portfolio_return_is_the_weighted_sum(self):
+        """Simple returns aggregate across assets; log returns do not. This is
+        the property the whole return-type choice rests on."""
+        r = self._returns()
+        w = {A: 0.5, B: 0.3, C: 0.2}
+        got = portfolio_return_series(r, w)
+        expected = r[A] * 0.5 + r[B] * 0.3 + r[C] * 0.2
+        assert np.allclose(got, expected)
+
+    def test_weights_applied_by_name_not_position(self):
+        r = self._returns()
+        assert np.allclose(portfolio_return_series(r, {C: 0.2, A: 0.5, B: 0.3}),
+                           portfolio_return_series(r, {A: 0.5, B: 0.3, C: 0.2}))
+
+    def test_value_series_compounds_from_one(self):
+        r = self._returns()
+        w = {A: 0.5, B: 0.3, C: 0.2}
+        v = portfolio_value_series(r, w)
+        assert v.iloc[0] == pytest.approx(1 + portfolio_return_series(r, w).iloc[0])
+        assert len(v) == len(r)
+
+    def test_drawdown_of_the_value_series_is_never_positive(self):
+        r = self._returns()
+        assert drawdown(portfolio_value_series(r, {A: 0.5, B: 0.3, C: 0.2})) \
+            .max_drawdown <= 0
+
+
+class TestNormaliseWeights:
+    def test_subset_sums_to_one(self):
+        got = normalise_weights({A: 0.5, B: 0.3, C: 0.2}, [A, B])
+        assert sum(got.values()) == pytest.approx(1.0)
+        assert set(got) == {A, B}
+
+    def test_preserves_relative_proportions(self):
+        got = normalise_weights({A: 0.5, B: 0.3, C: 0.2}, [A, B])
+        assert got[A] / got[B] == pytest.approx(0.5 / 0.3)
+
+    def test_empty_subset_gives_empty(self):
+        assert normalise_weights({A: 0.5}, []) == {}
+
+    def test_all_zero_weights_give_empty_rather_than_dividing_by_zero(self):
+        assert normalise_weights({A: 0.0, B: 0.0}) == {}
+
+
+class TestCorrelationThreshold:
+    """0.85, lowered from 0.90 on measured evidence from the real portfolio."""
+
+    def test_threshold_is_085(self):
+        assert HIGH_CORRELATION_THRESHOLD == 0.85
+
+    def _cov(self, rho: float) -> pd.DataFrame:
+        """Sigma with sigma_A = 0.02, sigma_B = 0.01, so corr == rho exactly."""
+        return pd.DataFrame([[0.0004, rho * 0.0002], [rho * 0.0002, 0.0001]],
+                            index=[A, B], columns=[A, B])
+
+    def test_grains_against_wheat_at_0848_falls_just_below(self):
+        """Documented, not asserted as desired: 0.848 < 0.85, so the observed
+        Grains/Wheat pair does NOT fire at this threshold.
+
+        The intent behind lowering the threshold was to catch that pair. It
+        misses by 0.002. The value is left at the specified 0.85 rather than
+        quietly tuned to 0.84, because a threshold chosen to fit one observation
+        is a threshold that means nothing -- but the gap is real and the choice
+        is the user's.
+        """
+        assert 0.848 < HIGH_CORRELATION_THRESHOLD
+        assert high_correlation_pairs(correlation_matrix(self._cov(0.848))) == []
+
+    def test_a_pair_at_the_threshold_fires(self):
+        assert len(high_correlation_pairs(correlation_matrix(self._cov(0.85)))) == 1
+
+    def test_090_would_have_missed_this_range_entirely(self):
+        """The old threshold missed everything between 0.85 and 0.90."""
+        pairs = high_correlation_pairs(correlation_matrix(self._cov(0.87)))
+        assert pairs and pairs[0].correlation < 0.90
+
+    def test_still_ignores_a_genuinely_different_exposure(self):
+        assert high_correlation_pairs(correlation_matrix(self._cov(0.55))) == []
+
+    def test_the_defence_pair_at_099_fires(self):
+        """The observed correlation between the two European defence ETFs.
+        Different issuers, different ISINs, one position for risk purposes."""
+        pairs = high_correlation_pairs(correlation_matrix(self._cov(0.990)))
+        assert pairs and pairs[0].correlation == pytest.approx(0.990, abs=1e-6)
+
+    def test_pairwise_misses_a_cluster_that_effective_holdings_catches(self):
+        """Four holdings mutually correlated at 0.80 raise no pairwise flag,
+        yet behave as far fewer than four independent positions. This is why
+        the interface gives effective holdings more weight than the pair list."""
+        n, rho = 4, 0.80
+        matrix = np.full((n, n), rho * 0.0004)
+        np.fill_diagonal(matrix, 0.0004)
+        cov = pd.DataFrame(matrix, index=list("WXYZ"), columns=list("WXYZ"))
+        assert high_correlation_pairs(correlation_matrix(cov)) == []
+        w = [0.25] * n
+        # Equal weights give an effective count of 4 by capital, but the
+        # diversification ratio shows they are not 4 independent bets.
+        assert concentration(w).effective_holdings == pytest.approx(4.0)
+        assert diversification_ratio(w, cov) < 1.15
+
+
+class TestStandaloneVolatilities:
+    def test_annualised_and_sorted_descending(self):
+        cov = pd.DataFrame([[0.0004, 0.0], [0.0, 0.0001]], index=[A, B], columns=[A, B])
+        vols = standalone_volatilities(cov)
+        assert list(vols.index) == [A, B]
+        assert vols[A] == pytest.approx(0.02 * np.sqrt(252))
