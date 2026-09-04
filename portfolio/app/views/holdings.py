@@ -86,7 +86,7 @@ def render() -> None:
     st.subheader("Weight by holding")
     weights = [(r.name, float(r.weight)) for r in table.rows if r.weight is not None]
     if weights:
-        st.altair_chart(charts.weight_bars(weights), use_container_width=True)
+        st.altair_chart(charts.weight_bars(weights), width="stretch")
 
     # ---- 4. The dense table -----------------------------------------------
     st.subheader("Positions")

@@ -121,7 +121,7 @@ def render() -> None:
                "of the money. Bars at zero are behaving as expected.")
     st.altair_chart(
         charts.divergence_bars([(r.name, r.divergence) for r in rows]),
-        use_container_width=True)
+        width="stretch")
 
     # ---- 4. The dense table ------------------------------------------------
     st.dataframe(
@@ -208,4 +208,4 @@ def render() -> None:
     st.altair_chart(
         charts.correlation_heatmap(
             corr, [instruments[i].name if i in instruments else i for i in used]),
-        use_container_width=True)
+        width="stretch")
