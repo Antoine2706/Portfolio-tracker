@@ -1,27 +1,44 @@
 [project]
 name = "portfolio-tracker"
-version = "0.1.0"
+version = "0.2.0"
 description = "Personal investment portfolio tracker with real risk analytics"
 requires-python = ">=3.11"
 
 # core/ needs numpy and pandas for the risk mathematics and nothing else.
-# streamlit appears only under [app]: core must import without it.
+# Nothing UI-related may appear here: core must import without it.
 dependencies = ["numpy>=1.26", "pandas>=2.2"]
 
 [project.optional-dependencies]
-# The test suite must run with these alone -- no streamlit, no network client.
+# The core test suite must run with these alone -- no web framework, no network client.
 test = ["pytest>=8.0"]
-app = ["streamlit>=1.36", "altair>=5.0"]
+# The application: API server and the static web client it serves. httpx is
+# what FastAPI's TestClient needs, so the API tests run wherever the app does.
+app = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "pydantic>=2.5",
+    "python-multipart>=0.0.9",
+    "openpyxl>=3.1",
+    "httpx>=0.27",
+]
 # yfinance is not optional to this extra: YahooProvider imports it directly, so
 # installing `data` without it produces an application that cannot fetch a
 # single price. requests alone was never enough.
 data = ["requests>=2.31", "yfinance>=0.2.40"]
+
+[project.scripts]
+portfolio = "portfolio.cli:main"
 
 # Without this, a flat-layout clone fails to install: setuptools finds both
 # `portfolio` and `spike` at the top level and refuses to guess. `spike/` is
 # throwaway validation scripts and is deliberately not packaged.
 [tool.setuptools.packages.find]
 include = ["portfolio*"]
+
+# The web client and the seed data ship inside the wheel, so `pip install`
+# followed by `portfolio serve` is the whole installation.
+[tool.setuptools.package-data]
+portfolio = ["web/**/*", "data_store/seed/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["portfolio/tests", "portfolio/core"]

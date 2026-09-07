@@ -15,3 +15,8 @@ venv/
 .env
 .pytest_cache/
 .DS_Store
+
+# Build metadata and the price cache are regenerated, never committed.
+*.egg-info/
+portfolio/data_store/cache/
+data_store/cache/

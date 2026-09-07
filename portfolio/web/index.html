@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Portfolio</title>
+  <meta name="color-scheme" content="dark light">
+  <meta name="theme-color" content="#0f0f0e" media="(prefers-color-scheme: dark)">
+  <meta name="theme-color" content="#f6f6f3" media="(prefers-color-scheme: light)">
+  <script>
+    // Apply the theme before first paint: stored choice wins, else the OS preference.
+    (function () {
+      var t = null;
+      try { t = localStorage.getItem("pt.theme"); } catch (e) {}
+      if (t !== "light" && t !== "dark") {
+        t = window.matchMedia && window.matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+      }
+      document.documentElement.setAttribute("data-theme", t);
+    })();
+  </script>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%233987e5'/%3E%3Crect x='6' y='18' width='5' height='8' rx='1.5' fill='%23fff' opacity='.55'/%3E%3Crect x='13.5' y='12' width='5' height='14' rx='1.5' fill='%23fff' opacity='.8'/%3E%3Crect x='21' y='6' width='5' height='20' rx='1.5' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="preload" href="/static/vendor/inter-variable.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/static/styles/app.css">
+  <script src="/static/vendor/echarts.min.js"></script>
+</head>
+<body>
+  <div id="app"></div>
+  <noscript><p style="padding:24px;font-family:system-ui">Portfolio needs JavaScript.</p></noscript>
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>

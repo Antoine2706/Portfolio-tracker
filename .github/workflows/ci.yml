@@ -8,8 +8,8 @@ on:
 jobs:
   core:
     # The architectural constraint, enforced by the environment rather than by
-    # a test that could pass on a machine which happens to have Streamlit.
-    name: core tests without streamlit
+    # a test that could pass on a machine which happens to have the app extra.
+    name: core tests without the app or network extras
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,19 +22,17 @@ jobs:
         run: |
           python - <<'PY'
           import importlib.util as u
-          for module in ("streamlit", "yfinance", "requests"):
+          for module in ("fastapi", "starlette", "pydantic", "yfinance", "requests", "streamlit"):
               assert u.find_spec(module) is None, f"{module} must not be installed here"
-          print("clean: no streamlit, no network client")
+          print("clean: no web framework, no network client")
           PY
-      - name: Run the suite
-        run: pytest --ignore=portfolio/tests/test_app_smoke.py
+      - name: Run the suite (API tests skip themselves without fastapi)
+        run: pytest
 
   install:
-    # A clean clone must install and launch. Nobody had ever verified this, and
-    # for a while it did not: setuptools refused the flat layout, and yfinance
-    # was missing from the data extra, so every price fetch failed on a fresh
-    # install with "yfinance is not installed".
-    name: clean clone installs and launches
+    # A clean clone must install and launch, offline. The fixture provider
+    # means this job proves the application, not the runner's network.
+    name: clean clone installs, launches and answers
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +44,7 @@ jobs:
       - name: Every declared provider dependency is importable
         run: |
           python - <<'PY'
-          import yfinance, streamlit, altair, requests
+          import yfinance, fastapi, uvicorn, openpyxl, requests
           from portfolio.data.providers.yahoo import YahooProvider
           from portfolio.data.providers.openfigi import OpenFIGIProvider
           # Not a network call: this only proves the library is present, which
@@ -54,15 +52,18 @@ jobs:
           YahooProvider()._ticker("AAPL")
           print("providers import and can construct their clients")
           PY
-      - name: Launch the app and check it serves
+      - name: Full suite, API tests included
+        run: pytest
+      - name: Launch offline and check it answers
         run: |
-          streamlit run portfolio/app/main.py --server.port 8501 --server.headless true &
-          for i in $(seq 1 60); do
-            if curl -sf http://localhost:8501/_stcore/health > /dev/null; then
-              echo "app is serving"; exit 0
+          portfolio serve --provider fixture --no-browser --port 8765 &
+          for i in $(seq 1 45); do
+            if curl -sf http://127.0.0.1:8765/api/health > /dev/null; then
+              echo "app is serving"
+              curl -sf http://127.0.0.1:8765/api/snapshot | python -c 'import json,sys; s=json.load(sys.stdin); print(len(s["holdings"]), "holdings,", "risk available:", s["risk"]["available"]); assert s["risk"]["available"]'
+              curl -sf http://127.0.0.1:8765/ | grep -q "<title>" && echo "client is served"
+              exit 0
             fi
             sleep 2
           done
           echo "app failed to start"; exit 1
-      - name: UI smoke tests
-        run: pytest portfolio/tests/test_app_smoke.py
