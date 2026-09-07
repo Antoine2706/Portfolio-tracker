@@ -15,8 +15,9 @@ export function useFocusTrap(ref, active, { onEscape, initialFocus = true } = {}
     const root = ref.current;
     const previous = document.activeElement;
     if (initialFocus) {
-      const auto = root.querySelector("[data-autofocus]") || root.querySelector(FOCUSABLE);
-      const target = auto || root;
+      // Focus the dialog itself unless something asks for it (data-autofocus):
+      // landing on the × button paints a focus ring on every open.
+      const target = root.querySelector("[data-autofocus]") || root;
       setTimeout(() => target && target.focus && target.focus({ preventScroll: true }), 0);
     }
     const onKey = (e) => {

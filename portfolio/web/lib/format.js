@@ -132,8 +132,16 @@ export function date(v, { year = true, month = false } = {}) {
   return year ? `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}` : `${d.getDate()} ${MONTHS[d.getMonth()]}`;
 }
 
-/** dateTime(iso) → "4 Sep 2026, 16:32" */
+const DATE_ONLY = /^\s*\d{4}-\d{2}-\d{2}\s*$/;
+/** True for a calendar date with no time part ("2026-09-04"). */
+export function isDateOnly(v) {
+  return typeof v === "string" && DATE_ONLY.test(v);
+}
+
+/** dateTime(iso) → "4 Sep 2026, 16:32". A date-only input renders as a date
+    (never a fabricated "00:00"). */
 export function dateTime(v, { seconds = false } = {}) {
+  if (isDateOnly(v)) return date(v);
   const d = parseDate(v);
   if (!d) return DASH;
   const hh = String(d.getHours()).padStart(2, "0");
@@ -165,11 +173,28 @@ export function relative(v, now = Date.now()) {
   return date(d);
 }
 
-/** "prices as of 4 Sep 2026, 16:32 (delayed ~15 min)" — from snapshot.meta / a holding. */
+/** "prices as of 4 Sep 2026, 16:32 (delayed ~15 min)" — from snapshot.meta / a holding.
+    A date-only as-of ("2026-09-04", the last close) renders "4 Sep 2026 close". */
 export function delayNote(asOf, delayMinutes = 15, { prefix = "prices as of" } = {}) {
-  if (isNil(asOf)) return `${prefix} ${DASH}`;
+  if (isNil(asOf) || asOf === "") return `${prefix} ${DASH}`;
   const delay = delayMinutes == null ? "" : ` (delayed ~${delayMinutes} min)`;
-  return `${prefix} ${dateTime(asOf)}${delay}`;
+  const when = isDateOnly(asOf) ? `${date(asOf)} close` : dateTime(asOf);
+  return `${prefix} ${when}${delay}`;
+}
+
+/** dateRange("2025-09-18", "2026-09-04") → "18 Sep 2025 – 4 Sep 2026" */
+export function dateRange(a, b) {
+  const da = parseDate(a), db = parseDate(b);
+  if (!da && !db) return DASH;
+  if (!da) return `… – ${date(db)}`;
+  if (!db) return `${date(da)} – …`;
+  return `${date(da)} – ${date(db)}`;
+}
+
+/** count(3, "holding") → "3 holdings"; count(1, "entry", "entries") → "1 entry" */
+export function count(n, one, many) {
+  if (isNil(n)) return DASH;
+  return `${int(n)} ${n === 1 ? one : many || one + "s"}`;
 }
 
 const NAME_NOISE = [
@@ -221,7 +246,8 @@ export function days(v) {
 }
 
 /** fmtCell(kind, opts) → (value, row) => string, for DataTable column `format`.
-    kinds: money | money-compact | pct | pct-signed | pp | num | int | qty | mult | date | dateTime | relative | text | isin */
+    kinds: money | money-compact | money-signed | pct | pct-signed | pp | num | int | qty | mult
+         | date | dateTime | relative | days | isin | shortName | text */
 export function fmtCell(kind, opts = {}) {
   switch (kind) {
     case "money": return (v, row) => money(v, opts.currency || (row && row.currency) || "EUR", opts);
@@ -237,6 +263,7 @@ export function fmtCell(kind, opts = {}) {
     case "date": return (v) => date(v, opts);
     case "dateTime": return (v) => dateTime(v, opts);
     case "relative": return (v) => relative(v);
+    case "shortName": return (v) => shortName(v, opts.length);
     case "isin": return (v) => isin(v);
     case "days": return (v) => days(v);
     case "text":

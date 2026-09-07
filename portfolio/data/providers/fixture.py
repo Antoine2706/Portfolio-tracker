@@ -34,24 +34,26 @@ __all__ = ["FixtureProvider", "FixtureIdentityProvider", "FIXTURE_END"]
 FIXTURE_END = dt.date(2026, 9, 4)
 
 # Symbols the seed universe and the benchmarks use, with (annual drift, annual
-# volatility, market beta, observations). Anything not listed gets sensible
-# defaults derived from its hash. Row counts mirror what the real venues
-# returned in the 2026-09-03 provider matrix, so the alignment report in the
-# demo shows the same shortened window a real book would.
-_PROFILES: dict[str, tuple[float, float, float, int]] = {
-    "EUDF.DE": (0.35, 0.30, 1.3, 377),
-    "DFNC.DE": (0.30, 0.29, 1.25, 320),
-    "8RMY.DE": (0.28, 0.31, 1.2, 356),
-    "ASWC.DE": (0.22, 0.27, 1.1, 505),
-    "ISAE.AS": (0.04, 0.18, 0.8, 508),
-    "AIGG.MI": (-0.05, 0.22, 0.2, 503),
-    "WEAT.MI": (-0.08, 0.28, 0.15, 503),
-    "AIGE.MI": (0.02, 0.33, 0.4, 503),
-    "ESIE.DE": (0.08, 0.20, 0.9, 490),
-    "GLUX.PA": (0.06, 0.19, 1.0, 508),
-    "MEUD.PA": (0.09, 0.14, 1.0, 511),
-    "IWDA.AS": (0.11, 0.15, 0.95, 510),
-    "SMEA.MI": (0.08, 0.14, 1.0, 503),
+# volatility, market beta, observations, closing level). Anything not listed
+# gets sensible defaults derived from its hash. Row counts mirror what the
+# real venues returned in the 2026-09-03 provider matrix, so the alignment
+# report in the demo shows the same shortened window a real book would. The
+# closing level is pinned near the seed ledger's purchase prices, so the demo
+# P&L reads like a portfolio rather than a lottery ticket.
+_PROFILES: dict[str, tuple[float, float, float, int, float]] = {
+    "EUDF.DE": (0.35, 0.30, 1.3, 377, 33.8),
+    "DFNC.DE": (0.30, 0.29, 1.25, 320, 12.4),
+    "8RMY.DE": (0.28, 0.31, 1.2, 356, 17.1),
+    "ASWC.DE": (0.22, 0.27, 1.1, 505, 21.6),
+    "ISAE.AS": (0.04, 0.18, 0.8, 508, 9.05),
+    "AIGG.MI": (-0.05, 0.22, 0.2, 503, 4.35),
+    "WEAT.MI": (-0.08, 0.28, 0.15, 503, 5.10),
+    "AIGE.MI": (0.02, 0.33, 0.4, 503, 3.42),
+    "ESIE.DE": (0.08, 0.20, 0.9, 490, 11.2),
+    "GLUX.PA": (0.06, 0.19, 1.0, 508, 127.4),
+    "MEUD.PA": (0.09, 0.14, 1.0, 511, 262.0),
+    "IWDA.AS": (0.11, 0.15, 0.95, 510, 98.5),
+    "SMEA.MI": (0.08, 0.14, 1.0, 503, 86.3),
 }
 
 # Spot levels for FX pairs, quoted as units of the second currency per one of
@@ -89,28 +91,31 @@ class FixtureProvider(MarketDataProvider):
         rng = np.random.default_rng(self.seed)
         return rng.normal(0.0004, 0.009, 600)
 
-    def _profile(self, symbol: str) -> tuple[float, float, float, int]:
+    def _profile(self, symbol: str) -> tuple[float, float, float, int, float | None]:
         if symbol in _PROFILES:
             return _PROFILES[symbol]
         h = _seed(symbol, 1)
         drift = -0.05 + (h % 1000) / 1000 * 0.30
         vol = 0.12 + ((h >> 10) % 1000) / 1000 * 0.25
         beta = 0.3 + ((h >> 20) % 1000) / 1000 * 1.0
-        return drift, vol, beta, 505
+        return drift, vol, beta, 505, None
 
     def _series(self, symbol: str) -> pd.Series:
         if symbol in self.fail:
             raise ProviderError(self.name, f"{symbol} is configured to fail")
         if symbol in _FX_LEVELS or symbol.endswith("=X"):
             return self._fx_series(symbol)
-        drift, vol, beta, n = self._profile(symbol)
+        drift, vol, beta, n, close = self._profile(symbol)
         rng = np.random.default_rng(_seed(symbol, self.seed))
         daily_vol = vol / np.sqrt(252)
         idio = rng.normal(0.0, daily_vol * 0.75, n)
         market = self._market[-n:] * beta
         steps = drift / 252 + market + idio
-        level = 20.0 + (_seed(symbol, 2) % 9000) / 100.0
-        prices = level * np.exp(np.cumsum(steps))
+        path = np.exp(np.cumsum(steps))
+        # Pin the last close where the profile says, or start from a level
+        # derived from the symbol so unknown tickers still look like prices.
+        level = close / path[-1] if close else 20.0 + (_seed(symbol, 2) % 9000) / 100.0
+        prices = level * path
         index = pd.bdate_range(end=self.end, periods=n)
         return pd.Series(prices, index=index, name=symbol)
 

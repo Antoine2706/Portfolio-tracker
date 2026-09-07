@@ -101,14 +101,11 @@ export async function loadSnapshot({ benchmark, lookback, force = false } = {}) 
   try {
     const snap = await api.get(`/snapshot${snapshotQuery({ benchmark: b, lookback: l })}`, { signal: controller.signal });
     if (controller !== snapshotController) return null;
-    app.patch({
-      snapshot: snap,
-      loading: false,
-      loadedAt: new Date(),
-      error: null,
-      benchmark: snap.selected_benchmark || b,
-      lookback: snap.lookback || l,
-    });
+    // store.benchmark / store.lookback stay the *requested* values (null = server
+    // default); overwriting them from the response would retrigger the effect
+    // that loads on change and fetch the snapshot twice. The selected benchmark
+    // for display is snapshot.selected_benchmark.
+    app.patch({ snapshot: snap, loading: false, loadedAt: new Date(), error: null });
     return snap;
   } catch (err) {
     if (err && err.name === "AbortError") return null;

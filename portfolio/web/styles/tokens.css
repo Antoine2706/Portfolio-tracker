@@ -4,9 +4,12 @@
 
    Theme selection: index.html sets data-theme on <html> before first paint
    (localStorage, else prefers-color-scheme). The media query below only
-   covers the no-JS case and never overrides an explicit data-theme. */
+   covers the no-JS case and never overrides an explicit data-theme.
 
-:root {
+   The dark block also matches [data-theme="dark"] so that theme.js can read
+   the dark palette from a probe element while light is the active theme. */
+
+:root, [data-theme="dark"] {
   color-scheme: dark;
 
   /* surfaces */

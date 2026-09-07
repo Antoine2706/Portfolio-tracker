@@ -1,11 +1,16 @@
 /* Chart — a Card-wrapped ECharts instance with a table-view twin.
    Chart({ title, caption, option | buildOption, deps, height = 260, table: { columns, rows },
            tableDefault = false, actions, footer, empty = "No data", loading, onEvents, class, legend })
-   - option: an ECharts option built by lib/charts.js (recomputed when `deps` change;
-     if deps is omitted the option object identity is the dependency).
+   - option: an ECharts option built by lib/charts.js, OR a function returning one
+     (same as buildOption). Prefer the function form: builders read the active
+     theme's tokens when called, and the chart re-runs them on theme change.
+     A plain option object is recomputed only when `deps` change (if deps is
+     omitted the option object identity is the dependency), so include the
+     store theme in its useMemo deps if you pass an object.
    - table: the same data as rows for DataTable; when given, a table/chart toggle appears.
    - While the store is loading, the previous render stays at reduced opacity (no skeleton).
-   Also exports ChartBody({ option, deps, height, onEvents }) — the bare canvas without the card. */
+   Also exports ChartBody({ option, buildOption, deps, height, onEvents, empty, loading, style })
+   — the bare canvas without the card. */
 
 import { html, useRef, useState } from "/static/vendor/preact-htm.module.js";
 import { Card } from "/static/components/Card.js";
@@ -18,7 +23,9 @@ export function ChartBody({ option, buildOption, deps, height = 260, onEvents, c
   const storeLoading = useStore((s) => s.loading);
   const isLoading = loading ?? storeLoading;
   const ref = useRef(null);
-  const build = buildOption || (() => option || null);
+  // `option` may itself be a builder function; builders are re-run on theme
+  // change so the colours baked into the option follow the active tokens.
+  const build = buildOption || (typeof option === "function" ? option : () => option || null);
   const hasData = !!(option || buildOption);
   useChart(ref, build, deps || [option], { onEvents });
   return html`<div class=${["chart-body", isLoading ? "is-loading" : "", cls].filter(Boolean).join(" ")} style=${`height:${typeof height === "number" ? height + "px" : height};${style || ""}`}>

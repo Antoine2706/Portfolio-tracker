@@ -94,7 +94,7 @@ const PALETTE_ACTIONS = [
   { id: "act:add-instr", label: "Add instrument", group: "Actions", icon: "plus", keywords: "isin resolve new universe", run: () => navigate("/instruments?new=1") },
   { id: "act:sidebar", label: "Toggle sidebar", group: "Actions", icon: "sidebar", hint: ["["], keywords: "collapse expand nav", run: () => setSidebarCollapsed(!app.get().sidebarCollapsed) },
   { id: "act:help", label: "Keyboard shortcuts", group: "Actions", icon: "keyboard", hint: ["?"], keywords: "help keys", run: showShortcuts },
-  { id: "act:gallery", label: "Component gallery", sub: "for developers", group: "Actions", icon: "layers", keywords: "kitchen sink dev components", run: () => navigate("/kitchensink") },
+  { id: "act:gallery", label: "Kitchen sink", sub: "every component, from the live snapshot", group: "Actions", icon: "layers", keywords: "gallery dev components visual regression", run: () => navigate("/kitchensink") },
 ];
 
 /* ---------------- keyboard ---------------- */

@@ -36,6 +36,8 @@ export function fuzzyScore(query, text) {
     score += (found === prev + 1 ? 6 : 1) + (found === 0 || /[\s\-_.]/.test(t[found - 1]) ? 5 : 0);
     prev = found;
   }
+  // A subsequence scattered over more than 3× the query length is noise, not a match.
+  if (matched[matched.length - 1] - matched[0] + 1 > q.length * 3) return [-1, []];
   return [score, matched];
 }
 

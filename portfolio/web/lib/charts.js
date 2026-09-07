@@ -180,14 +180,39 @@ function tickFormatter(yFormat, ccy) {
   }
 }
 
-function dateTick(dates) {
+/**
+ * Ticks for a category axis of ISO dates: one label per month boundary (every
+ * month / quarter / half-year / year depending on the span; the year is spelled
+ * out on the first tick and on January), or every 1–2 weeks for short spans.
+ * Returns { interval, formatter } for axisLabel — never the same label twice.
+ */
+export function dateAxisTicks(dates = []) {
   const n = dates.length;
-  const span = n > 1 ? (new Date(dates[n - 1]) - new Date(dates[0])) / 86400000 : 0;
-  return (v) => {
-    if (span > 400) return fmt.date(v, { month: true });
-    if (span > 120) return fmt.date(v, { month: true });
-    return fmt.date(v, { year: false });
-  };
+  const ticks = new Map();
+  if (!n) return { interval: 0, formatter: (v) => fmt.date(v), ticks };
+  const parts = dates.map((d) => {
+    const [y, m, day] = String(d).slice(0, 10).split("-").map(Number);
+    return { y, m, d: day, t: Date.UTC(y, (m || 1) - 1, day || 1) / 86400000 };
+  });
+  const span = parts[n - 1].t - parts[0].t;
+  if (span > 120) {
+    const step = span > 1500 ? 12 : span > 730 ? 6 : span > 400 ? 3 : 1; // months between ticks
+    for (let i = 1; i < n; i++) {
+      const p = parts[i], q = parts[i - 1];
+      if (p.y === q.y && p.m === q.m) continue;
+      if ((p.m - 1) % step !== 0) continue;
+      ticks.set(i, p.m === 1 || ticks.size === 0 ? `${fmt.MONTHS_SHORT[p.m - 1]} ${p.y}` : fmt.MONTHS_SHORT[p.m - 1]);
+    }
+  } else {
+    const stepDays = span > 45 ? 14 : span > 12 ? 7 : 1;
+    let last = -Infinity;
+    for (let i = 0; i < n; i++) {
+      if (parts[i].t - last < stepDays) continue;
+      ticks.set(i, `${parts[i].d} ${fmt.MONTHS_SHORT[parts[i].m - 1]}`);
+      last = parts[i].t;
+    }
+  }
+  return { interval: (i) => ticks.has(i), formatter: (v, i) => ticks.get(i) ?? "", ticks };
 }
 
 function baseGrid(t, { legend = false, left = 8, right = 12, top, bottom = 4 } = {}) {
@@ -195,15 +220,16 @@ function baseGrid(t, { legend = false, left = 8, right = 12, top, bottom = 4 } =
 }
 
 function xTimeAxis(t, dates) {
+  const ticks = dateAxisTicks(dates);
   return {
     type: "category",
     data: dates,
     boundaryGap: false,
     axisLine: { show: false },
     axisTick: { show: false },
-    axisLabel: { color: t.axisText, fontSize: 11, hideOverlap: true, formatter: dateTick(dates), margin: 10 },
+    axisLabel: { color: t.axisText, fontSize: 11, hideOverlap: true, interval: ticks.interval, formatter: ticks.formatter, margin: 10, showMinLabel: false, showMaxLabel: false },
     splitLine: { show: false },
-    axisPointer: { label: { show: true, formatter: (p) => fmt.date(p.value) } },
+    axisPointer: { label: { show: false } },
   };
 }
 

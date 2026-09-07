@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import csv
 import datetime as dt
+import importlib.util
 import io
 import sys
 from decimal import Decimal
@@ -123,6 +124,11 @@ class TestHoldingsCsv:
         assert a["warnings"].count(" | ") == 2
 
 
+# openpyxl ships with the app extra, not with core. The core CI job installs
+# neither, on purpose, and the export must then fail with a sentence rather
+# than a traceback -- which the last class below checks without openpyxl.
+@pytest.mark.skipif(importlib.util.find_spec("openpyxl") is None,
+                    reason="workbook export needs openpyxl (the app extra)")
 class TestWorkbook:
     def _read(self, data: bytes):
         from openpyxl import load_workbook
@@ -181,6 +187,8 @@ class TestWorkbook:
     def test_no_sheets_still_yields_a_valid_file(self):
         assert self._read(workbook({})).sheetnames == ["Sheet"]
 
+
+class TestWorkbookWithoutOpenpyxl:
     def test_missing_openpyxl_is_a_sentence_with_the_install_command(self, monkeypatch):
         monkeypatch.setitem(sys.modules, "openpyxl", None)
         with pytest.raises(ExportUnavailable) as exc:

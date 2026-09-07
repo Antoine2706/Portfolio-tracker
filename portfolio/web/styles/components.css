@@ -220,13 +220,20 @@
 
 /* ---------- Data table ---------- */
 
+/* The wrap must NOT be a scroll container by default: position:sticky sticks
+   to the nearest scrolling ancestor, and that has to be .main for the header
+   to stay put while the page scrolls. overflow-x:clip keeps a too-wide table
+   inside its card without creating one. With maxHeight (or scroll) the table
+   scrolls itself and the header sticks inside it. */
 .table-wrap {
   position: relative;
-  overflow: auto;
+  overflow-x: clip;
+  overflow-y: visible;
   max-width: 100%;
   border-radius: inherit;
   transition: opacity var(--dur) var(--ease);
 }
+.table-wrap.scroll { overflow: auto; }
 .table-wrap.is-loading { opacity: .6; }
 .table-toolbar {
   display: flex; align-items: center; justify-content: space-between; gap: var(--sp-2);
@@ -357,8 +364,8 @@
 
 /* ---------- Drawer ---------- */
 
-.drawer-root { position: fixed; inset: 0; z-index: 60; pointer-events: none; }
-.drawer-root[data-open="true"] { pointer-events: auto; }
+.drawer-root { position: fixed; inset: 0; z-index: 60; pointer-events: none; visibility: hidden; transition: visibility 0s linear var(--dur-slow); }
+.drawer-root[data-open="true"] { pointer-events: auto; visibility: visible; transition-delay: 0s; }
 .drawer-backdrop {
   position: absolute; inset: 0;
   background: var(--color-backdrop);

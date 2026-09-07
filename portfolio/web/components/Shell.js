@@ -25,7 +25,24 @@ function BrandMark() {
   </svg>`;
 }
 
-function Sidebar({ collapsed }) {
+/** True while the media query matches; re-renders on change. */
+export function useMediaQuery(query) {
+  const [matches, setMatches] = useState(() => !!(window.matchMedia && window.matchMedia(query).matches));
+  useEffect(() => {
+    if (!window.matchMedia) return undefined;
+    const mq = window.matchMedia(query);
+    const onChange = () => setMatches(mq.matches);
+    onChange();
+    if (mq.addEventListener) mq.addEventListener("change", onChange); else mq.addListener(onChange);
+    return () => { if (mq.removeEventListener) mq.removeEventListener("change", onChange); else mq.removeListener(onChange); };
+  }, [query]);
+  return matches;
+}
+
+/** Below this width the sidebar is icons-only regardless of the stored choice. */
+export const NARROW_QUERY = "(max-width: 1100px)";
+
+function Sidebar({ collapsed, forced }) {
   const route = useRoute();
   const mode = useStore((s) => (s.snapshot && s.snapshot.meta.mode) || (s.settings && s.settings.mode) || null);
   return html`<nav class="sidebar" aria-label="Primary">
@@ -50,11 +67,11 @@ function Sidebar({ collapsed }) {
         <span class="nav-label">Search</span>
         <span class="nav-hint" style="opacity:1"><kbd>${MOD_KEY}</kbd><kbd>K</kbd></span>
       </button>
-      <button type="button" class="nav-item" onClick=${() => setSidebarCollapsed(!collapsed)} title=${collapsed ? "Expand sidebar  ([)" : "Collapse sidebar  ([)"} aria-expanded=${collapsed ? "false" : "true"}>
+      ${forced ? null : html`<button type="button" class="nav-item" onClick=${() => setSidebarCollapsed(!collapsed)} title=${collapsed ? "Expand sidebar  ([)" : "Collapse sidebar  ([)"} aria-expanded=${collapsed ? "false" : "true"}>
         <span class="nav-icon"><${Icon} name=${collapsed ? "chevronsRight" : "chevronsLeft"} /></span>
         <span class="nav-label">Collapse</span>
         <span class="nav-hint" aria-hidden="true"><kbd>[</kbd></span>
-      </button>
+      </button>`}
     </div>
   </nav>`;
 }
@@ -80,7 +97,9 @@ function BenchmarkSelect() {
   const benchmark = useStore((s) => s.benchmark);
   const list = (snapshot && snapshot.benchmarks) || [];
   if (!list.length) return null;
-  const value = benchmark || (snapshot && snapshot.selected_benchmark) || (list.find((b) => b.is_default) || list[0]).symbol;
+  // The server's answer wins over a stale stored choice that is not in the list.
+  const known = benchmark && list.some((b) => b.symbol === benchmark) ? benchmark : null;
+  const value = known || (snapshot && snapshot.selected_benchmark) || (list.find((b) => b.is_default) || list[0]).symbol;
   return html`<label class="row" style="gap:6px" title="Benchmark used for beta, alpha and the comparison lines">
     <span class="faint small nowrap">vs</span>
     <${Select} compact value=${value} onChange=${(v) => setBenchmark(v)} aria-label="Benchmark"
@@ -111,7 +130,7 @@ function TopBar() {
     <div class="spacer"></div>
     <div class="topbar-group">
       <${BenchmarkSelect} />
-      <${Button} variant="ghost" icon="refresh" iconOnly loading=${refreshing} class=${refreshing ? "" : ""} title="Refresh prices (bypasses the 15-minute quote cache)" tipPos="bottom-right" onClick=${onRefresh} ariaLabel="Refresh prices" />
+      <${Button} variant="ghost" icon="refresh" iconOnly loading=${refreshing} title="Refresh prices (bypasses the 15-minute quote cache)" tipPos="bottom-right" onClick=${onRefresh} ariaLabel="Refresh prices" />
       <${Button} variant="ghost" icon=${theme === "dark" ? "sun" : "moon"} iconOnly title=${theme === "dark" ? "Switch to light theme" : "Switch to dark theme"} tipPos="bottom-right" onClick=${() => toggleTheme()} ariaLabel="Toggle theme" />
       <${Button} variant="secondary" icon="search" onClick=${() => openPalette()} title="Command palette">
         <span class="muted">Search</span><kbd>${MOD_KEY}</kbd><kbd>K</kbd>
@@ -122,15 +141,17 @@ function TopBar() {
 }
 
 export function Shell({ children }) {
-  const collapsed = useStore((s) => s.sidebarCollapsed);
+  const stored = useStore((s) => s.sidebarCollapsed);
+  const narrow = useMediaQuery(NARROW_QUERY);
+  const collapsed = stored || narrow;
   const route = useRoute();
   // scroll the main pane to top on page change (not on drawer param changes)
   useEffect(() => {
     const main = document.querySelector(".main");
     if (main) main.scrollTo({ top: 0 });
   }, [route.page]);
-  return html`<div class="shell" data-collapsed=${collapsed ? "true" : "false"}>
-    <${Sidebar} collapsed=${collapsed} />
+  return html`<div class="shell" data-collapsed=${collapsed ? "true" : "false"} data-narrow=${narrow ? "true" : "false"}>
+    <${Sidebar} collapsed=${collapsed} forced=${narrow} />
     <${TopBar} />
     <main class="main" id="main" tabindex="-1">${children}</main>
   </div>`;

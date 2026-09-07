@@ -5,10 +5,13 @@
      rows, rowKey = "id" | fn(row), sort: { key, dir } (initial), onSort,
      onRowClick(row, event), selectedKey, empty = "No rows", footer: row | fn(rows) → vnode,
      density: "comfortable"|"compact", densityToggle, toolbar (left) / toolbarRight, maxHeight,
+     scroll (the wrap scrolls horizontally; implied by maxHeight), rowClass: fn(row) → class,
      loading (defaults to store.loading), class, stickyHeader = true, caption
    })
-   Client-side sort with an indicator; sticky header; hover rows; numeric columns
-   right-aligned with tabular figures; keyboard-focusable clickable rows (Enter/Space). */
+   Client-side sort with an indicator; sticky header (sticks to the page scroll
+   by default, to the wrap when maxHeight/scroll is set); hover rows; numeric
+   columns right-aligned with tabular figures; keyboard-focusable clickable rows
+   (Enter/Space). Footer cells use the column's render/format like body cells. */
 
 import { html, useState, useMemo, useCallback } from "/static/vendor/preact-htm.module.js";
 import { Icon } from "/static/components/Icons.js";
@@ -42,7 +45,7 @@ function compare(a, b) {
 export function DataTable({
   columns = [], rows = [], rowKey = "id", sort: initialSort, onSort, onRowClick, selectedKey,
   empty = "No rows", footer, density: densityProp, densityToggle = false, toolbar, toolbarRight,
-  maxHeight, loading, class: cls = "", stickyHeader = true, caption, rowClass,
+  maxHeight, loading, class: cls = "", stickyHeader = true, caption, rowClass, scroll = false,
 }) {
   const storeLoading = useStore((s) => s.loading);
   const isLoading = loading ?? storeLoading;
@@ -85,7 +88,7 @@ export function DataTable({
   const footRow = typeof footer === "function" ? footer(sorted) : footer;
   const showToolbar = toolbar || toolbarRight || densityToggle;
 
-  return html`<div class=${["table-wrap", isLoading ? "is-loading" : "", cls].filter(Boolean).join(" ")} style=${maxHeight ? `max-height:${typeof maxHeight === "number" ? maxHeight + "px" : maxHeight}` : undefined}>
+  return html`<div class=${["table-wrap", maxHeight || scroll ? "scroll" : "", isLoading ? "is-loading" : "", cls].filter(Boolean).join(" ")} style=${maxHeight ? `max-height:${typeof maxHeight === "number" ? maxHeight + "px" : maxHeight}` : undefined}>
     ${showToolbar ? html`<div class="table-toolbar">
       <div class="row">${toolbar}</div>
       <div class="row">
@@ -132,7 +135,7 @@ export function DataTable({
       ${footRow ? html`<tfoot><tr>
         ${cols.map((c) => {
           const v = footRow[c.key];
-          const content = c.renderFooter ? c.renderFooter(footRow, v) : v == null ? "" : typeof v === "string" ? v : c.fmt(v, footRow);
+          const content = c.renderFooter ? c.renderFooter(footRow, v) : v == null ? "" : typeof v === "string" ? v : c.render ? c.render(footRow, v) : c.fmt(v, footRow);
           return html`<td key=${c.key} class=${[c.numeric ? "num" : "", c.align === "center" ? "center" : ""].filter(Boolean).join(" ")}>${content}</td>`;
         })}
       </tr></tfoot>` : null}
