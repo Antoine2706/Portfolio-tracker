@@ -1,17 +1,23 @@
-/* Overview — the daily cockpit. Props: { route, snapshot }.
+/* Overview — the front page, answerable in five seconds. Props: { route, snapshot }.
 
    Layout order, and why:
    1. What is wrong with the data (meta.failures) before any number that
       depends on it.
-   2. The figures: portfolio value as the one hero number with today's move,
-      then unrealised, realised, invested and fees — the whole P&L identity
-      in one row so nothing has to be reconciled elsewhere.
-   3. Value history next to the allocation treemap: how the money moved and
-      where it sits now, on one line of sight.
+   2. The figures: portfolio value as the one hero number, then today's move,
+      unrealised, realised (with dividends and fees) and invested — the P&L
+      identity in one row so nothing has to be reconciled elsewhere.
+   3. Value history next to the allocation: how the money moved and where it
+      sits now, on one line of sight; exposure by class / currency / issuer
+      sits under the allocation as compact segmented bars.
    4. Risk headline, the alerts feed and today's movers: what to look at.
-   5. Trailing returns against the benchmark, the calm summary at the bottom.
-   With no holdings at all the page is a welcome card that explains demo
-   versus live data — the only place a decorative image is allowed. */
+   5. The watchlist strip and trailing returns, the calm summary at the bottom.
+   First run (user mode, empty ledger) is a welcome card with the three steps
+   on a procedural contour backdrop — the only decoration on the page.
+
+   Nothing is computed here beyond formatting, sorting, filtering and range
+   slicing; the two client-side sums (value − invested in the tooltip,
+   realised + dividends − fees on the tile) are display arithmetic the page
+   is asked to show side by side with their terms. */
 
 import { html, useMemo, useState } from "/static/vendor/preact-htm.module.js";
 import { Page } from "/static/components/Page.js";
@@ -21,12 +27,13 @@ import { Chart } from "/static/components/Chart.js";
 import { Notice } from "/static/components/Notice.js";
 import { Badge, SeverityBadge } from "/static/components/Badge.js";
 import { Button } from "/static/components/Button.js";
+import { EmptyState } from "/static/components/EmptyState.js";
 import { Icon } from "/static/components/Icons.js";
 import { Sparkline } from "/static/components/Sparkline.js";
-import { RangeSelector, rangeStartIndex } from "/static/components/Segmented.js";
+import { Segmented, RangeSelector, RANGES, rangeStartIndex } from "/static/components/Segmented.js";
 import { useStore } from "/static/lib/store.js";
-import { navigate } from "/static/lib/router.js";
-import { lineOption, treemapOption, seriesTable, tipElement } from "/static/lib/charts.js";
+import { navigate, href } from "/static/lib/router.js";
+import { lineOption, barOption, treemapOption, seriesTable, tipElement, seriesColor, foldOther } from "/static/lib/charts.js";
 import { tokens } from "/static/lib/theme.js";
 import * as fmt from "/static/lib/format.js";
 
@@ -45,10 +52,19 @@ function firstFinite(values, from = 0) {
   return null;
 }
 
-/** Value history: value (accent) with invested as a thin muted line, the
-    benchmark index optionally re-based to the portfolio value at the range
-    start (one axis, common base), and every external flow as a small marker
-    that names itself in the crosshair tooltip. */
+/** Route link that keeps middle-click / copy-link working but navigates in-app on click. */
+function go(path) {
+  return (e) => {
+    if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey || e.button === 1) return;
+    e.preventDefault();
+    navigate(path);
+  };
+}
+
+/** Value history: value (accent area) with invested as a thin muted line, the
+    benchmark optionally re-based to the portfolio value at the range start
+    (one axis, common base), BUY/SELL flows as small triangles on the value
+    line, and one crosshair tooltip listing value, invested, gain and trades. */
 function valueOption({ dates, value, invested, benchmark, benchmarkName, flows, currency }) {
   const t = tokens();
   const series = [
@@ -57,73 +73,95 @@ function valueOption({ dates, value, invested, benchmark, benchmarkName, flows, 
   ];
   if (benchmark) series.push({ name: benchmarkName || "Benchmark", values: benchmark, color: t.series[1], width: 1.5 });
   const opt = lineOption({ series, dates, yFormat: "money-compact", currency });
-  // flows as markers on the value line
+
   const idx = new Map(dates.map((d, i) => [d, i]));
-  const marks = dates.map(() => null);
-  let any = false;
+  const buckets = { BUY: dates.map(() => null), SELL: dates.map(() => null) };
+  let hasBuy = false, hasSell = false;
   for (const f of flows || []) {
+    const type = String(f.type || "").toUpperCase();
+    if (type !== "BUY" && type !== "SELL") continue;
     const i = idx.get(f.date);
     if (i == null || value[i] == null) continue;
-    if (!marks[i]) marks[i] = { value: value[i], flows: [] };
-    marks[i].flows.push(f);
-    any = true;
+    const arr = buckets[type];
+    if (!arr[i]) arr[i] = { value: value[i], flows: [] };
+    arr[i].flows.push(f);
+    if (type === "BUY") hasBuy = true; else hasSell = true;
   }
-  if (any) {
-    opt.series.push({
-      name: "Flows", type: "scatter", data: marks, symbol: "circle", symbolSize: 8, z: 6,
-      itemStyle: { color: t.text2, borderColor: t.chartSurface, borderWidth: 2 },
-      emphasis: { scale: 1.4 },
-    });
-    opt.legend.data = [...(opt.legend.data || series.map((s) => s.name)), { name: "Flows", icon: "circle" }];
+  const marker = (name, data, color, rotate) => ({
+    name, type: "scatter", data, symbol: "triangle", symbolRotate: rotate, symbolSize: 9, z: 6,
+    itemStyle: { color, borderColor: t.chartSurface, borderWidth: 1.5 },
+    emphasis: { scale: 1.3 },
+  });
+  if (hasBuy) opt.series.push(marker("Buys", buckets.BUY, t.good, 0));
+  if (hasSell) opt.series.push(marker("Sells", buckets.SELL, t.bad, 180));
+  if (hasBuy || hasSell) {
+    opt.legend = { ...opt.legend, show: true, data: [...series.map((s) => s.name), ...(hasBuy ? [{ name: "Buys", icon: "triangle" }] : []), ...(hasSell ? [{ name: "Sells", icon: "path://M0,0 L10,0 L5,8 Z" }] : [])] };
   }
+
   opt.tooltip.formatter = (params) => {
-    const list = (Array.isArray(params) ? params : [params]).filter((p) => p.value != null && !(p.data && typeof p.data === "object" && p.data.value == null));
-    if (!list.length) return "";
+    const list = Array.isArray(params) ? params : [params];
     const rows = [];
-    let foot = null;
+    const foot = [];
+    let v = null, inv = null;
     for (const p of list) {
       if (p.seriesType === "scatter") {
-        const fl = (p.data && p.data.flows) || [];
-        foot = fl.map((f) => `${f.type} ${fmt.money(Math.abs(f.amount), currency)} · ${fmt.shortName(f.name, 28)}`).join("\n");
+        for (const f of (p.data && p.data.flows) || []) foot.push(`${f.type} ${fmt.money(Math.abs(f.amount), currency)} · ${fmt.shortName(f.name, 28)}`);
         continue;
       }
+      if (p.value == null) continue;
+      if (p.seriesName === "Value") v = p.value;
+      if (p.seriesName === "Invested") inv = p.value;
       rows.push({ name: p.seriesName, value: fmt.money(p.value, currency), color: p.color, kind: "line" });
     }
-    const el = tipElement(fmt.date(list[0].axisValue), rows, foot);
-    if (foot) el.lastChild.style.whiteSpace = "pre-line";
+    if (!rows.length && !foot.length) return "";
+    if (v != null && inv != null) rows.push({ name: "Gain", value: fmt.money(v - inv, currency, { signed: true }), polarity: fmt.polarityClass(v - inv) });
+    const el = tipElement(fmt.date(list[0].axisValue), rows, foot.length ? foot.join("\n") : undefined);
+    if (foot.length) el.lastChild.style.whiteSpace = "pre-line";
     return el;
   };
   return opt;
 }
 
-/* ---------------- sections ---------------- */
+/* ---------------- KPI strip ---------------- */
 
 function KpiRow({ totals, meta, base }) {
   const t = totals || {};
-  const dayDelta = t.day_change == null ? null : t.day_change;
-  const dayFmt = (v) => `${fmt.money(v, base, { signed: true })} · ${fmt.pct(t.day_change_pct, { signed: true })}`;
-  return html`<div class="grid" style="grid-template-columns:repeat(5,minmax(0,1fr))">
-    <${KpiTile} class="col-12" style="grid-column:span 1" size="hero" label="Portfolio value" value=${fmt.money(t.value, base)}
-      delta=${dayDelta} deltaFormat=${dayFmt} deltaLabel="today" sub=${t.priced_holdings != null ? `${fmt.int(t.priced_holdings)} priced${t.unpriced_holdings ? `, ${fmt.int(t.unpriced_holdings)} unpriced` : ""}` : null}
-      help="Market value of every priced holding in the base currency, at the last delayed price." />
+  const dayNull = t.day_change == null;
+  const dayReason = !t.priced_holdings ? "no priced holdings" : "no previous close to compare with";
+  const netRealised = [t.realised, t.dividends, t.fees].every((v) => v != null) ? t.realised + t.dividends - t.fees : null;
+  const holdingsSub = t.priced_holdings != null
+    ? `${fmt.int(t.priced_holdings)} priced${t.unpriced_holdings ? `, ${fmt.int(t.unpriced_holdings)} unpriced` : ""}${meta ? ` · ${fmt.int(meta.transaction_count)} ${meta.transaction_count === 1 ? "transaction" : "transactions"}` : ""}`
+    : null;
+  return html`<div class="ov-kpis">
+    <${KpiTile} class="ov-hero" size="hero" label="Portfolio value" value=${fmt.money(t.value, base)} sub=${holdingsSub}
+      help="Market value of every priced holding in the base currency, at the last delayed price. Unpriced holdings are excluded." />
+    <${KpiTile} label="Day change" value=${dayNull ? fmt.DASH : fmt.money(t.day_change, base, { signed: true })} polarity=${fmt.polarityClass(t.day_change)}
+      delta=${dayNull ? null : t.day_change_pct} deltaFormat="pct" deltaLabel=${dayNull ? null : "vs previous close"} sub=${dayNull ? dayReason : null}
+      help="Change in value since the previous close, across priced holdings." />
     <${KpiTile} label="Unrealised P&L" value=${fmt.money(t.unrealised, base, { signed: true })} polarity=${fmt.polarityClass(t.unrealised)}
       delta=${t.unrealised_pct} deltaFormat="pct" deltaLabel="of cost" help="Value minus cost basis of the open positions. The percentage is against cost, not against invested cash." />
-    <${KpiTile} label="Realised P&L" value=${fmt.money(t.realised, base, { signed: true })} polarity=${fmt.polarityClass(t.realised)}
-      sub=${`${fmt.money(t.dividends, base)} in dividends on top`} help="Gains and losses locked in by sells, average-cost method. Dividends are shown separately and are not part of this figure." />
+    <${KpiTile} label="Realised" value=${fmt.money(netRealised, base, { signed: true })} polarity=${fmt.polarityClass(netRealised)}
+      sub=${`${fmt.money(t.realised, base, { signed: true })} realised · ${fmt.money(t.dividends, base)} dividends · ${fmt.money(t.fees, base)} fees`}
+      help="Realised gains and losses (average-cost method) plus dividends received, minus every fee in the ledger." />
     <${KpiTile} label="Invested" value=${fmt.money(t.invested, base)} sub=${`cost basis ${fmt.money(t.cost_basis, base)}`}
       help="Net external cash put in: buys plus fees, minus sells and dividends taken out. Cost basis is what the open positions cost." />
-    <${KpiTile} label="Fees paid" value=${fmt.money(t.fees, base)} sub=${meta ? `${fmt.int(meta.transaction_count)} transactions` : null}
-      help="Every fee in the ledger. Fees are paid from outside, so they depress the return without changing the value." />
   </div>`;
 }
+
+/* ---------------- value history ---------------- */
 
 function ValueChart({ perf, benchmarks, selectedBenchmark, base }) {
   const theme = useStore((s) => s.theme);
   const [range, setRange] = useState("ALL");
   const [showBench, setShowBench] = useState(false);
-  const ok = perf && perf.available && perf.dates && perf.dates.length > 1;
+  const ok = !!(perf && perf.available && perf.dates && perf.dates.length > 1);
   const bench = (benchmarks || []).find((b) => b.symbol === selectedBenchmark);
   const benchName = bench ? (bench.index || bench.label || bench.symbol) : "Benchmark";
+
+  const rangeOptions = useMemo(() => RANGES.map((k) => {
+    const shorter = ok && k !== "ALL" && k !== "YTD" && rangeStartIndex(perf.dates, k) === 0;
+    return { value: k, label: k, disabled: shorter, tip: shorter ? "History is shorter than this range" : undefined };
+  }), [perf, ok]);
 
   const slice = useMemo(() => {
     if (!ok) return null;
@@ -147,159 +185,302 @@ function ValueChart({ perf, benchmarks, selectedBenchmark, base }) {
     format: "money", currency: base,
   }) : null), [slice, base, benchName]);
 
-  const caption = ok
-    ? `Market value against cash invested${slice && slice.benchmark ? `, with ${benchName} re-based to the portfolio value at the start of the range` : ""}. Dots are external flows — hover one to see the trade.`
-    : (perf && perf.reason) || "No value history yet.";
+  if (!ok) {
+    return html`<${Card} title="Value" caption="Market value against cash invested." class="col-8">
+      <${EmptyState} compact icon="performance" title="No value history yet" body=${(perf && perf.reason) || "The value history needs at least one priced holding with a transaction."} />
+    <//>`;
+  }
 
-  return html`<${Chart} title="Value" caption=${caption} height=${300} class="col-8"
+  const caption = `Market value against cash invested${slice && slice.benchmark ? `, with ${benchName} re-based to the portfolio value at the start of the range` : ""}. Triangles are buys and sells — hover for the trade.`;
+  return html`<${Chart} title="Value" caption=${caption} height=${300} class="col-8 ov-value"
     actions=${html`
-      <${Button} size="sm" variant="ghost" aria-pressed=${showBench ? "true" : "false"} onClick=${() => setShowBench(!showBench)} title=${showBench ? `Hide ${benchName}` : `Overlay ${benchName}, indexed to the same base`}
+      <${Button} size="sm" variant="ghost" aria-pressed=${showBench ? "true" : "false"} onClick=${() => setShowBench(!showBench)}
+        title=${showBench ? `Hide ${benchName}` : `Overlay ${benchName}, indexed to the same base`}
         style=${showBench ? "box-shadow: inset 0 0 0 1px var(--color-border-strong)" : ""}>vs ${benchName}<//>
-      <${RangeSelector} value=${range} onChange=${setRange} />`}
-    deps=${[slice, theme]} table=${table} empty=${caption}
+      <${RangeSelector} value=${range} onChange=${setRange} options=${rangeOptions} />`}
+    deps=${[slice, theme]} table=${table}
     buildOption=${() => (slice ? valueOption({ ...slice, benchmarkName: benchName, currency: base }) : null)} />`;
 }
 
-function AllocationTreemap({ holdings, base }) {
+/* ---------------- allocation + exposure ---------------- */
+
+const EXPOSURE_DIMS = [["asset_class", "Asset class"], ["base_currency", "Base currency"], ["issuer", "Issuer"]];
+
+function ExposureBars({ exposure }) {
+  const t = tokens();
+  const rows = EXPOSURE_DIMS.map(([key, label]) => {
+    const slices = (exposure && exposure[key]) || [];
+    const items = foldOther(slices.map((s) => ({ name: s.label, value: s.weight, count: s.count })), { limit: 8, key: "value" });
+    return { key, label, items };
+  });
+  if (!rows.some((r) => r.items.length)) return html`<div class="ov-expo-empty">No exposure breakdown yet.</div>`;
+  return html`<div class="ov-expo">
+    ${rows.map((r) => html`<div key=${r.key} class="ov-expo-row">
+      <span class="ov-expo-label">${r.label}</span>
+      <div class="ov-expo-bar" role="img" aria-label=${`${r.label}: ${r.items.map((i) => `${i.name} ${fmt.pct(i.value)}`).join(", ")}`}>
+        ${r.items.map((i, k) => html`<span key=${i.name} class="ov-expo-seg" style=${`flex:${Math.max(0.001, i.value || 0)} 1 0;background:${i.isOther ? t.seriesOther : seriesColor(k, t)}`}
+          title=${`${i.name} · ${fmt.pct(i.value)} · ${fmt.count(i.count ?? (i.members ? i.members.reduce((s, m) => s + (m.count || 0), 0) : null), "holding")}`}></span>`)}
+      </div>
+      <div class="ov-expo-legend">
+        ${r.items.map((i, k) => html`<span key=${i.name} class="ov-expo-key"><span class="swatch" style=${`background:${i.isOther ? t.seriesOther : seriesColor(k, t)}`}></span>${i.name} <b>${fmt.pct(i.value)}</b></span>`)}
+      </div>
+    </div>`)}
+  </div>`;
+}
+
+function AllocationCard({ holdings, exposure, base }) {
   const theme = useStore((s) => s.theme);
-  const items = useMemo(() => holdings.filter((h) => h.value != null && h.value > 0).map((h) => ({ name: h.name, value: h.value, sub: [h.symbol, h.isin].filter(Boolean).join(" · ") })), [holdings]);
+  const [view, setView] = useState("treemap");
+  const items = useMemo(() => holdings.filter((h) => h.value != null && h.value > 0).sort((a, b) => b.value - a.value)
+    .map((h) => ({ isin: h.isin, name: h.name, value: h.value, weight: h.weight, sub: [h.symbol, h.isin].filter(Boolean).join(" · ") })), [holdings]);
   const table = useMemo(() => ({
     columns: [
-      { key: "name", label: "Holding", render: (r, v) => html`<div class="truncate" style="max-width:200px" title=${v}>${fmt.shortName(v, 32)}<span class="cell-sub">${r.sub}</span></div>` },
+      { key: "name", label: "Holding", render: (r, v) => html`<div class="truncate" style="max-width:220px" title=${v}>${fmt.shortName(v, 32)}<span class="cell-sub">${r.sub}</span></div>` },
       { key: "value", label: "Value", format: "money", formatOptions: { currency: base }, numeric: true },
       { key: "weight", label: "Weight", format: "pct", numeric: true },
     ],
-    rows: holdings.filter((h) => h.value != null).map((h) => ({ id: h.isin, name: h.name, sub: [h.symbol, h.isin].filter(Boolean).join(" · "), value: h.value, weight: h.weight })),
-  }), [holdings, base]);
+    rows: items.map((i) => ({ id: i.isin, ...i })),
+  }), [items, base]);
+  const open = (it) => { if (it) navigate(`/holdings/${it.isin}`); };
   const onClick = (p) => {
-    const h = holdings.find((x) => x.name === p.name) || null;
-    if (h) navigate(`/holdings/${h.isin}`);
+    if (p.seriesType === "treemap") open(items.find((x) => x.name === p.name));
+    else if (p.seriesType === "bar") open(items[p.dataIndex]);
   };
-  return html`<${Chart} title="Allocation" caption="Area is value; darker is larger. Click a tile for the holding." height=${300} class="col-4"
-    deps=${[items, theme]} table=${table} onEvents=${{ click: onClick }} empty="No priced holdings"
-    buildOption=${() => (items.length ? treemapOption({ items, currency: base }) : null)} />`;
+  const build = () => {
+    if (!items.length) return null;
+    if (view === "bars") {
+      return barOption({ categories: items.map((i) => fmt.shortName(i.name, 30)), values: items.map((i) => i.weight ?? 0), horizontal: true, format: "pct", showLabels: true });
+    }
+    return treemapOption({ items, currency: base });
+  };
+  const height = view === "bars" ? Math.max(300, items.length * 26 + 40) : 300;
+  return html`<${Chart} title="Allocation" class="col-4"
+    caption=${view === "bars" ? "Weight of each holding in portfolio value. Click a bar for the holding." : "Area is value; the darker the tile, the larger the holding. Click a tile for the holding."}
+    height=${height} deps=${[items, view, theme]} table=${table} onEvents=${{ click: onClick }} empty="No priced holdings"
+    actions=${html`<${Segmented} size="sm" ariaLabel="Allocation view" value=${view} onChange=${setView}
+      options=${[{ value: "treemap", label: "Treemap" }, { value: "bars", label: "Bars" }]} />`}
+    footer=${html`<${ExposureBars} exposure=${exposure} />`}
+    buildOption=${build} />`;
+}
+
+/* ---------------- risk headline ---------------- */
+
+function Stat({ label, value, sub, warning }) {
+  return html`<div class="ov-stat">
+    <span class="ov-stat-label">${label}</span>
+    <span class="ov-stat-value">${value == null || value === "" ? fmt.DASH : value}
+      ${warning ? html`<span class="warn-mark" title=${warning} tabindex="0" aria-label=${warning}><${Icon} name="alertTriangle" size=${12} stroke=${2} /></span>` : null}</span>
+    ${sub ? html`<span class="ov-stat-sub" title=${sub}>${sub}</span>` : null}
+  </div>`;
 }
 
 function RiskCard({ risk }) {
   const byKey = useMemo(() => Object.fromEntries(((risk && risk.metrics) || []).map((m) => [m.key, m])), [risk]);
-  const actions = html`<${Button} size="sm" variant="ghost" iconRight="chevronRight" onClick=${() => navigate("/risk")}>Risk<//>`;
+  const link = html`<a class="ov-link" href=${href("/risk")} onClick=${go("/risk")}>Open risk →</a>`;
   if (!risk || !risk.available) {
-    return html`<${Card} title="Risk" actions=${actions} class="col-4">
-      <div class="small muted" style="display:flex;gap:8px;align-items:flex-start"><span class="faint" style="margin-top:2px"><${Icon} name="info" size=${14} /></span><span>${(risk && risk.reason) || "The risk model has nothing to work with yet."}</span></div>
+    return html`<${Card} title="Risk" actions=${link} class="col-4">
+      <${EmptyState} compact icon="risk" title="Risk model not available" body=${(risk && risk.reason) || "The risk model has nothing to work with yet."} />
     <//>`;
   }
   const head = risk.headline;
   const m = (k) => byKey[k] || {};
-  const Row = ({ label, value, sub, warning }) => html`<div class="stack" style="gap:1px;min-width:0">
-    <span class="xs faint">${label}</span>
-    <span class="row" style="gap:6px"><span class="strong num" style="font-size:var(--fs-lg);line-height:1.2">${value == null || value === "" ? fmt.DASH : value}</span>
-      ${warning ? html`<span class="warn-mark" title=${warning} tabindex="0"><${Icon} name="alertTriangle" size=${12} stroke=${2} /></span>` : null}</span>
-    ${sub ? html`<span class="xs muted truncate" title=${sub}>${sub}</span>` : null}
-  </div>`;
-  return html`<${Card} title="Risk" caption=${risk.window ? `${fmt.int(risk.window.effective)}-day window to ${fmt.date(risk.window.last_date)}` : null} actions=${actions} class="col-4">
+  const benchShort = risk.beta_benchmark ? fmt.shortName(risk.beta_benchmark.replace(/\s*\(.*\)$/, ""), 22) : "benchmark";
+  return html`<${Card} title="Risk" caption=${risk.window ? `${fmt.int(risk.window.effective)}-day window to ${fmt.date(risk.window.last_date)}` : null} actions=${link} class="col-4">
     <div class="stack gap-3">
-      ${head ? html`<p class="small" style="line-height:1.5">${head.sentence}</p>` : null}
-      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px 16px">
-        <${Row} label="Effective holdings" value=${m("effective_holdings").display || (risk.effective_holdings != null ? `${fmt.num(risk.effective_holdings, { decimals: 1 })} of ${fmt.int(risk.actual_holdings)}` : null)} sub="independent bets, not positions" warning=${m("effective_holdings").warning} />
-        <${Row} label="Volatility, annualised" value=${m("volatility").display || fmt.pct(risk.volatility)} sub=${risk.volatility_multiple != null ? `${fmt.mult(risk.volatility_multiple)} a broad index` : null} warning=${m("volatility").warning} />
-        <${Row} label="Max drawdown" value=${m("max_drawdown").display || fmt.pct(risk.max_drawdown)} sub=${risk.current_drawdown != null ? `now ${fmt.pct(risk.current_drawdown)} below the peak` : null} warning=${m("max_drawdown").warning} />
-        <${Row} label=${`Beta vs ${risk.beta_benchmark ? fmt.shortName(risk.beta_benchmark.replace(/\s*\(.*\)$/, ""), 22) : "benchmark"}`} value=${m("beta").display || fmt.num(risk.beta)} sub="its move per 1% index move" warning=${m("beta").warning} />
+      ${head ? html`<p class="ov-lead">${head.sentence}</p>` : html`<p class="ov-lead muted">Risk and capital are in line across the book.</p>`}
+      <div class="ov-riskgrid">
+        <${Stat} label="Effective holdings" value=${m("effective_holdings").display || (risk.effective_holdings != null ? `${fmt.num(risk.effective_holdings, { decimals: 1 })} of ${fmt.int(risk.actual_holdings)}` : null)} sub="independent bets, not positions" warning=${m("effective_holdings").warning} />
+        <${Stat} label="Volatility, annualised" value=${m("volatility").display || fmt.pct(risk.volatility)} sub=${risk.volatility_multiple != null ? `${fmt.mult(risk.volatility_multiple)} a broad index` : null} warning=${m("volatility").warning} />
+        <${Stat} label="Max drawdown" value=${m("max_drawdown").display || fmt.pct(risk.max_drawdown)} sub=${risk.current_drawdown != null ? `now ${fmt.pct(risk.current_drawdown)} from the peak` : null} warning=${m("max_drawdown").warning} />
+        <${Stat} label=${`Beta vs ${benchShort}`} value=${m("beta").display || fmt.num(risk.beta)} sub="its move per 1% index move" warning=${m("beta").warning} />
       </div>
     </div>
   <//>`;
 }
 
+/* ---------------- alerts ---------------- */
+
+function AlertItem({ a }) {
+  const path = a.route || "/holdings";
+  return html`<li>
+    <a class="ov-alert" href=${href(path)} onClick=${go(path)} title=${`Open ${path.replace(/^#?\//, "")}`}>
+      <${SeverityBadge} severity=${a.severity} showIcon=${false} />
+      <span class="ov-alert-text">
+        <span class="ov-alert-title">${a.title}</span>
+        ${a.detail ? html`<span class="ov-alert-detail">${a.detail}</span>` : null}
+      </span>
+      <span class="ov-alert-go" aria-hidden="true">→</span>
+    </a>
+  </li>`;
+}
+
 function AlertsCard({ alerts }) {
   const sorted = useMemo(() => [...(alerts || [])].sort((a, b) => (SEV_RANK[b.severity] ?? 0) - (SEV_RANK[a.severity] ?? 0) || a.title.localeCompare(b.title)), [alerts]);
-  return html`<${Card} title="Needs attention" caption=${sorted.length ? `${sorted.length} ${sorted.length === 1 ? "item" : "items"}, worst first` : null} class="col-4" flush=${sorted.length > 0}>
-    ${sorted.length ? html`<ul style="list-style:none;margin:0;padding:6px 0;max-height:300px;overflow:auto">
-      ${sorted.map((a) => html`<li key=${a.code + a.title}>
-        <a href=${a.route || "#/holdings"} class="row" style="gap:10px;align-items:flex-start;padding:8px 16px;color:inherit;text-decoration:none" onClick=${(e) => { e.preventDefault(); navigate(a.route || "/holdings"); }}
-          onMouseEnter=${(e) => { e.currentTarget.style.background = "var(--color-hover)"; }} onMouseLeave=${(e) => { e.currentTarget.style.background = ""; }}>
-          <span style="margin-top:1px"><${SeverityBadge} severity=${a.severity} showIcon=${false} /></span>
-          <span class="stack" style="gap:2px;min-width:0">
-            <span class="small" style="font-weight:500;color:var(--color-text)">${a.title}</span>
-            ${a.detail ? html`<span class="xs muted">${a.detail}</span>` : null}
-          </span>
-        </a>
-      </li>`)}
-    </ul>` : html`<div class="row small muted" style="gap:8px"><span class="pos"><${Icon} name="checkCircle" size=${15} /></span><span>Nothing needs attention. No stale prices, no concentration or correlation breaches.</span></div>`}
+  const loud = sorted.filter((a) => a.severity !== "INFO");
+  const info = sorted.filter((a) => a.severity === "INFO");
+  const caption = sorted.length ? `${fmt.count(sorted.length, "item")}, worst first` : null;
+  return html`<${Card} title="Needs attention" caption=${caption} class="col-4" flush=${sorted.length > 0}>
+    ${sorted.length ? html`
+      ${loud.length ? html`<ul class="ov-alerts">${loud.map((a) => html`<${AlertItem} key=${a.code + a.title} a=${a} />`)}</ul>` : null}
+      ${info.length ? (loud.length ? html`<details class="ov-more">
+          <summary><${Icon} name="chevronRight" size=${14} />${fmt.count(info.length, "more note")}</summary>
+          <ul class="ov-alerts">${info.map((a) => html`<${AlertItem} key=${a.code + a.title} a=${a} />`)}</ul>
+        </details>` : html`<ul class="ov-alerts">${info.map((a) => html`<${AlertItem} key=${a.code + a.title} a=${a} />`)}</ul>`) : null}`
+      : html`<div class="ov-ok"><span class="ov-ok-icon"><${Icon} name="checkCircle" size=${15} /></span><span>Nothing needs attention. No stale prices, no concentration or correlation breaches.</span></div>`}
   <//>`;
 }
 
-function MoversCard({ holdings, watchlist }) {
-  const movers = useMemo(() => {
-    const all = [
-      ...holdings.map((h) => ({ isin: h.isin, name: h.name, symbol: h.symbol, pct: h.day_change_pct, sparkline: h.sparkline, held: true })),
-      ...watchlist.map((w) => ({ isin: w.isin, name: w.name, symbol: w.symbol, pct: w.day_change_pct, sparkline: w.sparkline, held: false })),
-    ].filter((x) => x.pct != null);
-    const sorted = [...all].sort((a, b) => b.pct - a.pct);
-    const n = Math.min(3, Math.floor(sorted.length / 2) || sorted.length);
-    const best = sorted.slice(0, n);
-    const worst = sorted.slice(Math.max(n, sorted.length - n)).reverse();
-    return { best, worst, total: all.length };
-  }, [holdings, watchlist]);
-  const Row = ({ m }) => html`<a href=${`#/holdings/${m.isin}`} class="row" style="gap:10px;padding:5px 0;color:inherit;text-decoration:none" onClick=${(e) => { e.preventDefault(); navigate(`/holdings/${m.isin}`); }} title=${m.name}>
-    <span class="stack grow" style="gap:0">
-      <span class="small truncate" style="color:var(--color-text)">${fmt.shortName(m.name, 26)}</span>
-      <span class="xs faint">${m.symbol || m.isin}${m.held ? "" : " · watchlist"}</span>
+/* ---------------- movers + watchlist ---------------- */
+
+function MoverRow({ h, base }) {
+  const path = `/holdings/${h.isin}`;
+  return html`<a class="ov-row" href=${href(path)} onClick=${go(path)} title=${h.name}>
+    <span class="ov-row-text">
+      <span class="ov-row-name">${fmt.shortName(h.name, 30)}</span>
+      <span class="ov-row-sub">${h.symbol || h.isin}${h.weight != null ? ` · ${fmt.pct(h.weight)} of value` : ""}</span>
     </span>
-    <span style="width:64px;height:20px;flex-shrink:0"><${Sparkline} values=${m.sparkline || []} area=${false} endDot=${false} /></span>
-    <span class=${["num", "small", "strong", fmt.polarityClass(m.pct)].join(" ")} style="width:56px;text-align:right">${fmt.pct(m.pct, { signed: true })}</span>
+    <span class="ov-row-spark"><${Sparkline} values=${h.sparkline || []} area=${false} endDot=${false} /></span>
+    <span class="ov-row-num">
+      <span class=${["ov-row-pct", fmt.polarityClass(h.day_change_pct)].join(" ")}>${fmt.pct(h.day_change_pct, { signed: true })}</span>
+      <span class="ov-row-amt">${fmt.money(h.day_change, base, { signed: true })}</span>
+    </span>
   </a>`;
-  return html`<${Card} title="Today's movers" caption=${movers.total ? "Day change across holdings and watchlist" : null} class="col-4" tight>
-    ${movers.total ? html`<div style="display:grid;grid-template-columns:1fr;gap:4px">
-      <div class="caps" style="font-size:10px;margin-top:2px">Up</div>
-      ${movers.best.map((m) => html`<${Row} key=${m.isin} m=${m} />`)}
-      <div class="caps" style="font-size:10px;margin-top:6px">Down</div>
-      ${movers.worst.map((m) => html`<${Row} key=${m.isin} m=${m} />`)}
-    </div>` : html`<div class="faint small" style="padding:8px 0">No day change available yet.</div>`}
+}
+
+function MoversCard({ holdings, base }) {
+  const movers = useMemo(() => holdings.filter((h) => h.day_change_pct != null).sort((a, b) => Math.abs(b.day_change_pct) - Math.abs(a.day_change_pct)).slice(0, 5), [holdings]);
+  return html`<${Card} title="Today's movers" caption=${movers.length ? "Largest moves since the previous close" : null} class="col-4" tight>
+    ${movers.length
+      ? html`<div class="ov-list">${movers.map((h) => html`<${MoverRow} key=${h.isin} h=${h} base=${base} />`)}</div>`
+      : html`<div class="ov-watch-empty">No day change available yet.</div>`}
   <//>`;
 }
+
+function WatchRow({ w }) {
+  const path = `/holdings/${w.isin}`;
+  return html`<a class="ov-row" href=${href(path)} onClick=${go(path)} title=${w.name}>
+    <span class="ov-row-text">
+      <span class="ov-row-name">${fmt.shortName(w.name, 30)}</span>
+      <span class="ov-row-sub">${w.symbol || w.isin}</span>
+    </span>
+    ${w.in_risk_model
+      ? html`<span class="ov-watch-flag good" data-tip="In the risk model: enough overlapping history to simulate with" data-tip-pos="top" aria-label="In the risk model"><${Icon} name="check" size=${11} /></span>`
+      : html`<span class="ov-watch-flag" data-tip="Not enough history yet to sit in the covariance matrix" data-tip-pos="top" aria-label="No history yet"><${Icon} name="clock" size=${11} /></span>`}
+    <span class="ov-row-spark"><${Sparkline} values=${w.sparkline || []} area=${false} endDot=${false} /></span>
+    <span class="ov-row-price">${fmt.money(w.price, w.price_currency)}</span>
+    <span class="ov-row-num" style="width:56px"><span class=${["ov-row-pct", fmt.polarityClass(w.day_change_pct)].join(" ")}>${fmt.pct(w.day_change_pct, { signed: true })}</span></span>
+  </a>`;
+}
+
+function WatchlistStrip({ watchlist }) {
+  return html`<${Card} title="Watchlist" caption="Priced instruments in the universe that are not held. Open one for its history and correlation with the portfolio." tight
+    actions=${html`<a class="ov-link" href=${href("/instruments")} onClick=${go("/instruments")}>Add instrument →</a>`}>
+    ${watchlist.length
+      ? html`<div class="ov-watch">${watchlist.map((w) => html`<${WatchRow} key=${w.isin} w=${w} />`)}</div>`
+      : html`<div class="ov-watch-empty">Nothing on the watchlist. Instruments in the universe that you do not hold show up here.</div>`}
+  <//>`;
+}
+
+/* ---------------- trailing returns ---------------- */
 
 const TRAILING = [["1w", "1 week"], ["1m", "1 month"], ["3m", "3 months"], ["6m", "6 months"], ["ytd", "Year to date"], ["1y", "1 year"], ["all", "Since start"]];
 
 function TrailingStrip({ perf, benchName }) {
   const ok = perf && perf.available && perf.trailing;
-  const tr = (ok && perf.trailing) || {};
-  const bt = (ok && perf.benchmark_trailing) || {};
-  return html`<${Card} title="Trailing returns" caption=${`Time-weighted, portfolio above ${benchName} below.${perf && perf.summary && perf.summary.last_date ? ` To ${fmt.date(perf.summary.last_date)}.` : ""}`} tight>
-    <div style="display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:8px;padding-top:4px">
-      ${TRAILING.map(([k, label]) => html`<div key=${k} class="stack" style="gap:2px;padding:6px 10px;border-radius:var(--radius);background:var(--color-surface-2)">
+  if (!ok) return null;
+  const tr = perf.trailing || {};
+  const bt = perf.benchmark_trailing || {};
+  return html`<${Card} title="Trailing returns" caption=${`Time-weighted. Portfolio above, ${benchName} below.${perf.summary && perf.summary.last_date ? ` To ${fmt.date(perf.summary.last_date)}.` : ""}`} tight>
+    <div class="ov-trailing">
+      ${TRAILING.map(([k, label]) => html`<div key=${k} class="ov-trail">
         <span class="xs faint">${label}</span>
-        <span class=${["num", "strong", fmt.polarityClass(tr[k])].join(" ")} style="font-size:var(--fs-lg);line-height:1.2">${fmt.pct(tr[k], { signed: true })}</span>
-        <span class="xs muted num">${fmt.pct(bt[k], { signed: true })} <span class="faint">${benchName ? "index" : ""}</span></span>
+        <span class=${["ov-trail-value", fmt.polarityClass(tr[k])].join(" ")}>${fmt.pct(tr[k], { signed: true })}</span>
+        <span class="ov-trail-bench" title=${benchName}>${fmt.pct(bt[k], { signed: true })} <span class="faint">index</span></span>
       </div>`)}
     </div>
   <//>`;
 }
 
+/* ---------------- first run ---------------- */
+
+/** Closed Catmull-Rom spline as an SVG path. */
+function smoothClosed(pts) {
+  const n = pts.length;
+  const f = (v) => v.toFixed(1);
+  let d = `M${f(pts[0][0])},${f(pts[0][1])}`;
+  for (let i = 0; i < n; i++) {
+    const p0 = pts[(i - 1 + n) % n], p1 = pts[i], p2 = pts[(i + 1) % n], p3 = pts[(i + 2) % n];
+    d += `C${f(p1[0] + (p2[0] - p0[0]) / 6)},${f(p1[1] + (p2[1] - p0[1]) / 6)} ${f(p2[0] - (p3[0] - p1[0]) / 6)},${f(p2[1] - (p3[1] - p1[1]) / 6)} ${f(p2[0])},${f(p2[1])}`;
+  }
+  return d + "Z";
+}
+
+/** Concentric, gently perturbed rings around a hill — a contour map, deterministic. */
+function contours({ cx, cy, rings, step, seed, squash = 0.62 }) {
+  const out = [];
+  for (let k = 1; k <= rings; k++) {
+    const r = k * step;
+    const pts = [];
+    const n = 44;
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      const w = 1 + 0.17 * Math.sin(3 * a + seed) + 0.10 * Math.sin(5 * a - seed * 1.3 + k * 0.12) + 0.06 * Math.sin(8 * a + seed * 0.7 + k * 0.25);
+      pts.push([cx + r * w * Math.cos(a), cy + r * w * squash * Math.sin(a)]);
+    }
+    out.push(smoothClosed(pts));
+  }
+  return out;
+}
+
+const CONTOUR_PATHS = [
+  ...contours({ cx: 960, cy: 140, rings: 12, step: 30, seed: 1.3 }),
+  ...contours({ cx: 330, cy: 400, rings: 7, step: 28, seed: 4.1, squash: 0.7 }),
+];
+
+function ContourBackdrop() {
+  return html`<div class="ov-welcome-bg" aria-hidden="true">
+    <svg viewBox="0 0 1200 420" preserveAspectRatio="xMidYMid slice">
+      ${CONTOUR_PATHS.map((d, i) => html`<path key=${i} d=${d} fill="none" stroke="currentColor" stroke-width="1" vector-effect="non-scaling-stroke" />`)}
+    </svg>
+  </div>`;
+}
+
 function Welcome({ meta }) {
-  const demo = !meta || meta.mode === "seed";
-  return html`<div class="card" style="position:relative;overflow:hidden;min-height:360px">
-    <div aria-hidden="true" style="position:absolute;inset:0;background:linear-gradient(135deg, var(--color-accent-soft), transparent 60%), radial-gradient(60% 80% at 100% 0%, rgba(57,135,229,.18), transparent)"></div>
-    <img src="/static/assets/hero.webp" alt="" aria-hidden="true" onError=${(e) => { e.currentTarget.style.display = "none"; }}
-      style="position:absolute;inset:0;width:100%;height:100%;object-fit:cover;opacity:.16;pointer-events:none" />
-    <div style="position:relative;padding:40px 40px 36px;max-width:640px">
-      <div class="row" style="gap:8px;margin-bottom:14px"><${Badge} kind=${demo ? "demo" : "live"} dot>${demo ? "DEMO" : "LIVE"}<//><span class="xs faint">${demo ? "synthetic seed data" : "your own ledger"}</span></div>
-      <h2 style="font-size:var(--fs-2xl);letter-spacing:-.02em;margin-bottom:10px">${demo ? "Nothing is held in the demo book yet." : "No holdings yet."}</h2>
-      <p class="muted" style="max-width:520px;line-height:1.55">
-        ${demo
-          ? "Demo mode runs on a synthetic universe with deterministic prices, so every page can be explored without touching your data. Switch to live data in Settings when you are ready to load your own instruments and transactions."
-          : "Add the instruments you own to the universe, then record the buys. Positions, prices, weights and the risk model appear as soon as the first transaction is in the ledger."}
-      </p>
-      <div class="row wrap" style="gap:8px;margin-top:20px">
-        <${Button} variant="primary" icon="instruments" onClick=${() => navigate("/instruments")}>Instruments<//>
-        <${Button} variant="secondary" icon="transactions" onClick=${() => navigate("/transactions?new=1")}>Record a transaction<//>
-        <${Button} variant="ghost" icon="settings" onClick=${() => navigate("/settings")}>${demo ? "Switch to live data" : "Settings"}<//>
+  return html`<section class="card ov-welcome">
+    <${ContourBackdrop} />
+    <div class="ov-welcome-fade" aria-hidden="true"></div>
+    <div class="ov-welcome-body">
+      <div class="row" style="gap:8px"><${Badge} kind="live" dot>LIVE<//><span class="xs faint">your own ledger · ${fmt.count(meta ? meta.instrument_count : null, "instrument")} in the universe</span></div>
+      <h2 class="ov-welcome-title">Nothing is held yet.</h2>
+      <p class="ov-welcome-lead">Three steps stand between this page and your portfolio. Prices, weights, the risk model and the alerts appear as soon as the first BUY is in the ledger.</p>
+      <div class="ov-steps">
+        <div class="ov-step">
+          <span class="ov-step-n">1</span>
+          <span class="ov-step-title">Add an instrument</span>
+          <span class="ov-step-body">Type an ISIN. The listing is resolved, its price history checked, and the instrument joins the universe.</span>
+          <${Button} variant="primary" size="sm" icon="instruments" onClick=${() => navigate("/instruments?new=1")}>Add by ISIN<//>
+        </div>
+        <div class="ov-step">
+          <span class="ov-step-n">2</span>
+          <span class="ov-step-title">Record a transaction</span>
+          <span class="ov-step-body">Enter a buy by hand, or import the CSV your broker exports — the columns are detected and previewed first.</span>
+          <${Button} variant="secondary" size="sm" icon="transactions" onClick=${() => navigate("/transactions?new=1")}>Record or import<//>
+        </div>
+        <div class="ov-step">
+          <span class="ov-step-n">3</span>
+          <span class="ov-step-title">Come back here</span>
+          <span class="ov-step-body">Value, day change, allocation, risk and what needs attention — the whole book, answerable in five seconds.</span>
+          <${Button} variant="ghost" size="sm" icon="settings" onClick=${() => navigate("/settings")}>Or explore the demo data<//>
+        </div>
       </div>
     </div>
-  </div>`;
+  </section>`;
 }
 
 /* ---------------- page ---------------- */
 
 export default function OverviewPage({ snapshot }) {
+  const loading = useStore((s) => s.loading);
   const meta = snapshot && snapshot.meta;
   const base = (meta && meta.base_currency) || "EUR";
   const holdings = (snapshot && snapshot.holdings) || [];
@@ -308,29 +489,28 @@ export default function OverviewPage({ snapshot }) {
   const bench = snapshot && (snapshot.benchmarks || []).find((b) => b.symbol === snapshot.selected_benchmark);
   const benchName = bench ? (bench.index || bench.label || bench.symbol) : "benchmark";
   const failures = useMemo(() => failureAlerts(meta), [meta]);
+  const delay = useMemo(() => { const d = holdings.map((h) => h.price_delay_minutes).filter((v) => v != null); return d.length ? Math.max(...d) : null; }, [holdings]);
 
   const subtitle = snapshot
-    ? `${holdings.length} ${holdings.length === 1 ? "holding" : "holdings"} · ${watchlist.length} on the watchlist · vs ${benchName} · ${fmt.int(snapshot.lookback)}-day risk window · ${fmt.delayNote(meta.prices_as_of, 15)}`
+    ? `${fmt.count(holdings.length, "holding")} · ${fmt.count(watchlist.length, "instrument")} on the watchlist · vs ${benchName} · ${fmt.int(snapshot.lookback)}-day risk window · ${fmt.delayNote(meta.prices_as_of, delay)}`
     : "Value, P&L, allocation and what needs attention today.";
 
   if (!snapshot) {
     return html`<${Page} title="Overview" subtitle=${subtitle}>
-      <${Card}><div class="faint small" style="padding:24px;text-align:center">Loading the snapshot…</div><//>
+      <${Card}><${EmptyState} icon=${loading ? "clock" : "inbox"} title=${loading ? "Loading the snapshot…" : "No snapshot"} body=${loading ? "One request carries everything this page shows." : "The snapshot failed to load; retry from the banner above."} /><//>
     <//>`;
   }
 
   if (!holdings.length) {
+    const firstRun = meta.mode === "user" && !meta.transaction_count;
     return html`<${Page} title="Overview" subtitle=${subtitle}>
       <div class="stack gap-4">
         <${Notice} alerts=${failures} onNavigate=${navigate} />
-        <${Welcome} meta=${meta} />
-        ${watchlist.length ? html`<${Card} title="Watchlist" caption="Priced instruments in the universe that you do not hold." tight>
-          <div class="stack" style="gap:4px">${watchlist.map((w) => html`<a key=${w.isin} href=${`#/holdings/${w.isin}`} class="row small" style="gap:10px;padding:4px 0;color:inherit" onClick=${(e) => { e.preventDefault(); navigate(`/holdings/${w.isin}`); }}>
-            <span class="grow truncate">${w.name}</span><span class="faint xs">${w.symbol || w.isin}</span>
-            <span class="num" style="width:90px;text-align:right">${fmt.money(w.price, w.price_currency)}</span>
-            <span class=${["num", fmt.polarityClass(w.day_change_pct)].join(" ")} style="width:60px;text-align:right">${fmt.pct(w.day_change_pct, { signed: true })}</span>
-          </a>`)}</div>
-        <//>` : null}
+        ${firstRun ? html`<${Welcome} meta=${meta} />` : html`<${Card}>
+          <${EmptyState} icon="holdings" title="No open positions" body=${meta.mode === "seed" ? "The demo book has no open positions." : "Every position in the ledger has been closed. Record a BUY and the book comes back to life."}
+            action=${html`<${Button} variant="primary" icon="transactions" onClick=${() => navigate("/transactions?new=1")}>Record a transaction<//>`} />
+        <//>`}
+        <${WatchlistStrip} watchlist=${watchlist} />
       </div>
     <//>`;
   }
@@ -341,13 +521,14 @@ export default function OverviewPage({ snapshot }) {
       <${KpiRow} totals=${snapshot.totals} meta=${meta} base=${base} />
       <div class="grid">
         <${ValueChart} perf=${perf} benchmarks=${snapshot.benchmarks} selectedBenchmark=${snapshot.selected_benchmark} base=${base} />
-        <${AllocationTreemap} holdings=${holdings} base=${base} />
+        <${AllocationCard} holdings=${holdings} exposure=${snapshot.exposure} base=${base} />
       </div>
       <div class="grid">
         <${RiskCard} risk=${snapshot.risk} />
         <${AlertsCard} alerts=${snapshot.alerts} />
-        <${MoversCard} holdings=${holdings} watchlist=${watchlist} />
+        <${MoversCard} holdings=${holdings} base=${base} />
       </div>
+      <${WatchlistStrip} watchlist=${watchlist} />
       <${TrailingStrip} perf=${perf} benchName=${benchName} />
     </div>
   <//>`;

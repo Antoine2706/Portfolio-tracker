@@ -13,7 +13,7 @@
    columns right-aligned with tabular figures; keyboard-focusable clickable rows
    (Enter/Space). Footer cells use the column's render/format like body cells. */
 
-import { html, useState, useMemo, useCallback } from "/static/vendor/preact-htm.module.js";
+import { html, useState, useMemo, useCallback, useRef, useEffect } from "/static/vendor/preact-htm.module.js";
 import { Icon } from "/static/components/Icons.js";
 import { Segmented } from "/static/components/Segmented.js";
 import { useStore } from "/static/lib/store.js";
@@ -88,7 +88,28 @@ export function DataTable({
   const footRow = typeof footer === "function" ? footer(sorted) : footer;
   const showToolbar = toolbar || toolbarRight || densityToggle;
 
-  return html`<div class=${["table-wrap", maxHeight || scroll ? "scroll" : "", isLoading ? "is-loading" : "", cls].filter(Boolean).join(" ")} style=${maxHeight ? `max-height:${typeof maxHeight === "number" ? maxHeight + "px" : maxHeight}` : undefined}>
+  // A table wider than its card must scroll sideways rather than lose its
+  // last columns to the clip; a table that fits keeps the page-sticky header.
+  // CSS cannot tell the two apart, so the wrap measures itself.
+  const wrapRef = useRef(null);
+  useEffect(() => {
+    const wrap = wrapRef.current;
+    if (!wrap || typeof ResizeObserver === "undefined") return undefined;
+    const check = () => {
+      const table = wrap.querySelector("table.table");
+      if (!table) return;
+      const over = table.offsetWidth > wrap.clientWidth + 1;
+      if ((wrap.dataset.overflow === "true") !== over) wrap.dataset.overflow = over ? "true" : "false";
+    };
+    check();
+    const ro = new ResizeObserver(check);
+    ro.observe(wrap);
+    const table = wrap.querySelector("table.table");
+    if (table) ro.observe(table);
+    return () => ro.disconnect();
+  }, [cols, sorted, density]);
+
+  return html`<div ref=${wrapRef} class=${["table-wrap", maxHeight || scroll ? "scroll" : "", isLoading ? "is-loading" : "", cls].filter(Boolean).join(" ")} style=${maxHeight ? `max-height:${typeof maxHeight === "number" ? maxHeight + "px" : maxHeight}` : undefined}>
     ${showToolbar ? html`<div class="table-toolbar">
       <div class="row">${toolbar}</div>
       <div class="row">

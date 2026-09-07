@@ -120,11 +120,21 @@ def _values(s: pd.Series | None, index) -> list[float | None]:
     return [_f(v) for v in aligned.to_numpy()]
 
 
+def _when(v: dt.date | dt.datetime | None) -> str:
+    """A quote timestamp as people read it: '4 Sep 2026, 17:30 UTC' or '4 Sep 2026'."""
+    if v is None:
+        return "?"
+    if isinstance(v, dt.datetime):
+        u = v.astimezone(dt.timezone.utc) if v.tzinfo else v
+        return f"{u.day} {u:%b %Y}, {u:%H:%M} UTC"
+    return f"{v.day} {v:%b %Y}"
+
+
 def _provenance(pos: Position) -> str:
     q = pos.quote
     if q is None:
         return "no price available"
-    when = _iso(q.as_of) or "?"
+    when = _when(q.as_of)
     if q.is_stale:
         return f"last close {when} ({q.source}) - not a live price"
     delay = f", delayed ~{q.delay_minutes} min" if q.delay_minutes else ", delay unstated"
@@ -654,6 +664,7 @@ def _performance(transactions: list[Transaction], instruments: dict[str, Instrum
         rolling_beta=_series(rolling_b.dropna()) if rolling_b is not None else S.Series(dates=[], values=[]),
         per_holding_value={str(c): _values(history.per_holding[c], dates)
                            for c in history.per_holding.columns},
+        holding_names={str(c): names.get(str(c), str(c)) for c in history.per_holding.columns},
         missing=[names.get(m, m) for m in history.missing],
         warnings=list(history.warnings))
     return _PerfState(out=out, history=history, twr=twr)

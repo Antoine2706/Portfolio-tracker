@@ -42,6 +42,17 @@ Prices are delayed and are never presented as live. A holding that cannot be
 valued is named and excluded from the total rather than valued at zero. A
 missing FX rate raises rather than defaulting to parity.
 
+| Risk | Simulator (risk parity) |
+|---|---|
+| ![Risk](docs/screenshots/risk.png) | ![Simulator](docs/screenshots/simulator.png) |
+| **Performance** | **Holding detail** |
+| ![Performance](docs/screenshots/performance.png) | ![Holding detail](docs/screenshots/holding-detail.png) |
+
+Every chart has a table twin (the grid icon in its corner), the whole
+application is reachable from the keyboard (`?` lists the shortcuts, `Ctrl K`
+opens the command palette), and dark and light themes are designed
+separately rather than inverted.
+
 ## Architecture
 
 ```

@@ -201,6 +201,7 @@ class Performance(BaseModel):
     rolling_volatility: Series
     rolling_beta: Series
     per_holding_value: dict[str, list[float | None]]
+    holding_names: dict[str, str] = {}  # ISIN -> display name, closed positions included
     missing: list[str]
     warnings: list[str]
 

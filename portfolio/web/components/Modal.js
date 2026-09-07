@@ -7,13 +7,13 @@ import { Button } from "/static/components/Button.js";
 import { useFocusTrap } from "/static/components/Drawer.js";
 import { useStore, openModal, closeModal } from "/static/lib/store.js";
 
-export function Modal({ open = true, title, onClose, size = "md", footer, children, ariaLabel }) {
+export function Modal({ open = true, title, onClose, size = "md", footer, children, ariaLabel, class: cls = "" }) {
   const ref = useRef(null);
   useFocusTrap(ref, open, { onEscape: onClose });
   if (!open) return null;
   return html`<div class="modal-root">
     <div class="modal-backdrop" onClick=${onClose}></div>
-    <div ref=${ref} class=${["modal", size === "lg" ? "lg" : ""].filter(Boolean).join(" ")} role="dialog" aria-modal="true" aria-label=${ariaLabel || (typeof title === "string" ? title : "Dialog")} tabindex="-1">
+    <div ref=${ref} class=${["modal", size === "lg" ? "lg" : "", cls].filter(Boolean).join(" ")} role="dialog" aria-modal="true" aria-label=${ariaLabel || (typeof title === "string" ? title : "Dialog")} tabindex="-1">
       ${title ? html`<header class="modal-header">
         <h2 class="modal-title">${title}</h2>
         <${Button} variant="ghost" icon="x" iconOnly title="Close (Esc)" onClick=${onClose} />

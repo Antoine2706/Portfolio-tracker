@@ -277,10 +277,13 @@ export function foldOther(items, { limit = 8, key = "value" } = {}) {
 
 /**
  * lineOption({ series: [{ name, dates?, values, color?, area?, dashed?, width? }], dates?,
- *              yFormat, currency, area, markLines: [{ value, label }], baseline, colors, height })
+ *              yFormat, currency, area, markLines: [{ value, label }], baseline, colors, height,
+ *              endLabels, stacked })
  * dates may be given once at the top level or per series (they must be aligned).
+ * endLabels: direct-label each series at its last point (name + value), legend kept.
+ * stacked:   stacked area — bands filled at .55 with a 2px surface gap between them.
  */
-export function lineOption({ series = [], dates, yFormat = "num", currency = "EUR", area = false, markLines = [], baseline, colors, theme, min, max, emphasisIndex } = {}) {
+export function lineOption({ series = [], dates, yFormat = "num", currency = "EUR", area = false, markLines = [], baseline, colors, theme, min, max, emphasisIndex, endLabels = false, stacked = false } = {}) {
   const t = tokens(theme);
   const xs = dates || (series[0] && series[0].dates) || [];
   const names = series.map((s) => s.name);
@@ -305,6 +308,16 @@ export function lineOption({ series = [], dates, yFormat = "num", currency = "EU
     if (area || ser.area) {
       out.areaStyle = { color: alpha(color, .10) };
     }
+    if (stacked) {
+      out.stack = "total";
+      out.areaStyle = { color: alpha(color, .55) };
+      out.lineStyle = { color: t.chartSurface, width: 2, join: "round", cap: "round" };
+      out.emphasis = { focus: "none" };
+    }
+    if (endLabels) {
+      out.endLabel = { show: true, color: t.text2, fontSize: 11, offset: [6, 0], valueAnimation: false, formatter: (p) => `${p.seriesName} ${format(p.value)}` };
+      out.labelLayout = { moveOverlap: "shiftY" };
+    }
     if (i === 0 && markLines.length) {
       out.markLine = {
         silent: true,
@@ -325,11 +338,13 @@ export function lineOption({ series = [], dates, yFormat = "num", currency = "EU
       data: [{ yAxis: baseline }],
     };
   }
+  // room for the end labels: the longest "name value" at ~6.4px per character
+  const labelRoom = endLabels ? Math.min(220, 16 + Math.round((Math.max(0, ...names.map((n) => String(n).length)) + 7) * 6.4)) : 12;
   return {
     animationDuration: 200,
     animationDurationUpdate: 160,
     animationEasing: "cubicOut",
-    grid: baseGrid(t, { legend: series.length > 1 }),
+    grid: baseGrid(t, { legend: series.length > 1, right: labelRoom }),
     legend: legendFor(t, series.length, names),
     tooltip: {
       ...tooltipBase(t),
@@ -352,10 +367,13 @@ export function lineOption({ series = [], dates, yFormat = "num", currency = "EU
 }
 
 /**
- * barOption({ categories, values, horizontal, format, color, series: [{name, values}], stacked, currency })
+ * barOption({ categories, values, horizontal, format, color, series: [{name, values}], stacked, currency,
+ *             markLines: [{ value, label }], tipRows: (params) => [{ name, value }] })
  * One series → one colour (slot 1). Several → fixed slots, legend shown.
+ * markLines draw a reference rule on the value axis (the axis is widened to
+ * include it); tipRows appends rows to the per-bar tooltip.
  */
-export function barOption({ categories = [], values, series, horizontal = false, format = "num", currency = "EUR", color, colors, stacked = false, theme, showLabels = false, sort } = {}) {
+export function barOption({ categories = [], values, series, horizontal = false, format = "num", currency = "EUR", color, colors, stacked = false, theme, showLabels = false, sort, markLines = [], tipRows } = {}) {
   const t = tokens(theme);
   const fmtV = valueFormatter(format, currency);
   let cats = categories;
@@ -402,17 +420,28 @@ export function barOption({ categories = [], values, series, horizontal = false,
     axisLabel: { color: t.axisText, fontSize: 11, hideOverlap: true, width: horizontal ? 160 : undefined, overflow: horizontal ? "truncate" : undefined, interval: horizontal ? 0 : "auto" },
     splitLine: { show: false },
   };
-  const valAxis = yValueAxis(t, format, currency, { scale: false });
+  const ruleMax = markLines.length ? Math.max(...markLines.map((m) => m.value)) : null;
+  const valAxis = yValueAxis(t, format, currency, { scale: false, max: ruleMax == null ? undefined : (v) => Math.max(v.max, ruleMax * 1.08) });
+  if (markLines.length && s[0]) {
+    s[0].markLine = {
+      silent: true, symbol: "none", animation: false,
+      lineStyle: { color: t.text3, width: 1, type: "solid" },
+      // a vertical rule labels above the plot (the grid keeps 24px for it);
+      // "inside" positions would set the text along the line
+      label: { color: t.text3, fontSize: 11, position: horizontal ? "start" : "insideEndTop", formatter: (p) => p.name || "" },
+      data: markLines.map((m) => (horizontal ? { xAxis: m.value, name: m.label || "" } : { yAxis: m.value, name: m.label || "" })),
+    };
+  }
   return {
     animationDuration: 200,
     animationDurationUpdate: 160,
     animationEasing: "cubicOut",
-    grid: baseGrid(t, { legend: multi, right: showLabels ? 40 : 12 }),
+    grid: baseGrid(t, { legend: multi, right: showLabels ? 40 : 12, top: horizontal && markLines.length ? 24 : undefined }),
     legend: legendFor(t, sers.length, sers.map((x) => x.name)),
     tooltip: {
       ...tooltipBase(t),
       trigger: "item",
-      formatter: (p) => tipElement(p.name, [{ name: multi ? p.seriesName : null, color: p.color, kind: "swatch", value: fmtV(p.value) }]),
+      formatter: (p) => tipElement(p.name, [{ name: multi ? p.seriesName : null, color: p.color, kind: "swatch", value: fmtV(p.value) }, ...(tipRows ? tipRows(p) : [])]),
     },
     xAxis: horizontal ? valAxis : catAxis,
     yAxis: horizontal ? catAxis : valAxis,
@@ -421,21 +450,29 @@ export function barOption({ categories = [], values, series, horizontal = false,
 }
 
 /**
- * divergingBarOption({ names, values, extent, format, warmLabel, coolLabel })
- * Horizontal bars coloured by sign: warm (bad) for positive = carries MORE risk
- * than capital, cool (accent) for negative. Neutral zero rule.
+ * divergingBarOption({ names, values, extent, format, sentences, labels: { pos, neg, zero }, palette })
+ * Horizontal bars coloured by sign. palette "risk" (default): warm for positive
+ * = carries MORE risk than capital, cool (accent) for negative. palette "pnl":
+ * gain / loss status colours for signed money or return. Neutral zero rule;
+ * labels name the sign in the tooltip; sentences[i] is the tooltip footer.
  */
-export function divergingBarOption({ names = [], values = [], extent, format = "pp", currency = "EUR", theme, sentences } = {}) {
+export function divergingBarOption({ names = [], values = [], extent, format = "pp", currency = "EUR", theme, sentences, labels, palette = "risk" } = {}) {
   const t = tokens(theme);
   const fmtV = format === "pp" ? (v) => fmt.pp(v, { signed: true }) : valueFormatter(format, currency);
   const maxAbs = extent ?? Math.max(0.01, ...values.map((v) => Math.abs(v || 0)));
+  const posColor = palette === "pnl" ? t.good : t.divWarm;
+  const negColor = palette === "pnl" ? t.bad : t.divCool;
+  const lab = { pos: "more risk than capital", neg: "less risk than capital", zero: "balanced", ...(labels || {}) };
   const data = values.map((v) => ({
     value: v,
     itemStyle: {
-      color: v == null ? t.divNeutral : v > 0 ? t.divWarm : v < 0 ? t.divCool : t.divNeutral,
+      color: v == null ? t.divNeutral : v > 0 ? posColor : v < 0 ? negColor : t.divNeutral,
       borderRadius: v != null && v < 0 ? [4, 0, 0, 4] : [0, 4, 4, 0],
     },
   }));
+  // Headroom on both sides of the symmetric domain so the outside label of the
+  // largest bar never runs past the plot edge.
+  const span = maxAbs * 1.18;
   return {
     animationDuration: 200,
     animationDurationUpdate: 160,
@@ -444,14 +481,16 @@ export function divergingBarOption({ names = [], values = [], extent, format = "
     tooltip: {
       ...tooltipBase(t),
       trigger: "item",
-      formatter: (p) => tipElement(p.name, [{ color: p.color, kind: "swatch", value: fmtV(p.value), name: p.value > 0 ? "more risk than capital" : p.value < 0 ? "less risk than capital" : "balanced" }], sentences ? sentences[p.dataIndex] : undefined),
+      formatter: (p) => tipElement(p.name, [{ color: p.color, kind: "swatch", value: fmtV(p.value), name: p.value > 0 ? lab.pos : p.value < 0 ? lab.neg : lab.zero }], sentences ? sentences[p.dataIndex] : undefined),
     },
     xAxis: {
       type: "value",
-      min: -maxAbs, max: maxAbs,
+      min: -span, max: span,
       axisLine: { show: false },
       axisTick: { show: false },
-      axisLabel: { color: t.axisText, fontSize: 11, formatter: (v) => (format === "pp" ? fmt.pp(v, { signed: true, decimals: 0 }) : tickFormatter(format, currency)(v)) },
+      // the domain edges are not round numbers (headroom), so only the
+      // interval ticks are labelled — otherwise "6%" and "7%" collide
+      axisLabel: { color: t.axisText, fontSize: 11, showMinLabel: false, showMaxLabel: false, formatter: (v) => (format === "pp" ? fmt.pp(v, { signed: true, decimals: 0 }) : tickFormatter(format, currency)(v)) },
       splitLine: { show: true, lineStyle: { color: t.gridline, width: 1, type: "solid" } },
       splitNumber: 4,
     },
@@ -487,9 +526,11 @@ export function divergingBarOption({ names = [], values = [], extent, format = "
  * heatmapOption({ xLabels, yLabels, matrix, min:-1, max:1, format, showValues })
  * Diverging cool ↔ neutral ↔ warm. Cells carry their own tooltip.
  */
-export function heatmapOption({ xLabels = [], yLabels = [], matrix = [], min = -1, max = 1, format, showValues = true, theme, cellLabel } = {}) {
+export function heatmapOption({ xLabels = [], yLabels = [], matrix = [], min = -1, max = 1, format, showValues = true, theme, cellLabel, tipLabels } = {}) {
   const t = tokens(theme);
   const fmtV = format || ((v) => fmt.num(v, { decimals: 2 }));
+  // the column axis may carry short codes (tickers); the tooltip names in full
+  const tipX = tipLabels || xLabels;
   const data = [];
   for (let y = 0; y < yLabels.length; y++) {
     for (let x = 0; x < xLabels.length; x++) {
@@ -511,12 +552,13 @@ export function heatmapOption({ xLabels = [], yLabels = [], matrix = [], min = -
       ...tooltipBase(t),
       trigger: "item",
       position: "top",
-      formatter: (p) => tipElement(`${yLabels[p.value[1]]} × ${xLabels[p.value[0]]}`, [{ color: colorAt(p.value[2]), kind: "swatch", value: fmtV(p.value[2]) }]),
+      formatter: (p) => tipElement(`${yLabels[p.value[1]]} × ${tipX[p.value[0]]}`, [{ color: colorAt(p.value[2]), kind: "swatch", value: fmtV(p.value[2]) }]),
     },
     xAxis: {
       type: "category", data: xLabels, position: "top",
       axisLine: { show: false }, axisTick: { show: false },
-      axisLabel: { color: t.text2, fontSize: 11, interval: 0, width: 90, overflow: "truncate", rotate: xLabels.length > 8 ? 30 : 0 },
+      // long labels lean at 45° so neighbours never overprint; short codes stay flat
+      axisLabel: { color: t.text2, fontSize: 11, interval: 0, width: 90, overflow: "truncate", rotate: xLabels.some((l) => String(l).length > 8) ? 45 : 0 },
       splitLine: { show: false }, splitArea: { show: false },
     },
     yAxis: {
@@ -699,7 +741,7 @@ export function drawdownOption(dates = [], values = [], { benchmark, benchmarkNa
  * monthlyHeatmapOption(years, months, matrix) — matrix[yearIndex][monthIndex] = return or null.
  * Diverging by polarity: green = gain, red = loss, neutral at zero.
  */
-export function monthlyHeatmapOption(years = [], months = fmt.MONTHS_SHORT, matrix = [], { theme, extent } = {}) {
+export function monthlyHeatmapOption(years = [], months = fmt.MONTHS_SHORT, matrix = [], { theme, extent, showValues = true } = {}) {
   const t = tokens(theme);
   const flat = matrix.flat().filter((v) => v != null);
   const maxAbs = extent ?? Math.max(0.01, ...flat.map((v) => Math.abs(v)));
@@ -742,9 +784,125 @@ export function monthlyHeatmapOption(years = [], months = fmt.MONTHS_SHORT, matr
       type: "heatmap",
       data,
       itemStyle: { borderColor: t.chartSurface, borderWidth: 2, borderRadius: 3 },
-      label: { show: true, fontSize: 11, formatter: (p) => fmt.pct(p.value[2], { decimals: 1 }) },
+      label: { show: showValues, fontSize: 11, formatter: (p) => fmt.pct(p.value[2], { decimals: 1 }) },
       emphasis: { itemStyle: { borderColor: t.text, borderWidth: 1.5 } },
     }],
+  };
+}
+
+/**
+ * histogramOption({ bins: [{ x0, x1, count }], format, currency, markLines: [{ value, label }], countLabel })
+ * One hue. Bars sit on a value axis (bin centres) so reference rules land at
+ * exact values; each bar carries its own tooltip (range + count).
+ */
+export function histogramOption({ bins = [], format = "pct", currency = "EUR", markLines = [], theme, countLabel = "days" } = {}) {
+  const t = tokens(theme);
+  const fmtV = valueFormatter(format, currency);
+  const data = bins.map((b) => ({ value: [(b.x0 + b.x1) / 2, b.count], x0: b.x0, x1: b.x1 }));
+  const lo = bins.length ? bins[0].x0 : undefined;
+  const hi = bins.length ? bins[bins.length - 1].x1 : undefined;
+  return {
+    animationDuration: 200,
+    animationDurationUpdate: 160,
+    grid: baseGrid(t, { top: markLines.length ? 26 : 12 }),
+    legend: { show: false },
+    tooltip: {
+      ...tooltipBase(t),
+      trigger: "item",
+      formatter: (p) => tipElement(`${fmtV(p.data.x0)} to ${fmtV(p.data.x1)}`, [{ color: p.color, kind: "swatch", value: `${fmt.int(p.value[1])} ${countLabel}` }]),
+    },
+    xAxis: {
+      type: "value",
+      min: lo, max: hi,
+      axisLine: { show: false },
+      axisTick: { show: false },
+      axisLabel: { color: t.axisText, fontSize: 11, formatter: tickFormatter(format, currency), margin: 10, hideOverlap: true },
+      splitLine: { show: false },
+      splitNumber: 6,
+    },
+    yAxis: yValueAxis(t, (v) => fmt.int(v), currency, { scale: false, minInterval: 1 }),
+    series: [{
+      type: "bar",
+      data,
+      barCategoryGap: "12%",
+      itemStyle: { color: seriesColor(0, t), borderRadius: [3, 3, 0, 0] },
+      emphasis: { focus: "none", itemStyle: { opacity: .85 } },
+      markLine: markLines.length ? {
+        silent: true, symbol: "none", animation: false,
+        lineStyle: { color: t.text2, width: 1, type: "solid" },
+        label: { color: t.text2, fontSize: 11, position: "end", formatter: (p) => p.name || "" },
+        data: markLines.map((m) => ({ xAxis: m.value, name: m.label || "" })),
+      } : undefined,
+    }],
+  };
+}
+
+/**
+ * smallMultiplesOption({ panels: [{ name, values, yFormat, markLines, color, area, min, max }], dates, height, currency })
+ * Several measures on one canvas, one panel each, stacked vertically with a
+ * shared x axis and a linked crosshair — the answer to "two scales" that never
+ * becomes a dual axis. `height` is the container height in px (panels split it).
+ */
+export function smallMultiplesOption({ panels = [], dates, height = 320, theme, currency = "EUR", left = 48 } = {}) {
+  const t = tokens(theme);
+  const xs = dates || (panels[0] && panels[0].dates) || [];
+  const n = Math.max(1, panels.length);
+  const titleH = 22, gapH = 12, axisH = 24;
+  const slot = (height - axisH) / n;
+  const grids = [], xAxes = [], yAxes = [], series = [], titles = [], formats = [];
+  panels.forEach((p, i) => {
+    const top = Math.round(i * slot + titleH);
+    const h = Math.max(40, Math.round(slot - titleH - gapH));
+    const last = i === n - 1;
+    const color = p.color || seriesColor(i, t);
+    grids.push({ left, right: 12, top, height: h, containLabel: false });
+    const xa = xTimeAxis(t, xs);
+    xa.gridIndex = i;
+    if (!last) xa.axisLabel = { ...xa.axisLabel, show: false };
+    xAxes.push(xa);
+    const ya = yValueAxis(t, p.yFormat || "num", currency, { gridIndex: i, min: p.min, max: p.max, splitNumber: 3 });
+    yAxes.push(ya);
+    titles.push({ text: p.name, left: left - 2, top: Math.round(i * slot) - 2, textStyle: { color: t.text2, fontSize: 11, fontWeight: 500, fontFamily: t.fontSans } });
+    formats.push(valueFormatter(p.yFormat || "num", currency));
+    series.push({
+      name: p.name,
+      type: "line",
+      xAxisIndex: i, yAxisIndex: i,
+      data: (p.values || []).map((v) => (v == null ? null : v)),
+      showSymbol: false, symbol: "circle", symbolSize: 8, connectNulls: false,
+      itemStyle: { color, borderColor: t.chartSurface, borderWidth: 2 },
+      lineStyle: { color, width: 2, join: "round", cap: "round" },
+      areaStyle: p.area ? { color: alpha(color, .10) } : undefined,
+      emphasis: { focus: "none" },
+      sampling: xs.length > 2000 ? "lttb" : undefined,
+      markLine: p.markLines && p.markLines.length ? {
+        silent: true, symbol: "none", animation: false,
+        lineStyle: { color: t.text3, width: 1, type: "solid" },
+        label: { color: t.text3, fontSize: 11, position: "insideEndTop", formatter: (m) => m.name || "" },
+        data: p.markLines.map((m) => ({ yAxis: m.value, name: m.label || "" })),
+      } : undefined,
+    });
+  });
+  return {
+    animationDuration: 200,
+    animationDurationUpdate: 160,
+    title: titles,
+    grid: grids,
+    xAxis: xAxes,
+    yAxis: yAxes,
+    legend: { show: false },
+    axisPointer: { link: [{ xAxisIndex: "all" }], lineStyle: { color: t.borderStrong, width: 1, type: "solid" }, label: { show: false } },
+    tooltip: {
+      ...tooltipBase(t),
+      trigger: "axis",
+      axisPointer: { type: "line", snap: true, lineStyle: { color: t.borderStrong, width: 1, type: "solid" }, label: { show: false } },
+      formatter: (params) => {
+        const list = Array.isArray(params) ? params : [params];
+        if (!list.length) return "";
+        return tipElement(fmt.date(list[0].axisValue), list.map((p) => ({ name: p.seriesName, color: p.color, kind: "line", value: formats[p.seriesIndex](p.value) })));
+      },
+    },
+    series,
   };
 }
 

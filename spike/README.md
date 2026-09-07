@@ -181,21 +181,13 @@ treated as a coverage benchmark rather than assumed to be the production pick.
 
 ## Running the application
 
+The spike settled the provider question; the application itself lives in
+`portfolio/` and is documented in the repository README and
+`docs/ARCHITECTURE.md`.
+
 ```bash
 pip install -e ".[app,data,test]"
-streamlit run portfolio/app/main.py
+portfolio serve                          # demo mode, http://127.0.0.1:8765
+portfolio serve --provider fixture       # fully offline, synthetic prices
+pytest                                   # the whole suite, offline, in seconds
 ```
-
-Starts in **demo mode** on the seed data. Switch to your own data with the
-sidebar radio, or `PORTFOLIO_DATA_MODE=user`.
-
-Tests:
-
-```bash
-python -m pytest --ignore=portfolio/tests/test_app_smoke.py   # 345, no streamlit needed
-python -m pytest                                              # 356, includes UI smoke
-```
-
-The UI smoke tests take ~3 minutes because yfinance retries against a network
-it cannot reach; they are worth the wait, since they are what caught the FX
-failure that blanked the Holdings view.

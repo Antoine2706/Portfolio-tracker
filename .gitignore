@@ -20,3 +20,4 @@ venv/
 *.egg-info/
 portfolio/data_store/cache/
 data_store/cache/
+build/

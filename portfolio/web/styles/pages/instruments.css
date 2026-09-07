@@ -1,0 +1,93 @@
+/* Instruments page (pages/instruments.js). Prefix: ins-.
+   The .wz-* step indicator is shared with the transactions import wizard. */
+
+/* ---------- step indicator ---------- */
+
+.wz-steps { display: flex; align-items: center; gap: 8px; list-style: none; margin: 0; padding: 0; flex-wrap: wrap; }
+.wz-step { display: inline-flex; align-items: center; gap: 8px; font-size: var(--fs-sm); color: var(--color-text-3); }
+.wz-step-n {
+  width: 20px; height: 20px; border-radius: 50%;
+  display: grid; place-items: center;
+  font-size: var(--fs-xs); font-weight: 600; line-height: 1;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border-strong);
+  color: var(--color-text-2);
+  font-variant-numeric: tabular-nums;
+}
+.wz-step[data-state="active"] { color: var(--color-text); font-weight: 500; }
+.wz-step[data-state="active"] .wz-step-n { background: var(--color-accent); color: var(--color-accent-fg); border-color: transparent; }
+.wz-step[data-state="done"] .wz-step-n { background: var(--color-good-soft); color: var(--color-good); border-color: transparent; }
+.wz-step-sep { width: 24px; height: 1px; background: var(--color-border-strong); }
+
+/* ---------- add flow ---------- */
+
+.ins-isin-row { display: flex; gap: var(--sp-3); align-items: flex-start; max-width: 720px; }
+.ins-isin-actions { padding-top: 22px; flex-shrink: 0; }
+.ins-isin-input.input {
+  font-family: var(--font-mono);
+  letter-spacing: .1em;
+  text-transform: uppercase;
+  height: var(--control-h-lg);
+  font-size: var(--fs-md);
+}
+.ins-check { display: flex; align-items: flex-start; gap: 6px; font-size: var(--fs-xs); color: var(--color-text-3); line-height: 1.4; }
+.ins-check svg { margin-top: 1px; }
+.ins-check[data-state="valid"] { color: var(--color-good); }
+.ins-check[data-state="invalid"] { color: var(--color-bad); }
+
+.ins-candidates { display: flex; flex-direction: column; gap: 8px; }
+.ins-candidate {
+  display: flex; gap: 12px; align-items: flex-start;
+  width: 100%; text-align: left;
+  padding: 10px 12px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  background: var(--color-surface-2);
+  color: var(--color-text);
+  transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
+}
+button.ins-candidate:hover:not(:disabled) { border-color: var(--color-border-strong); background: var(--color-surface-3); }
+button.ins-candidate:focus-visible { box-shadow: var(--focus-ring); border-radius: var(--radius-card); }
+.ins-candidate[aria-checked="true"] { border-color: var(--color-accent); background: var(--color-accent-soft); }
+.ins-candidate:disabled { opacity: .6; cursor: not-allowed; }
+.ins-candidate.ins-refused { border-color: color-mix(in srgb, var(--color-serious) 35%, transparent); background: var(--color-surface); }
+.ins-cand-radio {
+  width: 14px; height: 14px; border-radius: 50%; flex-shrink: 0;
+  border: 1.5px solid var(--color-text-3);
+  margin-top: 2px;
+  position: relative;
+  transition: border-color var(--dur-fast) var(--ease);
+}
+.ins-candidate[aria-checked="true"] .ins-cand-radio { border-color: var(--color-accent); }
+.ins-candidate[aria-checked="true"] .ins-cand-radio::after {
+  content: ""; position: absolute; inset: 2.5px; border-radius: 50%; background: var(--color-accent);
+}
+.ins-cand-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
+.ins-cand-facts { display: flex; flex-wrap: wrap; gap: 2px 14px; }
+.ins-cand-reasons, .ins-errors { list-style: none; margin: 2px 0 0; padding: 0; display: flex; flex-direction: column; gap: 2px; font-size: var(--fs-xs); color: var(--color-warn); }
+.ins-cand-reasons li, .ins-errors li { display: flex; gap: 6px; align-items: flex-start; line-height: 1.4; }
+.ins-cand-reasons li svg, .ins-errors li svg { margin-top: 1px; }
+.ins-refused .ins-cand-reasons { color: var(--color-serious); }
+
+.ins-listing-summary {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border);
+  font-size: var(--fs-sm);
+  color: var(--color-text-2);
+}
+.ins-confirm-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
+@media (max-width: 720px) { .ins-confirm-grid { grid-template-columns: 1fr; } .ins-isin-row { flex-direction: column; } .ins-isin-actions { padding-top: 0; } }
+
+/* ---------- universe table ---------- */
+
+.ins-search.input, .input-wrap .ins-search { width: 280px; }
+.ins-inactive td { color: var(--color-text-3); }
+.ins-inactive td .cell-sub { color: var(--color-text-3); }
+
+/* ---------- edit drawer ---------- */
+
+.ins-facts { padding: 10px 12px; border-radius: var(--radius); background: var(--color-surface-2); border: 1px solid var(--color-border); }
+.ins-actions-left { display: flex; align-items: center; gap: var(--sp-2); margin-right: auto; }
