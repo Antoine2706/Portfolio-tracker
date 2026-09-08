@@ -97,7 +97,34 @@ anything, so the harness is calibrated before any strategy is run against it:
 Costs are mandatory, not optional: `walk_forward` takes a cost model, and the
 one in `agents/execution.py` is per broker, per instrument and side-aware,
 because at a real account all three vary. Every input is either read off a
-contract note or marked as an estimate, and the model prints which:
+contract note or marked as an estimate, and the model prints which — and how
+much of the answer each is carrying:
+
+> Transaction tax: 1 of 7 rates was read off a contract note, covering 17% of
+> the book by value. Of the remaining 6: 5 (80%) assumed to sit in the same
+> band, 1 (3%) not recorded at all, so trades in it are refused rather than
+> priced.
+>
+> Weighted by what the model actually charges on a round trip, 9% of the cost
+> figure rests on inputs read off a document and 91% on estimates, of which
+> the bid-ask spread is 39%: it is paid inside the execution price and appears
+> on no contract note.
+
+Where those facts live is `portfolio instruments`:
+
+```bash
+portfolio instruments list                        # what is evidence, what is not
+portfolio instruments set --all --broker MeDirect
+portfolio instruments set IE00B579F325 --broker Keytrade --not-tradeable
+portfolio instruments set DE000A2QP372 --tob-rate 0.12% --observed
+```
+
+Rates parse as `0.0012`, `0,0012` or `0.12%` interchangeably and a bare
+`0.12` is refused as ambiguous, because a hundredfold error from one
+keystroke has nothing to notice it by. `--observed` cannot be set without the
+number it describes. A book written before these columns existed is migrated
+on load, with a notice naming every value it derived and every one it
+refused to.
 
 ```bash
 portfolio backtest erc      # equal risk contribution against buy-and-hold
@@ -114,8 +141,11 @@ Holdings can be marked non-tradeable. A position at a second broker cannot be
 rebalanced against the rest of the book — that is a cash transfer between
 institutions taking about a week, not a trade — so its weight is exogenous.
 It stays in the risk model, since it genuinely affects every correlation, and
-the referee rejects any proposal that moves it. Equal risk contribution then
-solves over the restricted simplex and reports what the constraint cost.
+the referee rejects any proposal that moves it. A holding whose trading cost
+cannot be established is frozen the same way and for a stated reason: refusing
+to price it is absolute, but refusing to produce any result at all was not the
+same thing. Equal risk contribution then solves over the restricted simplex
+and reports what the constraint cost.
 
 Every statistic is reported with its uncertainty. A Sharpe ratio the sample
 cannot establish is reported as undetermined, with the track record length

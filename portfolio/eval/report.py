@@ -102,6 +102,7 @@ class Comparison:
     warnings: tuple[str, ...]
     cost_assumptions: tuple[str, ...]
     constraint_notes: tuple[str, ...] = ()
+    cost_provenance: tuple[str, ...] = ()
 
     def lines(self) -> list[str]:
         out = [f"{self.policy_name} against buy-and-hold", "=" * 64, ""]
@@ -143,12 +144,16 @@ class Comparison:
                 wrapped = _wrap(note, 60)
                 out.append("  - " + wrapped[0])
                 out += ["    " + line for line in wrapped[1:]]
-        out += ["", "Cost inputs that are estimates, not observations",
+        out += ["", "How much of the cost figure rests on observed inputs",
                 "-" * 64]
+        for note in self.cost_provenance:
+            out += ["  " + line for line in _wrap(note, 62)]
+            out.append("")
+        out.append("  Estimates, not observations:")
         for note in self.cost_assumptions:
-            wrapped = _wrap(note, 60)
-            out.append("  - " + wrapped[0])
-            out += ["    " + line for line in wrapped[1:]]
+            wrapped = _wrap(note, 58)
+            out.append("    - " + wrapped[0])
+            out += ["      " + line for line in wrapped[1:]]
         if self.warnings:
             out += ["", "Warnings", "-" * 64]
             for note in sorted(self.warnings)[:10]:
@@ -172,6 +177,7 @@ def _wrap(text: str, width: int = 62) -> list[str]:
 def compare(policy: BacktestResult, benchmark: BacktestResult, *,
             cost_model=None, trials: int = 1, trial_sharpe_sd: float = 0.0,
             overlap: int = 1, constraint_notes: "tuple[str, ...]" = (),
+            weights: "dict[str, float] | None" = None,
             periods_per_year: int = TRADING_DAYS_PER_YEAR) -> Comparison:
     """Summarise a policy against doing nothing.
 
@@ -179,6 +185,10 @@ def compare(policy: BacktestResult, benchmark: BacktestResult, *,
     count reflects how much of the estimation window successive decisions
     share. Leaving it at 1 on a daily-rebalanced policy overstates the
     evidence, which is the direction that matters.
+
+    `weights` are the book's actual weights, used only to weight the
+    observed-against-assumed split of the cost inputs. Counting instruments
+    treats a 2% holding and a 40% holding as the same evidence.
     """
     net = policy.track(trials=trials, trial_sharpe_sd=trial_sharpe_sd,
                        overlap=overlap, periods_per_year=periods_per_year)
@@ -195,9 +205,15 @@ def compare(policy: BacktestResult, benchmark: BacktestResult, *,
     unit_cost = (policy.total_cost / turnover_total) if turnover_total > 0 else 0.0
     breakeven = (edge / unit_cost) if (edge > 0 and unit_cost > 0) else None
 
-    assumptions = tuple(cost_model.assumptions()) if cost_model is not None else (
-        "no cost model was supplied: this run is COST-FREE and cannot be used "
-        "to judge a strategy, only to calibrate the harness",)
+    if cost_model is not None:
+        assumptions = tuple(cost_model.assumptions())
+        provenance = tuple(cost_model.provenance(weights).lines())
+    else:
+        assumptions = (
+            "no cost model was supplied: this run is COST-FREE and cannot be "
+            "used to judge a strategy, only to calibrate the harness",)
+        provenance = ("None of it. There is no cost model in this run at all, "
+                      "so every figure above is gross by construction.",)
 
     return Comparison(
         policy_name=policy.policy, net=net, gross=gross, benchmark=bench,
@@ -207,4 +223,4 @@ def compare(policy: BacktestResult, benchmark: BacktestResult, *,
         total_cost=policy.total_cost, mean_turnover=policy.mean_turnover,
         rebalances=len(policy.decisions),
         warnings=policy.warnings, cost_assumptions=assumptions,
-        constraint_notes=constraint_notes)
+        constraint_notes=constraint_notes, cost_provenance=provenance)

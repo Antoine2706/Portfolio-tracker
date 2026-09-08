@@ -23,6 +23,7 @@ from portfolio.core.models import AssetClass, Instrument
 BANKS = "DE000A2QP372"          # the instrument on the contract note
 GOLD = "IE00B579F325"
 SCHNEIDER = "FR0000121972"
+PROPERTY = "IE00BGDQ0L74"       # a fund, and the one the refusal misdescribed
 
 
 class TestTheContractNote:
@@ -92,11 +93,41 @@ class TestRefusingToGuess:
 
     def test_the_refusal_says_what_to_do_about_it(self):
         model = CostModel(per_instrument={GOLD: InstrumentCost(tob_rate=None)})
-        with pytest.raises(UnknownCost, match="Read the rate off its contract note"):
+        with pytest.raises(UnknownCost, match="Read the rate off a contract note"):
             model.instrument_cost(GOLD, 500.0, "sell")
 
+    def test_the_refusal_names_the_instrument_it_is_refusing(self):
+        """It named the wrong thing once, and cost an hour looking at gold.
+
+        The message asserted "an ETC is a debt security rather than a fund"
+        unconditionally, having been written for the gold case. Raised for a
+        property ETF it stated a confident, specific and false explanation.
+        """
+        model = CostModel(per_instrument={PROPERTY: InstrumentCost(
+            tob_rate=None, name="iShares European Property Yield",
+            asset_class="ETF")})
+        with pytest.raises(UnknownCost) as caught:
+            model.instrument_cost(PROPERTY, 500.0, "buy")
+        message = str(caught.value)
+        assert PROPERTY in message and "European Property Yield" in message
+        assert "ETC" not in message and "debt security" not in message, (
+            "the refusal explained a property fund as a debt security")
+
+    def test_the_etc_explanation_appears_where_it_is_true(self):
+        """And the fix must not have been to delete the explanation."""
+        model = CostModel(per_instrument={GOLD: InstrumentCost(
+            tob_rate=None, name="Invesco Physical Gold ETC",
+            asset_class="ETC")})
+        with pytest.raises(UnknownCost, match="debt security rather than a fund"):
+            model.instrument_cost(GOLD, 500.0, "buy")
+
     def test_a_blank_cell_is_not_read_as_zero(self, tmp_path):
-        """The silently-wrong failure this column exists to prevent."""
+        """The silently-wrong failure this column exists to prevent.
+
+        The header carries `tob_rate`, so the blank cell under it is a
+        statement rather than an absence, and the schema migration must leave
+        it alone even while it fills in the columns that are missing.
+        """
         from portfolio.data.store import DataMode, DataStore
         store = DataStore(mode=DataMode.USER, root=tmp_path)
         store.directory.mkdir(parents=True, exist_ok=True)
@@ -119,6 +150,88 @@ class TestRefusingToGuess:
             BANKS: InstrumentCost(tob_rate=0.0012, tob_observed=True,
                                   half_spread_bps=8.0, spread_observed=True)})
         assert model.assumptions() == ["every cost input has been observed"]
+
+
+class TestProvenance:
+    """How much of the cost figure is evidence, worked out by hand first.
+
+    Account 10,000 EUR, slippage 2 bps, no FX. A at 50% has a contract-note
+    rate and an observed spread; B at 40% has neither; C at 10% has no rate
+    at all and so cannot be traded.
+
+        A  value 5,000   tax 2x5000x0.0012 = 12.00  observed
+                         spread 2x5000x8bps = 8.00  observed
+                         slippage 2x5000x2bps = 2.00  estimated
+        B  value 4,000   tax 2x4000x0.0012 = 9.60   assumed
+                         spread 2x4000x8bps = 6.40  estimated
+                         slippage 2x4000x2bps = 1.60  estimated
+
+    So 20.00 EUR rests on documents and 19.60 does not: 50.5%.
+    """
+
+    def _model(self):
+        return CostModel(account_value=10_000.0, per_instrument={
+            "A": InstrumentCost(tob_rate=0.0012, tob_observed=True,
+                                half_spread_bps=8.0, spread_observed=True),
+            "B": InstrumentCost(tob_rate=0.0012, half_spread_bps=8.0),
+            "C": InstrumentCost(tob_rate=None)})
+
+    WEIGHTS = {"A": 0.5, "B": 0.4, "C": 0.1}
+
+    def test_it_sorts_the_instruments_three_ways(self):
+        p = self._model().provenance(self.WEIGHTS)
+        assert (p.observed, p.assumed, p.unpriced) == (("A",), ("B",), ("C",))
+        assert p.instruments == 3
+
+    def test_the_weights_are_the_book_not_the_count(self):
+        p = self._model().provenance(self.WEIGHTS)
+        assert p.weight_observed == pytest.approx(0.5)
+        assert p.weight_assumed == pytest.approx(0.4)
+        assert p.weight_unpriced == pytest.approx(0.1)
+
+    def test_the_cost_split_matches_the_arithmetic_above(self):
+        p = self._model().provenance(self.WEIGHTS)
+        assert p.cost_observed == pytest.approx(20.0)
+        assert p.cost_assumed == pytest.approx(19.6)
+        assert p.observed_cost_share == pytest.approx(20.0 / 39.6)
+        assert p.cost_spread_estimated == pytest.approx(6.4)
+
+    def test_weighting_by_the_book_changes_the_answer(self):
+        """Which is the reason for weighting at all. One observed rate on the
+        largest holding and one on the smallest are not the same claim."""
+        model = self._model()
+        heavy = model.provenance({"A": 0.8, "B": 0.1, "C": 0.1})
+        light = model.provenance({"A": 0.1, "B": 0.8, "C": 0.1})
+        assert heavy.observed_cost_share > light.observed_cost_share
+        assert len(heavy.observed) == len(light.observed) == 1
+
+    def test_without_weights_it_treats_the_instruments_equally_and_says_so(self):
+        p = self._model().provenance()
+        assert not p.weighted
+        assert "of the book by value" not in " ".join(p.lines())
+        assert p.weight_observed == pytest.approx(1 / 3)
+
+    def test_the_sentence_reads_as_a_finding(self):
+        lines = self._model().provenance(self.WEIGHTS).lines()
+        assert lines[0].startswith(
+            "Transaction tax: 1 of 3 rates was read off a contract note, "
+            "covering 50% of the book by value.")
+        assert "1 (40%) assumed to sit in the same band" in lines[0]
+        assert "1 (10%) not recorded at all" in lines[0]
+        assert "51% of the cost figure rests on inputs read off a document" in lines[1]
+
+    def test_an_unpriceable_holding_contributes_no_cost_either_way(self):
+        """It cannot be traded, so charging it to either column would be
+        inventing a trade nobody can make."""
+        p = self._model().provenance(self.WEIGHTS)
+        assert p.unpriced == ("C",)
+        # A and B account for the whole figure; C's tenth of the book buys no
+        # modelled cost at all, in either column.
+        assert p.cost_observed + p.cost_assumed == pytest.approx(39.6)
+
+    def test_an_empty_model_does_not_claim_a_split(self):
+        assert "nothing here can be attributed" in \
+            " ".join(CostModel().provenance({}).lines())
 
 
 class TestSidedTaxes:

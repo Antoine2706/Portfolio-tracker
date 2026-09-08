@@ -36,8 +36,17 @@ portfolio/
 
 Dependency arrows point inward: `web -> api -> data -> core` and
 `eval -> agents -> core`. `core` never imports from `data` or `api`; `api`
-never imports numpy or scipy; `agents` never imports `eval` (the layering
-tests enforce all of it with `ast`).
+never imports numpy or scipy; `agents` never imports `eval`; `data` never
+imports `agents`, `eval`, `api` or `research` (the layering tests enforce all
+of it with `ast`).
+
+That last one has a concrete temptation behind it. The schema migration in
+`data/migrations.py` needs the Belgian transaction tax bands, which are also
+what `agents/execution.py` prices a trade with. Importing them across would
+make storage depend on the decision layer for three constants, and the next
+thing imported along that edge would not be three constants. They live in
+`core/taxes.py` instead -- reference data about jurisdictions, computed by
+nobody -- and both layers reach inward for them.
 
 That last arrow is the one that is easy to get backwards and expensive to get
 wrong. A policy must not be able to tell that it is being backtested, because
@@ -78,6 +87,20 @@ estimate; `CostModel.assumptions()` lists everything unobserved and the
 backtest prints it beneath every result. A strategy that is profitable gross
 and unprofitable net is the most common false positive in this field, and a
 harness that cannot produce that finding is not measuring.
+
+`CostModel.provenance(weights)` goes further and quantifies it: how many tax
+rates were read off a document, what share of the book those holdings are,
+and what fraction of the modelled round-trip cost rests on evidence rather
+than judgement. A count alone is not the answer, because one observed rate on
+a 2% position and one on a 40% position are not the same claim.
+
+**A holding whose cost cannot be established cannot be traded.** Refusing to
+price it stays absolute -- nothing invents a rate. But refusing to *run* was
+too strong: `research.load_book` now freezes such a holding and says why,
+which is what "no policy may trade this" already means elsewhere in the
+system. It also keeps the two reasons for a freeze apart, since a second
+broker is a permanent fact about the account and a missing tax band is a gap
+one contract note closes.
 
 **Some weights are exogenous.** A holding at a second broker cannot be traded
 against the rest of the book. It is marked non-tradeable on the instrument
@@ -324,6 +347,41 @@ def correlation_clusters(corr: pd.DataFrame, threshold: float = HIGH_CORRELATION
 ```
 
 ## data contract (new modules)
+
+### data/migrations.py
+
+```python
+TRADING_COLUMNS = ("broker", "tradeable", "tob_rate", "tob_observed",
+                   "half_spread_bps", "spread_observed", "buy_tax_rate")
+
+def missing_columns(path: Path) -> list[str]     # the trigger: absent from the header
+def derived_facts(inst: Instrument) -> list[Backfill]
+def backfill_trading_facts(instruments, path, fillable=None) -> MigrationReport
+```
+
+`DataStore.load_instruments` calls this when the file's header lacks any of
+those columns, backs the file up, rewrites it and prints what it filled in.
+
+The trigger is the **header**, never a blank cell, and `fillable` is a hard
+limit rather than a hint. A blank `tob_rate` under a `tob_rate` header is a
+recorded statement that the rate is not established -- exactly what the gold
+ETC needs -- and a derived default would destroy it on every load. Only a
+column that is not there at all can be said to have no answer in it. This
+also makes the migration one-shot by construction.
+
+It fills only what the instrument record determines: the tax band from the
+asset class (a debt security does not take a fund's band, so an ETC gets
+nothing and stays unpriceable), and the French FTT for French shares. It does
+not invent a broker -- which institution holds a position is not a property of
+the instrument, and the two brokers here have opposite fee shapes, so the
+wrong schedule changes which trades are affordable rather than changing a cost
+slightly. Everything derived is written with `tob_observed = False` and named
+in the notice.
+
+Populating what cannot be derived is `portfolio instruments set`, which
+parses `0.0012`, `0,0012` and `0.12%` alike and refuses a bare `0.12` as
+ambiguous, because a hundredfold error from one keystroke has nothing to
+notice it by.
 
 ### data/providers/fixture.py  (exists)
 `FixtureProvider(MarketDataProvider)`: deterministic synthetic prices for any

@@ -68,8 +68,15 @@ from __future__ import annotations
 
 import dataclasses
 
+# Reference data, not policy, and needed by the schema migration in data/ as
+# well as by the pricing here. Kept in core/ so neither of those two layers
+# has to import the other; re-exported because this module is where a reader
+# looks for them.
+from ..core.taxes import (BELGIAN_TOB_BANDS, BELGIAN_TOB_CAP, FRENCH_FTT_RATE,
+                          OBSERVED_TOB_RATE)
+
 __all__ = ["BrokerFees", "InstrumentCost", "CostModel", "UnknownCost", "cost_table",
-           "MEDIRECT", "KEYTRADE", "BROKERS", "OBSERVED_TOB_RATE",
+           "Provenance", "MEDIRECT", "KEYTRADE", "BROKERS", "OBSERVED_TOB_RATE",
            "FRENCH_FTT_RATE", "BELGIAN_TOB_BANDS"]
 
 
@@ -81,29 +88,6 @@ class UnknownCost(RuntimeError):
     a measurement, and the whole point of this module is that the numbers in
     it came from somewhere.
     """
-
-
-# Observed on the MeDirect contract note above. The Belgian tax on
-# stock-exchange transactions is charged on both purchase and sale.
-OBSERVED_TOB_RATE = 0.0012
-
-# The bands, for reference when confirming the other holdings. Which one
-# applies turns on facts about each specific compartment -- fund or debt
-# security, accumulating or distributing, registered for public distribution
-# in Belgium or not -- that cannot be derived from an ISIN. Read each off its
-# own contract note.
-BELGIAN_TOB_BANDS = {
-    "observed_medirect_etf": 0.0012,
-    "accumulating_registered": 0.0132,
-    "equity": 0.0035,
-    "unknown": None,
-}
-
-# France taxes acquisitions of shares in French-headquartered companies above
-# 1bn EUR of market capitalisation. Schneider Electric is on that list. Buy
-# side only, regardless of the buyer's residence or the venue used, which is
-# why `instrument_cost` takes a side.
-FRENCH_FTT_RATE = 0.004
 
 
 @dataclasses.dataclass(frozen=True)
@@ -221,15 +205,120 @@ class InstrumentCost:
     execution price and never appear on a contract note -- but it must be
     declared as one via `spread_observed`, so the model can report which of
     its inputs are evidence and which are judgement.
+
+    `name` and `asset_class` are carried purely so that a refusal can describe
+    the instrument it is refusing. They earned their place: the refusal
+    message used to assert "an ETC is a debt security rather than a fund"
+    unconditionally, having been written for the gold case, and then said it
+    about a property ETF -- a confident, specific and false explanation that
+    sent the reader to the wrong holding. An error message is an output like
+    any other, and the rule about not claiming more than is known applies to
+    it too.
     """
     broker: str = "MeDirect"
+    broker_recorded: bool = True         # False = the schedule is a fallback
     tob_rate: float | None = OBSERVED_TOB_RATE
     tob_observed: bool = False
     half_spread_bps: float = 8.0
     spread_observed: bool = False
     buy_tax_rate: float = 0.0            # the French FTT, where it applies
     needs_fx: bool = False
+    name: str = ""
+    asset_class: str = ""
     note: str = ""
+
+    def describe(self, isin: str) -> str:
+        return f"{isin} ({self.name})" if self.name else isin
+
+
+@dataclasses.dataclass(frozen=True)
+class Provenance:
+    """The split between cost inputs that are evidence and inputs that are not.
+
+    Printed under every result. A cost model whose numbers mostly came from
+    somebody's judgement produces a breakeven turnover that is mostly
+    somebody's judgement, and the reader is entitled to know that without
+    opening the source.
+
+    Two measures, because the obvious one is not sufficient on its own. The
+    count says how many rates were read off a document; the weighted figures
+    say whether those were the holdings that matter. One observed rate on a
+    2% position and one on a 40% position are very different claims.
+
+    >>> book = {"A": InstrumentCost(tob_rate=0.0012, tob_observed=True,
+    ...                             half_spread_bps=8.0, spread_observed=True),
+    ...         "B": InstrumentCost(tob_rate=0.0012),
+    ...         "C": InstrumentCost(tob_rate=None)}
+    >>> p = CostModel(per_instrument=book).provenance(
+    ...     {"A": 0.5, "B": 0.4, "C": 0.1})
+    >>> p.observed, p.assumed, p.unpriced
+    (('A',), ('B',), ('C',))
+    >>> round(p.weight_observed, 3), round(p.weight_unpriced, 3)
+    (0.5, 0.1)
+    """
+    observed: tuple[str, ...]            # tax rate read off a document
+    assumed: tuple[str, ...]             # tax rate derived or assumed
+    unpriced: tuple[str, ...]            # no tax rate at all; trades refused
+    weight_observed: float
+    weight_assumed: float
+    weight_unpriced: float
+    cost_observed: float                 # EUR of modelled round-trip cost
+    cost_assumed: float
+    cost_spread_estimated: float = 0.0
+    weighted: bool = False               # were real weights supplied?
+
+    @property
+    def instruments(self) -> int:
+        return len(self.observed) + len(self.assumed) + len(self.unpriced)
+
+    @property
+    def observed_cost_share(self) -> float | None:
+        total = self.cost_observed + self.cost_assumed
+        return float(self.cost_observed / total) if total > 0 else None
+
+    def lines(self) -> list[str]:
+        n = self.instruments
+        if not n:
+            return ["No per-instrument cost facts were supplied, so nothing "
+                    "here can be attributed to evidence or to judgement."]
+
+        def pct(weight: float) -> str:
+            return f" ({weight:.0%})" if self.weighted else ""
+
+        head = (f"Transaction tax: {len(self.observed)} of {n} "
+                f"{'rate' if n == 1 else 'rates'} "
+                f"{'was' if len(self.observed) == 1 else 'were'} read off a "
+                f"contract note")
+        if self.weighted:
+            head += (f", covering {self.weight_observed:.0%} of the book by "
+                     f"value")
+        out = [head + "."]
+
+        rest = []
+        if self.assumed:
+            rest.append(f"{len(self.assumed)}{pct(self.weight_assumed)} assumed "
+                        f"to sit in the same band")
+        if self.unpriced:
+            it = "it" if len(self.unpriced) == 1 else "them"
+            rest.append(f"{len(self.unpriced)}{pct(self.weight_unpriced)} not "
+                        f"recorded at all, so trades in {it} are refused rather "
+                        f"than priced")
+        if rest:
+            out[0] += (f" Of the remaining {n - len(self.observed)}: "
+                       f"{', '.join(rest)}.")
+
+        share = self.observed_cost_share
+        if share is not None:
+            line = (f"Weighted by what the model actually charges on a round "
+                    f"trip, {share:.0%} of the cost figure rests on inputs "
+                    f"read off a document and {1 - share:.0%} on estimates")
+            if self.cost_assumed > 0:
+                spread = self.cost_spread_estimated / self.cost_assumed
+                line += (f", of which the bid-ask spread is {spread:.0%}: it "
+                         f"is paid inside the execution price and appears on "
+                         f"no contract note")
+            out.append(line + ".")
+        return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,13 +370,26 @@ class CostModel:
     >>> round(fr.instrument_cost("FR", 1000.0, "sell"), 4)
     4.5
 
-    An instrument whose tax band has not been recorded is refused, not guessed:
+    An instrument whose tax band has not been recorded is refused, not guessed.
+    The refusal names the instrument and says only what is known about it:
 
-    >>> unknown = CostModel(per_instrument={"GOLD": InstrumentCost(tob_rate=None)})
-    >>> unknown.instrument_cost("GOLD", 500.0, "buy")
+    >>> book = {"IE00BGDQ0L74": InstrumentCost(
+    ...             tob_rate=None, name="iShares European Property Yield",
+    ...             asset_class="ETF"),
+    ...         "IE00B579F325": InstrumentCost(
+    ...             tob_rate=None, name="Invesco Physical Gold ETC",
+    ...             asset_class="ETC")}
+    >>> CostModel(per_instrument=book).instrument_cost("IE00BGDQ0L74", 500.0, "buy")
     Traceback (most recent call last):
         ...
-    portfolio.agents.execution.UnknownCost: no transaction tax rate is recorded for GOLD, so a trade in it cannot be priced. An ETC is a debt security rather than a fund and does not automatically take a fund's band. Read the rate off its contract note and set tob_rate.
+    portfolio.agents.execution.UnknownCost: no transaction tax rate is recorded for IE00BGDQ0L74 (iShares European Property Yield), so a trade in it cannot be priced. Read the rate off a contract note for this instrument and record it with: portfolio instruments set IE00BGDQ0L74 --tob-rate <rate> --observed
+
+    The sentence about debt securities is attached only where it is true:
+
+    >>> CostModel(per_instrument=book).instrument_cost("IE00B579F325", 500.0, "buy")
+    Traceback (most recent call last):
+        ...
+    portfolio.agents.execution.UnknownCost: no transaction tax rate is recorded for IE00B579F325 (Invesco Physical Gold ETC), so a trade in it cannot be priced. It is an ETC, a debt security rather than a fund, so it does not automatically take a fund's band. Read the rate off a contract note for this instrument and record it with: portfolio instruments set IE00B579F325 --tob-rate <rate> --observed
     """
 
     # Costs are computed against a fixed notional rather than the running
@@ -299,7 +401,7 @@ class CostModel:
 
     slippage_bps: float = 2.0            # the gap between the quote and the fill
     fx_spread_bps: float = 25.0          # on the currency leg, where there is one
-    tob_cap: float = 1_300.0             # EUR per transaction, in the 0.12% band
+    tob_cap: float = BELGIAN_TOB_CAP     # EUR per transaction, in the 0.12% band
 
     per_instrument: dict = dataclasses.field(default_factory=dict)
     brokers: dict = dataclasses.field(default_factory=lambda: dict(BROKERS))
@@ -345,11 +447,20 @@ class CostModel:
         facts = self.facts(isin)
 
         if facts.tob_rate is None:
+            # Say what is known and nothing more. The ETC clause is attached
+            # only when the instrument actually is one; asserting it about
+            # every unpriced holding was how a missing rate on a property ETF
+            # came to be reported as a fact about debt securities.
+            why = ""
+            if (facts.asset_class or "").strip().upper() == "ETC":
+                why = (" It is an ETC, a debt security rather than a fund, so "
+                       "it does not automatically take a fund's band.")
             raise UnknownCost(
-                f"no transaction tax rate is recorded for {isin}, so a trade "
-                f"in it cannot be priced. An ETC is a debt security rather "
-                f"than a fund and does not automatically take a fund's band. "
-                f"Read the rate off its contract note and set tob_rate.")
+                f"no transaction tax rate is recorded for "
+                f"{facts.describe(isin)}, so a trade in it cannot be priced."
+                f"{why} Read the rate off a contract note for this instrument "
+                f"and record it with: portfolio instruments set {isin} "
+                f"--tob-rate <rate> --observed")
 
         commission = self.broker_for(isin).commission(value)
         spread = value * (facts.half_spread_bps + self.slippage_bps) / 10_000.0
@@ -416,9 +527,85 @@ class CostModel:
                 out.append(f"{isin}: half-spread {facts.half_spread_bps:.1f} bps "
                            f"estimated; spreads are paid inside the execution "
                            f"price and never appear on a contract note")
+            if not facts.broker_recorded:
+                out.append(f"{isin}: no broker recorded, so {facts.broker}'s "
+                           f"fee schedule is being applied as a fallback; "
+                           f"commission and the minimum economic trade differ "
+                           f"between the two brokers by more than any other "
+                           f"input here")
         if not out:
             out.append("every cost input has been observed")
         return out
+
+    def provenance(self, weights: "dict[str, float] | None" = None) -> "Provenance":
+        """How much of the cost figure rests on evidence rather than judgement.
+
+        The count alone is not the answer -- one observed rate on the largest
+        holding and one on the smallest are not the same claim -- so this
+        weights by the book and, separately, by what the model actually
+        charges. See `Provenance.lines()` for the sentences it produces.
+        """
+        isins = sorted(self.per_instrument)
+        raw = ({i: abs(float(weights.get(i, 0.0))) for i in isins}
+               if weights else {i: 1.0 for i in isins})
+        total_weight = sum(raw.values())
+        if total_weight <= 0:
+            # An empty or all-zero book carries no information about which
+            # holdings matter, so reporting 0% everywhere would be a weighted
+            # answer with no weights in it. Fall back to counting.
+            raw = {i: 1.0 for i in isins}
+            total_weight = float(len(isins)) or 1.0
+            weights = None
+        share = {i: v / total_weight for i, v in raw.items()}
+
+        observed: list[str] = []
+        assumed: list[str] = []
+        unpriced: list[str] = []
+        cost_observed = cost_assumed = cost_spread = 0.0
+
+        for isin in isins:
+            facts = self.facts(isin)
+            if facts.tob_rate is None:
+                unpriced.append(isin)
+                continue
+            (observed if facts.tob_observed else assumed).append(isin)
+
+            # A round trip at this holding's share of the account, split into
+            # the components the model charges, each attributed to the input
+            # that set it.
+            value = share[isin] * self.account_value
+            if value <= 0:
+                continue
+            try:
+                commission = 2.0 * self.broker_for(isin).commission(value)
+            except UnknownCost:
+                commission = 0.0          # an unknown fee cannot be attributed
+            tax = 2.0 * min(value * facts.tob_rate, self.tob_cap)
+            tax += value * facts.buy_tax_rate
+            spread = 2.0 * value * facts.half_spread_bps / 10_000.0
+            estimated = 2.0 * value * self.slippage_bps / 10_000.0
+            if facts.needs_fx:
+                estimated += 2.0 * value * self.fx_spread_bps / 10_000.0
+
+            if not facts.spread_observed:
+                cost_spread += spread
+            for amount, is_evidence in ((tax, facts.tob_observed),
+                                        (spread, facts.spread_observed),
+                                        (commission, facts.broker_recorded),
+                                        (estimated, False)):
+                if is_evidence:
+                    cost_observed += amount
+                else:
+                    cost_assumed += amount
+
+        return Provenance(
+            observed=tuple(observed), assumed=tuple(assumed),
+            unpriced=tuple(unpriced),
+            weight_observed=sum(share[i] for i in observed),
+            weight_assumed=sum(share[i] for i in assumed),
+            weight_unpriced=sum(share[i] for i in unpriced),
+            cost_observed=cost_observed, cost_assumed=cost_assumed,
+            cost_spread_estimated=cost_spread, weighted=bool(weights))
 
 
 def cost_table(instruments) -> dict:
@@ -434,19 +621,30 @@ def cost_table(instruments) -> dict:
     marked unobserved, so `assumptions()` names it. Being wrong in the cheap
     direction on the largest unmeasured component is how a backtest comes to
     flatter a strategy.
+
+    A blank broker falls back the same way, and is flagged the same way. The
+    two brokers here have opposite fee shapes, so applying the wrong schedule
+    changes which trades are affordable rather than changing a cost by a few
+    basis points; that cannot be allowed to happen quietly.
+
+    The name and asset class ride along so that a refusal can describe what it
+    is refusing rather than guessing.
     """
     items = (instruments.items() if hasattr(instruments, "items")
              else [(i.isin, i) for i in instruments])
     out = {}
     for isin, inst in items:
         out[isin] = InstrumentCost(
-            broker=inst.broker or "MeDirect",
+            broker=inst.broker or MEDIRECT.name,
+            broker_recorded=bool(inst.broker),
             tob_rate=inst.tob_rate,
-            tob_observed=bool(inst.tob_observed),
+            tob_observed=bool(inst.tob_observed and inst.tob_rate is not None),
             half_spread_bps=(8.0 if inst.half_spread_bps is None
                              else float(inst.half_spread_bps)),
             spread_observed=bool(inst.spread_observed
                                  and inst.half_spread_bps is not None),
             buy_tax_rate=float(inst.buy_tax_rate),
+            name=inst.display_name,
+            asset_class=inst.asset_class.value,
         )
     return out

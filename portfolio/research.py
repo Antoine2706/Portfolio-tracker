@@ -26,6 +26,12 @@ transfer between institutions taking about a week, not a rebalance. Its weight
 still drifts with the market, so it is pinned to whatever it currently is
 rather than to a target, and both the policy and the referee are told.
 
+A holding whose trading cost cannot be established is frozen the same way,
+and the note says which of the two reasons applies. Refusing to price it
+stays absolute -- nothing here invents a rate -- but refusing to produce any
+result at all was a different and much stronger claim, and it is what one
+unrecorded tax band used to do to a whole book.
+
 There are no open prices here. The providers return adjusted closes, so
 execution is next-close: a full extra day of delay against the next-open
 model, which is the conservative direction.
@@ -118,11 +124,6 @@ def load_book(*, mode: str = "user", data_root: "pathlib.Path | None" = None,
     total = sum(held.values())
     held = {k: v / total for k, v in held.items()} if total > 0 else held
 
-    tradeable = frozenset(isin for isin in closes.columns
-                          if instruments[isin].tradeable)
-    frozen = {isin: held.get(isin, 0.0) for isin in closes.columns
-              if isin not in tradeable}
-
     value = account_value
     if value is None:
         value = sum(float(p.market_value(snapshot.fx, dt.date.today()).amount)
@@ -132,14 +133,49 @@ def load_book(*, mode: str = "user", data_root: "pathlib.Path | None" = None,
     costs = CostModel(account_value=value or 15_000.0,
                       per_instrument=cost_table(instruments))
 
+    # Two separate reasons a holding's weight cannot be moved, kept apart
+    # because they are undone by different things and the report should say
+    # which one applies. A second broker is a fact about the account and will
+    # not change; a missing tax band is a gap in the record that one contract
+    # note closes.
+    #
+    # An unpriceable holding is frozen rather than fatal. The alternative is
+    # what the previous build did: raise the moment the optimiser touched it,
+    # so a single unrecorded rate meant no result at all. Refusing to *price*
+    # it is still absolute -- nothing here invents a cost -- but a holding
+    # whose cost is unknown is exactly a holding no policy may trade, which is
+    # a constraint the machinery already models.
+    unpriceable = {isin for isin in closes.columns
+                   if costs.facts(isin).tob_rate is None}
+    tradeable = frozenset(isin for isin in closes.columns
+                          if instruments[isin].tradeable and isin not in unpriceable)
+    frozen = {isin: held.get(isin, 0.0) for isin in closes.columns
+              if isin not in tradeable}
+
     notes = []
     for isin in sorted(frozen):
         inst = instruments[isin]
+        if not inst.tradeable:
+            notes.append(
+                f"{inst.display_name} ({isin}) is frozen at {frozen[isin]:.1%}: "
+                f"held at {inst.broker or 'a different broker'}, so its weight "
+                f"cannot be traded against the rest of the book without a "
+                f"multi-day cash transfer between institutions. It stays in the "
+                f"risk model.")
+        else:
+            notes.append(
+                f"{inst.display_name} ({isin}) is frozen at {frozen[isin]:.1%} "
+                f"because no transaction tax rate is recorded for it, so no "
+                f"trade in it can be priced. This is a gap in the record rather "
+                f"than a fact about the account: read the rate off a contract "
+                f"note and run `portfolio instruments set {isin} --tob-rate "
+                f"<rate> --observed` to free it.")
+    if store.last_migration:
         notes.append(
-            f"{inst.display_name} ({isin}) is frozen at {frozen[isin]:.1%}: held "
-            f"at {inst.broker or 'a different broker'}, so its weight cannot be "
-            f"traded against the rest of the book without a multi-day cash "
-            f"transfer between institutions. It stays in the risk model.")
+            f"{store.instruments_path.name} predated the trading-cost columns "
+            f"and was migrated on load; the derived values are assumptions "
+            f"until confirmed against contract notes. The full notice was "
+            f"printed above.")
     unpriced = [i for i in instruments if i not in closes.columns]
     if unpriced:
         notes.append(f"not in the panel (too little price history): "
@@ -207,4 +243,4 @@ def run_equal_risk_contribution(book: Book, *, lookback: int = 252,
         notes.append("policy said: " + result.decisions[-1].reason)
     return compare(result, benchmark, cost_model=book.costs, trials=trials,
                    trial_sharpe_sd=trial_sharpe_sd, overlap=rebalance_every,
-                   constraint_notes=tuple(notes))
+                   weights=book.weights, constraint_notes=tuple(notes))

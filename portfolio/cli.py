@@ -4,6 +4,8 @@
     portfolio serve --mode user          # your own data
     portfolio serve --provider fixture   # fully offline demo, synthetic prices
     portfolio check                      # run the core test suite
+    portfolio instruments list           # where each holding is held, and its costs
+    portfolio instruments set ISIN ...   # record a broker, a tax band, a freeze
     portfolio controls                   # calibrate the backtest harness
     portfolio backtest erc               # equal risk contribution vs buy-and-hold
 
@@ -208,6 +210,169 @@ def _backtest(args: argparse.Namespace) -> int:
     return 0
 
 
+def _rate(text: str) -> float:
+    """Parse a rate written any of the ways a person actually writes one.
+
+    A contract note says "0.120%" and a spreadsheet on a machine with a comma
+    decimal separator says "0,0012". Both mean the same thing, and typing the
+    wrong one of them into a CSV by hand is exactly the silent, plausible,
+    wrong number this project keeps finding.
+
+    >>> _rate("0.0012"), _rate("0,0012"), _rate("0.12%"), _rate("0,120 %")
+    (0.0012, 0.0012, 0.0012, 0.0012)
+
+    A bare number large enough to be a percentage typed without its sign is
+    refused rather than accepted as a 12% tax:
+
+    >>> _rate("0.12")
+    Traceback (most recent call last):
+        ...
+    argparse.ArgumentTypeError: 0.12 as a bare rate means 12.0000%, which is far outside any transaction tax. Write it as '0.12%' if that is what you meant, or as a fraction such as 0.0012.
+    """
+    s = text.strip().replace(" ", "").replace("\xa0", "").replace(",", ".")
+    try:
+        if s.endswith("%"):
+            return float(s[:-1]) / 100.0
+        value = float(s)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r} is not a number") from None
+    if value > 0.1:
+        raise argparse.ArgumentTypeError(
+            f"{s} as a bare rate means {value:.4%}, which is far outside any "
+            f"transaction tax. Write it as '{s}%' if that is what you meant, "
+            f"or as a fraction such as 0.0012.")
+    if value < 0:
+        raise argparse.ArgumentTypeError(f"a rate cannot be negative: {s}")
+    return value
+
+
+def _open_store(args: argparse.Namespace):
+    import pathlib
+
+    from .data.store import DataMode, DataStore
+    root = pathlib.Path(args.data_root) if args.data_root else None
+    return DataStore.open(DataMode(args.mode), root=root)
+
+
+def _instrument_rows(instruments) -> list[str]:
+    """The trading facts, as a table, so they can be read rather than inferred."""
+    head = (f"{'ISIN':14}{'name':26}{'class':8}{'broker':10}{'trade':6}"
+            f"{'transaction tax':17}{'half-spread':18}{'buy tax':8}")
+    out = [head, "-" * len(head)]
+    for isin in sorted(instruments):
+        inst = instruments[isin]
+        if inst.tob_rate is None:
+            tax = "NOT RECORDED"
+        else:
+            tax = f"{inst.tob_rate:.4%} " + ("observed" if inst.tob_observed
+                                             else "assumed")
+        if inst.half_spread_bps is None:
+            spread = "8.0 bps fallback"
+        else:
+            spread = f"{inst.half_spread_bps:.1f} bps " + (
+                "obs" if inst.spread_observed else "est")
+        out.append(
+            f"{isin:14}{inst.display_name[:25]:26}{inst.asset_class.value:8}"
+            f"{(inst.broker or '-'):10}{('yes' if inst.tradeable else 'NO'):6}"
+            f"{tax:17}{spread:18}"
+            f"{(f'{inst.buy_tax_rate:.2%}' if inst.buy_tax_rate else '-'):8}")
+    return out
+
+
+def _instruments(args: argparse.Namespace) -> int:
+    """Read and edit the trading facts on the instrument records.
+
+    These fields decide whether a trade can be priced at all, and before this
+    existed the only way to populate them was to hand-edit a seven-column
+    addition across every row of a CSV -- on a machine whose spreadsheet uses
+    a comma decimal separator. That is precisely how a plausible wrong number
+    gets into a cost model, so it is code with validation instead.
+    """
+    store = _open_store(args)
+    instruments = store.load_instruments()
+    if not instruments:
+        print(f"no instruments in {store.directory}", file=sys.stderr)
+        return 2
+
+    if args.action == "list":
+        print(f"{store.describe()}\n")
+        print("\n".join(_instrument_rows(instruments)))
+        return 0
+
+    if not args.all and not args.isin:
+        print("name at least one ISIN, or pass --all.", file=sys.stderr)
+        return 2
+    targets = sorted(instruments) if args.all else [i.strip().upper()
+                                                    for i in args.isin]
+    unknown = [i for i in targets if i not in instruments]
+    if unknown:
+        print(f"not in {store.instruments_path}: {', '.join(unknown)}",
+              file=sys.stderr)
+        return 2
+
+    # An observed flag with no number behind it is an estimate wearing the
+    # label of evidence, which is worse than either honestly.
+    if args.observed and args.tob_rate is None:
+        if any(instruments[i].tob_rate is None for i in targets):
+            print("--observed marks a rate as read off a contract note, so it "
+                  "needs that rate: pass --tob-rate too, or set it first.",
+                  file=sys.stderr)
+            return 2
+    if args.spread_observed and args.half_spread_bps is None:
+        if any(instruments[i].half_spread_bps is None for i in targets):
+            print("--spread-observed needs --half-spread-bps: a spread cannot "
+                  "be observed without a value.", file=sys.stderr)
+            return 2
+
+    changes: list[str] = []
+    for isin in targets:
+        inst = instruments[isin]
+        for field, value in (("broker", args.broker),
+                             ("tradeable", args.tradeable),
+                             ("tob_rate", args.tob_rate),
+                             ("half_spread_bps", args.half_spread_bps),
+                             ("buy_tax_rate", args.buy_tax_rate),
+                             ("short_name", args.short_name),
+                             ("note", args.note)):
+            if value is None:
+                continue
+            before = getattr(inst, field)
+            if before == value:
+                continue
+            inst.override(field, value)
+            changes.append(f"{isin} {field}: {before!r} -> {value!r}")
+        # The observed flags travel with the value they describe, and setting
+        # a new rate without saying where it came from resets the claim.
+        for flag, field, value in (("observed", "tob_observed", args.observed),
+                                   ("spread_observed", "spread_observed",
+                                    args.spread_observed)):
+            source = args.tob_rate if field == "tob_observed" else args.half_spread_bps
+            if value is None and source is None:
+                continue
+            new = bool(value) if value is not None else False
+            if getattr(inst, field) != new:
+                inst.override(field, new)
+                changes.append(f"{isin} {field}: {new}")
+
+    if not changes:
+        print("nothing to change; every field already has the value asked for.")
+        return 0
+    store.save_instruments(instruments)
+    print("\n".join(changes))
+
+    from .agents.execution import BROKERS
+    strangers = sorted({instruments[i].broker for i in targets
+                        if instruments[i].broker
+                        and instruments[i].broker not in BROKERS})
+    if strangers:
+        print(f"\nWarning: no fee schedule is recorded for "
+              f"{', '.join(strangers)}, so the cost model will refuse to price "
+              f"a trade there. Known: {', '.join(sorted(BROKERS))}.")
+    print(f"\nWritten to {store.instruments_path}.\n")
+    print("\n".join(_instrument_rows(instruments)))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="portfolio",
                                      description="Portfolio risk tracker")
@@ -229,6 +394,56 @@ def build_parser() -> argparse.ArgumentParser:
 
     check = sub.add_parser("check", help="run the test suite")
     check.set_defaults(func=_check)
+
+    def _store_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--mode", choices=["seed", "user"], default="user")
+        p.add_argument("--data-root", default=None,
+                       help="directory holding seed/ and user/")
+
+    instruments = sub.add_parser(
+        "instruments",
+        help="read and edit where a holding is held and what trading it costs")
+    action = instruments.add_subparsers(dest="action", required=True)
+
+    listing = action.add_parser("list", help="show the trading facts on record")
+    _store_args(listing)
+    listing.set_defaults(func=_instruments)
+
+    setter = action.add_parser(
+        "set", help="record a broker, a tax band, a spread or a freeze",
+        description="Rates accept 0.0012, 0,0012 or 0.12% interchangeably.")
+    _store_args(setter)
+    setter.add_argument("isin", nargs="*", help="one or more ISINs")
+    setter.add_argument("--all", action="store_true",
+                        help="every instrument in the store")
+    setter.add_argument("--broker", default=None,
+                        help="the institution that holds it, e.g. MeDirect")
+    tradeable = setter.add_mutually_exclusive_group()
+    tradeable.add_argument("--tradeable", dest="tradeable", action="store_true",
+                           default=None)
+    tradeable.add_argument("--not-tradeable", dest="tradeable",
+                           action="store_false", default=None,
+                           help="no automated policy may change its weight")
+    setter.add_argument("--tob-rate", type=_rate, default=None,
+                        help="transaction tax, charged each way")
+    seen = setter.add_mutually_exclusive_group()
+    seen.add_argument("--observed", dest="observed", action="store_true",
+                      default=None, help="the tax rate was read off a document")
+    seen.add_argument("--assumed", dest="observed", action="store_false",
+                      default=None)
+    setter.add_argument("--half-spread-bps", type=float, default=None,
+                        help="from observed quotes, not from a contract note")
+    quoted = setter.add_mutually_exclusive_group()
+    quoted.add_argument("--spread-observed", dest="spread_observed",
+                        action="store_true", default=None)
+    quoted.add_argument("--spread-estimated", dest="spread_observed",
+                        action="store_false", default=None)
+    setter.add_argument("--buy-tax-rate", type=_rate, default=None,
+                        help="one-sided taxes, e.g. the French FTT")
+    setter.add_argument("--short-name", default=None,
+                        help="the label used on charts and in dense tables")
+    setter.add_argument("--note", default=None)
+    setter.set_defaults(func=_instruments)
 
     controls = sub.add_parser(
         "controls",

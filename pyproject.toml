@@ -41,10 +41,12 @@ include = ["portfolio*"]
 portfolio = ["web/**/*", "data_store/seed/*"]
 
 [tool.pytest.ini_options]
-# core/, eval/ and agents/ are collected for their doctests as well as their
-# tests: the worked numeric examples in the statistics are the check that the
-# formulae are the ones the papers state, and a doctest nobody runs is a
-# comment.
+# core/, eval/, agents/, data/ and the CLI are collected for their doctests as
+# well as their tests: the worked numeric examples in the statistics are the
+# check that the formulae are the ones the papers state, and a doctest nobody
+# runs is a comment. data/ is here for the schema migration's derivation
+# table, and cli.py for the rate parser, both of which turn a written value
+# into a stored one and so are exactly where a plausible wrong number enters.
 testpaths = ["portfolio/tests", "portfolio/core", "portfolio/eval",
-             "portfolio/agents"]
+             "portfolio/agents", "portfolio/data", "portfolio/cli.py"]
 addopts = "-q --doctest-modules --doctest-ignore-import-errors"

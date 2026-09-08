@@ -210,6 +210,37 @@ def test_the_evaluation_layer_does_not_import_the_composition_root(path):
         f"pulling the data layer into code that must stay offline.")
 
 
+# The data layer sits under both of those. It reads and writes files, and it
+# is allowed the network; what it may not do is depend on the code that makes
+# decisions. The temptation is concrete: the schema migration in
+# `data/migrations.py` needs the Belgian transaction tax bands, which are also
+# what `agents/execution.py` prices a trade with. Importing them across would
+# have made the storage layer depend on the decision layer for three
+# constants, and the next thing imported along that edge would not be three
+# constants. They live in `core/taxes.py` instead, and both layers reach in.
+
+DATA_FILES = sorted(DATA.rglob("*.py"))
+ABOVE_THE_DATA_LAYER = {"agents", "eval", "research", "api"}
+
+
+def upward_imports(path: pathlib.Path) -> set[str]:
+    """Relative imports from a file into a layer that sits above data/."""
+    return {m for m in imported_modules(path)
+            if m.startswith(".") and m.lstrip(".") in ABOVE_THE_DATA_LAYER}
+
+
+def test_the_data_layer_has_modules_to_check():
+    assert DATA_FILES, "no data modules found; the guard would pass vacuously"
+
+
+@pytest.mark.parametrize("path", DATA_FILES, ids=lambda p: p.name)
+def test_the_data_layer_does_not_depend_on_the_decision_layer(path):
+    bad = upward_imports(path)
+    assert not bad, (
+        f"{path.name} imports {sorted(bad)}. Storage sits under the decision "
+        f"layer, not beside it. Shared reference data belongs in core/.")
+
+
 def test_the_layering_guard_actually_bites(tmp_path):
     """Sabotage, because a guard that has never failed proves nothing.
 
@@ -234,6 +265,16 @@ def test_the_layering_guard_actually_bites(tmp_path):
         "from ..agents.base import Proposal\n", encoding="utf-8")
     assert not imported_modules(clean) & FORBIDDEN_IN_EVALUATION, (
         "the guard flags a clean file, so it is not testing what it claims")
+
+    # And the data-layer rule, sabotaged the same way: the exact import the
+    # schema migration was one line away from needing.
+    upward = tmp_path / "leaky_migration.py"
+    upward.write_text(
+        "from ..agents.execution import BELGIAN_TOB_BANDS\n"
+        "from ..core.taxes import FRENCH_FTT_RATE\n", encoding="utf-8")
+    assert upward_imports(upward) == {"..agents"}, (
+        "the data-layer guard did not flag a deliberate import of agents/, or "
+        "flagged the core/ import it must allow")
 
 
 def test_data_layer_may_use_the_network_but_core_may_not():

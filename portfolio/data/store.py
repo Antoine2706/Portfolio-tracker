@@ -30,6 +30,7 @@ import datetime as dt
 import enum
 import os
 import pathlib
+import sys
 from decimal import Decimal
 
 from ..core.models import (Amendment, AmendmentAction, AssetClass, Instrument,
@@ -114,6 +115,12 @@ class DataStore:
     mode: DataMode = DataMode.SEED
     root: pathlib.Path = DEFAULT_ROOT
 
+    # Set by `load_instruments` when it had to migrate the file it read, so a
+    # caller can print what changed. Not a constructor argument and not part
+    # of the store's identity: it is a fact about the last read.
+    last_migration: object = dataclasses.field(default=None, init=False,
+                                               repr=False, compare=False)
+
     @classmethod
     def open(cls, mode: str | DataMode | None = None,
              root: pathlib.Path | None = None) -> "DataStore":
@@ -180,7 +187,42 @@ class DataStore:
                     buy_tax_rate=float(row.get("buy_tax_rate") or 0.0),
                 )
                 out[inst.isin] = inst
+        if out:
+            self._migrate_instruments(out)
         return out
+
+    # The file this reads may predate the trading-cost columns. Left alone, a
+    # book like that loads with every tax rate NOT RECORDED, which makes every
+    # instrument unpriceable and every backtest impossible -- graceful loading
+    # and refusing to guess, each correct alone, composing into a tool that
+    # cannot run. See `migrations.py` for why the trigger is the header rather
+    # than a blank cell.
+    BACKUP_SUFFIX = ".before-trading-columns"
+
+    def _migrate_instruments(self, instruments: dict[str, Instrument]) -> None:
+        from .migrations import backfill_trading_facts, missing_columns
+
+        missing = missing_columns(self.instruments_path)
+        if not missing:
+            return
+        report = backfill_trading_facts(instruments, self.instruments_path,
+                                        fillable=set(missing))
+        backup = self.instruments_path.parent / (
+            self.instruments_path.name + self.BACKUP_SUFFIX)
+        try:
+            if not backup.exists():
+                backup.write_bytes(self.instruments_path.read_bytes())
+            self.save_instruments(instruments)
+        except OSError as exc:
+            # A read-only install directory must not stop the application
+            # starting. The derived values still apply for this run; they are
+            # simply derived again next time.
+            report = dataclasses.replace(report, persisted=False, backup=None,
+                                         error=f"{type(exc).__name__}: {exc}.")
+        else:
+            report = dataclasses.replace(report, backup=backup)
+        self.last_migration = report
+        print("\n".join(report.lines()), file=sys.stderr)
 
     def save_instruments(self, instruments: dict[str, Instrument]) -> None:
         """Reference data is rewritten wholesale -- unlike the ledger, it is a
