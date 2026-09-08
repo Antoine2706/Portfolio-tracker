@@ -57,7 +57,50 @@ from ..agents.allocate import allocate_buy_only, dispersion_of
 from ..core.returns import TRADING_DAYS_PER_YEAR
 from ..core.risk import covariance_matrix
 
-__all__ = ["Arm", "ReplayResult", "replay_purchases"]
+__all__ = ["Arm", "ReplayResult", "estimable_window", "replay_purchases"]
+
+
+def estimable_window(closes: pd.DataFrame, position: int, lookback: int, *,
+                     minimum: int) -> pd.DataFrame:
+    """Returns to estimate a covariance from, as of `position`, strictly before.
+
+    Two filters, and neither is a precaution: without them the replay of the
+    demo ledger raised `covariance needs at least 2 return observations, got 0`
+    and produced no result at all.
+
+    *Instruments that have not listed yet are dropped, not carried as gaps.*
+    The panel's ten instruments start on eight different dates, the earliest in
+    September 2024 and the latest in June 2025. Complete-case deletion across
+    all ten therefore deletes every date before the last of those, which for
+    any window reaching back further is every date in it. Dropping the column
+    is also the point-in-time answer: an instrument with no history is not a
+    destination the allocator could have chosen, and pretending otherwise would
+    be the same peek the harness exists to prevent.
+
+    *A return that spans a gap is not a return.* Dividing today's close by the
+    last one that printed produces a two-day move recorded as a one-day move,
+    which inflates the variance in expectation and is the defect the harness
+    carries its `measured` mask for. A return survives only if both of its
+    endpoint prices printed on consecutive panel dates.
+
+    What is left is complete-case over the surviving instruments, which is what
+    the equal risk contribution path does, so the two cannot disagree about
+    what the book's covariance is.
+
+    Empty when nothing survives, so the caller decides what to do rather than
+    being handed an exception mid-ledger.
+    """
+    history = closes.iloc[max(0, position - lookback):position]
+    if len(history) < 2:
+        return history.iloc[:0]
+    enough = [c for c in history.columns
+              if int(history[c].notna().sum()) >= minimum]
+    if len(enough) < 2:
+        return history.iloc[:0]
+    kept = history[enough].astype(float)
+    observed = kept.notna()
+    spanning = ~(observed & observed.shift(1))
+    return kept.pct_change().mask(spanning).iloc[1:].dropna(how="any")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -106,12 +149,34 @@ class ReplayResult:
     purchases: int
     total_invested: float
     carried: float                      # unspent at the end of the replay
+    measured: tuple[str, ...]           # instruments the dispersion covers, at the end
+    unmeasured: tuple[str, ...]         # in the panel, too little history to
+    opened_with: int                    # how many it covered on the first day
+    stopped_at: "pd.Timestamp | None"   # the first sale, where the replay ends
     skipped: tuple[str, ...]
 
     @property
     def dispersion_gap(self) -> float:
         """Mean dispersion, actual minus allocator. Positive favours the tool."""
         return float(self.actual.mean_dispersion - self.allocated.mean_dispersion)
+
+    @property
+    def correlation(self) -> "float | None":
+        """How alike the two arms' returns actually are.
+
+        Measured, not assumed. The report used to assert that the arms were
+        "nearly the same portfolio" as its reason for refusing to rank two
+        volatilities, which is the same move the risk-adjusted comparison was
+        corrected for: rho decides how much of each marginal standard error
+        cancels, so it has to be a number on the page rather than an
+        adjective. Two arms that share few holdings are not nearly the same
+        portfolio and the reader should be able to see that.
+        """
+        a, b = self.actual.returns.align(self.allocated.returns, join="inner")
+        if len(a) < 3:
+            return None
+        value = float(np.corrcoef(a.to_numpy(), b.to_numpy())[0, 1])
+        return value if np.isfinite(value) else None
 
     def lines(self) -> list[str]:
         out = [
@@ -147,48 +212,114 @@ class ReplayResult:
             f"sampling error. It is the size of the effect, not evidence for "
             f"its sign: directing money at an underweight holding lowers "
             f"dispersion close to arithmetically.",
+            f"Both arms are measured on the same day against the same "
+            f"covariance, estimated from the window ending that day, so no "
+            f"reported number depends on a price that had not printed. It "
+            f"decides nothing in either arm either: every purchase was chosen "
+            f"on a window strictly *before* its own date.",
         ]
+        if self.opened_with != len(self.measured):
+            out.append(
+                f"The metric covered {self.opened_with} instruments on the "
+                f"first day and {len(self.measured)} on the last, because "
+                f"instruments list at different dates and one with no history "
+                f"has no risk share. A range over "
+                f"{self.opened_with} risk shares and a range over "
+                f"{len(self.measured)} are not the same statistic, so read the "
+                f"final row rather than the mean where the two differ.")
+        if self.unmeasured:
+            out.append(
+                f"Outside the measurement even at the end: "
+                f"{', '.join(self.unmeasured)}. Too little price history to "
+                f"estimate a covariance, so neither arm's dispersion counts "
+                f"{'them' if len(self.unmeasured) > 1 else 'it'}.")
         if se_a is not None:
             gap = abs(self.actual.volatility - self.allocated.volatility)
+            rho = self.correlation
             out.append(
-                f"Volatility is estimated and does carry error. The two arms "
+                f"Volatility is estimated and does carry error: the two arms "
                 f"differ by {gap:.4f} against a standard error near "
-                f"{se_a:.4f} on each, and the two series are nearly the same "
-                f"portfolio, so this is not a ranking. With {self.purchases} "
-                f"purchases it was never going to be.")
+                f"{se_a:.4f} on each. Those are MARGINAL errors and the two "
+                f"series are correlated at "
+                f"{'unknown' if rho is None else format(rho, '.3f')}, so how "
+                f"much of each cancels is not read off them -- the same reason "
+                f"the policy comparison is made at matched risk rather than on "
+                f"a difference of levels. With {self.purchases} purchases this "
+                f"is not a ranking, and it was never going to be.")
+        if self.stopped_at is not None:
+            out += ["", f"The replay stops on {self.stopped_at:%Y-%m-%d}, the "
+                    f"first sale in the ledger. Both arms have to hold the "
+                    f"same money throughout, and there is no neutral way to "
+                    f"apply a concentrated sale to the arm that did not make "
+                    f"it: pro-rata leaves risk shares untouched, so the "
+                    f"allocator arm would carry a free disposal while the "
+                    f"actual arm carries one that moves its shares a long "
+                    f"way. Everything above covers the span before it."]
         if self.skipped:
             out += ["", "Purchases the allocator could not replay", "-" * 64]
             out += [f"  - {s}" for s in self.skipped]
         return out
 
 
+def _on_panel(when, dates) -> "pd.Timestamp | None":
+    """The panel date a ledger date falls on, or the next one that trades."""
+    stamp = pd.Timestamp(when)
+    if stamp in dates:
+        return stamp
+    later = dates[dates >= stamp]
+    return later[0] if len(later) else None
+
+
 def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
                      buyable, lookback: int = 252, warmup: int = 60,
-                     among=None) -> ReplayResult:
+                     among=None, sales=()) -> ReplayResult:
     """Run both arms through the same cash flows.
 
     `purchases` is an iterable of (date, isin, shares) -- the real ledger,
     with quantities rather than amounts, because the amount is the quantity
     times that day's price and using a recorded amount at a different price
     would put the two arms on different money.
+
+    `sales` is the same for disposals, and the replay **stops** at the first
+    one rather than replaying past it. That is a limit of the experiment, not
+    an oversight, and it is worth being exact about why.
+
+    The comparison rests on both arms holding the same money at every moment,
+    so a withdrawal has to be applied to both. But the two arms do not hold the
+    same instruments, so there is no neutral rule for applying a concentrated
+    sale to the arm that did not make it. Selling the same euro amount pro-rata
+    is dispersion-neutral -- risk shares are homogeneous of degree zero, so
+    scaling a book down changes none of them -- which means the allocator arm
+    would carry a disposal that costs it nothing while the actual arm carries
+    the real, concentrated one that moves its risk shares a long way. The
+    comparison would then be measuring the sale rather than the destination of
+    the purchases, which is the one thing it exists to isolate.
+
+    Replaying only up to the first sale keeps the claim clean and states what
+    it covers. Ignoring sales entirely -- which this did -- is the option that
+    is actually wrong: the demo ledger sells a 500-share position in October
+    and the "actual" arm went on holding it to the end of the panel, so the arm
+    labelled *what was bought* was a book nobody ever owned.
     """
     keys = [str(c) for c in closes.columns]
     dates = closes.index
     filled = closes.ffill()
 
+    stops = [d for d in (_on_panel(w, dates) for w, *_ in sales) if d is not None]
+    stop = min(stops) if stops else None
+
     by_date: "dict[pd.Timestamp, list[tuple[str, float]]]" = {}
     for when, isin, shares in purchases:
-        stamp = pd.Timestamp(when)
-        if stamp not in dates:
-            later = dates[dates >= stamp]
-            if not len(later):
-                continue
-            stamp = later[0]
+        stamp = _on_panel(when, dates)
+        if stamp is None or (stop is not None and stamp >= stop):
+            continue
         by_date.setdefault(stamp, []).append((str(isin), float(shares)))
 
     actual = {k: 0.0 for k in keys}
     model = {k: 0.0 for k in keys}
     rows_a, rows_m, index = [], [], []
+    flows_a: "list[float]" = []
+    flows_m: "list[float]" = []
     skipped: list[str] = []
     count, invested, invested_model = 0, 0.0, 0.0
     # Whole shares leave a remainder on every purchase, and over a ledger it
@@ -199,7 +330,12 @@ def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
     carry = 0.0
 
     for position, day in enumerate(dates):
+        if stop is not None and day >= stop:
+            break
         price = filled.loc[day]
+        # Money that arrived today, per arm. Needed because a contribution is
+        # not a return and has to be backed out before the series is divided.
+        paid_a = paid_m = 0.0
         for isin, shares in by_date.get(day, []):
             if isin not in actual or not np.isfinite(price.get(isin, np.nan)):
                 skipped.append(f"{day:%Y-%m-%d} {isin}: no price in the panel")
@@ -208,18 +344,23 @@ def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
             actual[isin] += float(shares)
             count += 1
             invested += cash
+            paid_a += cash
             budget = cash + carry
 
             # Decide on data strictly before today, fill at today's close.
             history = closes.iloc[max(0, position - lookback):position]
-            if position < warmup or len(history) < warmup:
+            window = estimable_window(closes, position, lookback,
+                                      minimum=warmup)
+            if position < warmup or len(history) < warmup or len(window) < 2:
                 model[isin] += float(shares)
                 invested_model += cash
-                skipped.append(f"{day:%Y-%m-%d} {isin}: only {len(history)} "
-                               f"rows of history, too few to estimate a "
-                               f"covariance; the actual purchase was copied")
+                paid_m += cash
+                skipped.append(f"{day:%Y-%m-%d} {isin}: {len(history)} rows of "
+                               f"history leave {len(window)} usable return "
+                               f"observations across {window.shape[1]} "
+                               f"instruments, too few to estimate a covariance; "
+                               f"the actual purchase was copied")
                 continue
-            window = history.pct_change().dropna(how="any")
             cov = covariance_matrix(window)
             values = {k: model[k] * float(price[k]) for k in keys
                       if np.isfinite(price.get(k, np.nan))}
@@ -231,6 +372,7 @@ def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
             if not allocation.purchases:
                 model[isin] += float(shares)
                 invested_model += cash
+                paid_m += cash
                 skipped.append(f"{day:%Y-%m-%d}: the allocator proposed "
                                f"nothing for {cash:,.0f} EUR; the actual "
                                f"purchase was copied")
@@ -238,6 +380,7 @@ def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
             for bought in allocation.purchases:
                 model[bought.isin] += bought.shares
             invested_model += allocation.invested
+            paid_m += float(allocation.invested)
             carry = float(allocation.leftover)
 
         value_a = sum(actual[k] * float(price[k]) for k in keys
@@ -249,24 +392,80 @@ def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
         index.append(day)
         rows_a.append((value_a, {k: actual[k] * float(price[k]) for k in keys}))
         rows_m.append((value_m, {k: model[k] * float(price[k]) for k in keys}))
+        flows_a.append(paid_a)
+        flows_m.append(paid_m)
 
     stamps = pd.DatetimeIndex(index)
-    window = closes.pct_change()
 
-    def arm(name, rows, shares, spent) -> Arm:
+    # The measurement covariance is point in time, one per reported day, from
+    # the window ending on that day. Both arms get the same matrix on the same
+    # day, so it cannot favour either, and no reported number depends on a
+    # price that had not printed yet.
+    #
+    # One matrix over the whole panel would read better -- the series would
+    # move only because the holdings moved, rather than partly because the
+    # estimator wandered -- and it was written that way first. The leak check
+    # in `test_replay.py` rejected it, correctly: rewriting every price after a
+    # date changed the reported dispersion *before* that date, because the
+    # matrix had seen the rewrite. The measurement enters no decision, so it is
+    # not a leak that could flatter the policy, but a number that moves when
+    # the future is rewritten is not a number about the past, and this project
+    # has twice found that kind of small to be load-bearing.
+    #
+    # The price is that the instrument set grows as instruments list, so a
+    # range over five risk shares and a range over ten both appear in one
+    # series. `measured` and `unmeasured` name the set at the end, and the
+    # report says how it changed.
+    positions = {day: i for i, day in enumerate(dates)}
+    per_day: "list[tuple[pd.Timestamp, pd.DataFrame, list[str], object]]" = []
+    for day in stamps:
+        window = estimable_window(closes, positions[day] + 1, lookback,
+                                  minimum=warmup)
+        if len(window) < 2:
+            continue
+        cov = covariance_matrix(window)
+        names = [str(c) for c in cov.columns]
+        scope = ([k for k in among if k in cov.columns]
+                 if among is not None else None)
+        per_day.append((day, cov, names, scope))
+    # An empty ledger has no days to measure, which is not an error: the
+    # caller gets two empty arms and a purchase count of zero. Days that exist
+    # but none of them estimable IS an error, because it means the panel cannot
+    # support the comparison at all and a silent empty series would read as
+    # "no difference".
+    if len(stamps) and not per_day:
+        raise ValueError(
+            "no day in the replay has enough price history to estimate a "
+            "covariance, so neither arm's dispersion can be measured.")
+    measure_keys = per_day[-1][2] if per_day else []
+    first_keys = per_day[0][2] if per_day else []
+
+    def arm(name, rows, flows, shares, spent) -> Arm:
         values = pd.Series([v for v, _ in rows], index=stamps)
+        # A contribution is not a return. The order fills at that day's close,
+        # so the new money was not in the book for the day's move and has to
+        # come back out before the series is divided. Left in, every purchase
+        # day reads as a double-digit gain: this replay reported annualised
+        # volatilities of 0.81 and 0.56 for two arms holding six ETFs between
+        # them, and the two arms differed because they invested slightly
+        # different amounts, not because they held different things.
+        grown = values - pd.Series(flows, index=stamps)
+        holdings_at = {day: holdings for day, (_, holdings) in zip(stamps, rows)}
         dispersion = pd.Series(
-            [dispersion_of(np.array([holdings.get(k, 0.0) for k in keys]),
-                           covariance_matrix(
-                               closes.loc[:day].iloc[-lookback:]
-                               .pct_change().dropna(how="any")), among)
-             for day, (_, holdings) in zip(stamps, rows)], index=stamps)
-        return Arm(name=name, dispersion=dispersion,
-                   returns=values.pct_change().dropna(), final_shares=shares,
-                   invested=float(spent))
+            [dispersion_of(
+                np.array([holdings_at[day].get(k, 0.0) for k in names]),
+                cov, scope)
+             for day, cov, names, scope in per_day],
+            index=pd.DatetimeIndex([d for d, _, _, _ in per_day]))
+        returns = (grown / values.shift(1) - 1.0).iloc[1:].dropna()
+        return Arm(name=name, dispersion=dispersion, returns=returns,
+                   final_shares=shares, invested=float(spent))
 
     return ReplayResult(
-        actual=arm("actual", rows_a, dict(actual), invested),
-        allocated=arm("allocator", rows_m, dict(model), invested_model),
+        actual=arm("actual", rows_a, flows_a, dict(actual), invested),
+        allocated=arm("allocator", rows_m, flows_m, dict(model), invested_model),
         purchases=count, total_invested=invested, carried=carry,
-        skipped=tuple(dict.fromkeys(skipped)))
+        measured=tuple(measure_keys), unmeasured=tuple(
+            k for k in keys if k not in measure_keys),
+        opened_with=len(first_keys),
+        stopped_at=stop, skipped=tuple(dict.fromkeys(skipped)))

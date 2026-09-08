@@ -297,14 +297,20 @@ def replay_the_ledger(book: Book, *, mode: str = "user",
 
     root = pathlib.Path(data_root) if data_root else None
     store = DataStore.open(DataMode(mode), root=root)
-    buys = [(t.date, t.isin, float(t.quantity))
-            for t in store.load_transactions()
-            if t.type is TransactionType.BUY
-            and t.isin in book.panel.closes.columns]
+    ledger = [t for t in store.load_transactions()
+              if t.isin in book.panel.closes.columns]
+    buys = [(t.date, t.isin, float(t.quantity)) for t in ledger
+            if t.type is TransactionType.BUY]
+    # Disposals are passed rather than filtered out. The replay stops at the
+    # first one and says so; dropping them silently made the "actual" arm a
+    # book that never sold, which is not what was bought.
+    sales = [(t.date, t.isin, float(t.quantity)) for t in ledger
+             if t.type is TransactionType.SELL]
     if not buys:
         raise ValueError(
             "the ledger has no purchases in instruments the panel covers, so "
             "there is nothing to replay.")
     return replay_purchases(book.panel.closes, sorted(buys),
                             costs=book.costs, buyable=book.buyable,
-                            lookback=lookback, warmup=warmup)
+                            lookback=lookback, warmup=warmup,
+                            sales=sorted(sales))

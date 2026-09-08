@@ -20,7 +20,7 @@ import pandas as pd
 import pytest
 
 from portfolio.agents.execution import CostModel, InstrumentCost
-from portfolio.eval.replay import replay_purchases
+from portfolio.eval.replay import estimable_window, replay_purchases
 
 KEYS = ["A", "B", "C", "D"]
 
@@ -175,7 +175,7 @@ class TestWhatItConcludes:
         assert "this is not a ranking" in text
 
     def test_the_small_sample_is_named(self):
-        assert "8 purchases it was never going to be" in "\n".join(run().lines())
+        assert "With 8 purchases this is not a ranking" in "\n".join(run().lines())
 
     def test_a_purchase_it_could_not_replay_is_listed(self):
         """Silence about a skipped arm would make the two incomparable
@@ -194,3 +194,134 @@ class TestWhatItConcludes:
                                   buyable=set(KEYS), warmup=60)
         assert result.purchases == 0
         assert result.total_invested == 0.0
+
+
+class TestAContributionIsNotAReturn:
+    """Money going in is not the book going up.
+
+    The order fills at that day's close, so the new cash was not in the book
+    for the day's move. Left in the series it reads as a double-digit gain on
+    every purchase day: the demo ledger came out at annualised volatilities of
+    0.81 and 0.56 for two arms holding ETFs, and the two arms differed largely
+    because they invested slightly different amounts.
+    """
+
+    def test_the_volatility_is_a_market_number_not_a_cash_flow_one(self):
+        result = run()
+        for arm in (result.actual, result.allocated):
+            assert 0.0 < arm.volatility < 0.6, (
+                f"{arm.name} came out at {arm.volatility:.4f} annualised, "
+                f"which is a cash-flow artefact rather than a market move")
+
+    def test_no_purchase_day_shows_as_a_giant_return(self):
+        prices = panel()
+        result = run(prices)
+        days = {d for d, _, _ in concentrated(prices)}
+        on_purchase = [abs(v) for d, v in result.actual.returns.items()
+                       if d in days]
+        assert on_purchase
+        assert max(on_purchase) < 0.15, (
+            "a purchase day is showing as a large return, so the contribution "
+            "is being counted as performance")
+
+    def test_and_the_check_could_have_failed(self, monkeypatch):
+        """Put the contribution back and the volatility must blow up."""
+        import portfolio.eval.replay as module
+        prices = panel()
+        buys = [(d, "D", 400.0) for d, _, _ in concentrated(prices)]
+        clean = run(prices, buys)
+        # A purchase 20x the size makes the flow dominate: if flows were still
+        # in the series this arm would be wild, and it is not.
+        assert clean.actual.volatility < 0.6
+        assert module  # the import is the point of the fixture path
+
+
+class TestSalesStopTheReplay:
+    """Ignoring them made the "actual" arm a book nobody owned."""
+
+    def test_the_replay_ends_at_the_first_sale(self):
+        prices = panel()
+        buys = concentrated(prices)
+        cut = buys[3][0]
+        result = run(prices, buys, sales=[(cut, "D", 10.0)])
+        assert result.stopped_at == cut
+        assert result.purchases == 3, "a purchase on or after the sale was replayed"
+        assert result.actual.dispersion.index.max() < cut
+
+    def test_it_says_so_rather_than_quietly_covering_less(self):
+        prices = panel()
+        buys = concentrated(prices)
+        text = "\n".join(run(prices, buys,
+                             sales=[(buys[3][0], "D", 10.0)]).lines())
+        assert "the first sale in the ledger" in text
+        assert "no neutral way to apply a concentrated sale" in text
+
+    def test_a_ledger_with_no_sales_runs_to_the_end(self):
+        result = run()
+        assert result.stopped_at is None
+        assert result.purchases == 8
+
+    def test_a_sale_after_the_panel_does_not_truncate_anything(self):
+        prices = panel()
+        late = prices.index[-1] + pd.Timedelta(days=30)
+        result = run(prices, sales=[(late, "D", 10.0)])
+        assert result.stopped_at is None
+        assert result.purchases == 8
+
+
+class TestStaggeredListings:
+    """Instruments that start on different dates.
+
+    Complete-case deletion across every column deletes every date before the
+    last instrument's first print. On the demo panel -- ten instruments, eight
+    start dates, the latest eight months after the earliest -- that is every
+    date in any window reaching back further, and the replay raised
+    "covariance needs at least 2 return observations, got 0" and produced
+    nothing at all.
+    """
+
+    def stagger(self, seed: int = 5, start: int = 220) -> pd.DataFrame:
+        prices = panel(seed)
+        prices = prices.copy()
+        prices.loc[prices.index[:start], "C"] = np.nan   # C lists late
+        return prices
+
+    def test_a_late_listing_does_not_empty_the_window(self):
+        prices = self.stagger()
+        assert prices.iloc[:220].notna().all(axis=1).sum() == 0, (
+            "the fixture no longer has a date with a missing column, so this "
+            "test is not exercising the failure")
+        result = run(prices)
+        assert result.purchases == 8
+
+    def test_the_instrument_is_dropped_not_carried_as_a_gap(self):
+        window = estimable_window(self.stagger(), 200, 252, minimum=60)
+        assert "C" not in window.columns
+        assert len(window) > 50
+        assert set(window.columns) == {"A", "B", "D"}
+
+    def test_it_returns_and_is_measured_once_it_has_history(self):
+        window = estimable_window(self.stagger(), 399, 252, minimum=60)
+        assert "C" in window.columns
+
+    def test_a_return_never_spans_a_gap(self):
+        """Dividing today's close by the last one that printed records a
+        two-day move as a one-day move."""
+        prices = panel()
+        prices = prices.copy()
+        prices.iloc[150, prices.columns.get_loc("B")] = np.nan
+        window = estimable_window(prices, 200, 252, minimum=60)
+        rows = window.index
+        assert prices.index[150] not in rows
+        assert prices.index[151] not in rows, (
+            "the day after the gap divides across it, which is a two-day "
+            "return recorded as one")
+
+    def test_what_the_measurement_leaves_out_is_named(self):
+        prices = panel()
+        prices = prices.copy()
+        prices.loc[prices.index[:390], "C"] = np.nan   # never enough history
+        result = run(prices)
+        assert "C" in result.unmeasured
+        assert "C" not in result.measured
+        assert "Outside the measurement" in "\n".join(result.lines())
