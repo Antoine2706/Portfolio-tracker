@@ -299,9 +299,11 @@ def run_equal_risk_contribution(book: Book, *, lookback: int = 252,
                      f"{refereed.adjustments[0]}")
     if result.decisions:
         notes.append("policy said: " + result.decisions[-1].reason)
+    from .core.taxes import CapitalGainsTax
     return compare(result, benchmark, cost_model=book.costs, trials=trials,
                    trial_sharpe_sd=trial_sharpe_sd, overlap=rebalance_every,
-                   weights=book.weights, constraint_notes=tuple(notes))
+                   weights=book.weights, capital_gains=CapitalGainsTax(),
+                   constraint_notes=tuple(notes))
 
 
 def dominant_holding(book: Book, *, warmup: int = 0,

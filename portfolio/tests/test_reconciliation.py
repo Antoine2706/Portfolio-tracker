@@ -172,6 +172,62 @@ class TestTheCostBasisDisagreesWithTheBankOnPurpose:
             "bank prints is understated by it")
 
 
+class TestTheCapitalGainsTaxOnTheRealSale:
+    """73.64 EUR on the VanEck disposal of 18 June 2026, and where it differs.
+
+    The bank charged 10.00% of a gain it computed from a pre-tax acquisition
+    value. The tracker computes the same rate on a basis that includes the
+    2.35 of tax paid to acquire the shares, so its figure is 12 cents lower.
+    Both numbers are printed; neither is quietly adopted.
+    """
+
+    def ledger_and_sale(self, positions):
+        from portfolio.core.taxes import CapitalGainsTax, GainsLedger
+        sale = next(c for c in CONFIRMATIONS if c.side == "SELL")
+        buy = next(c for c in CONFIRMATIONS
+                   if c.isin == SEMIS and c.side == "BUY")
+        paid = float(buy.notional + buy.commission + buy.tob)
+        basis = paid * (float(sale.quantity) / float(buy.quantity))
+        gains = GainsLedger(CapitalGainsTax(rate=0.10, allowance=0.0))
+        return gains, gains.record(sale.date, SEMIS, float(sale.notional), basis)
+
+    def test_the_rate_is_the_one_the_bank_charged(self, positions):
+        """With no tranche in the way, the arithmetic is the bank's."""
+        _, disposal = self.ledger_and_sale(positions)
+        assert disposal.tax / disposal.gain == pytest.approx(0.10, abs=1e-9)
+
+    def test_and_the_figure_is_twelve_cents_under_the_banks(self, positions):
+        _, disposal = self.ledger_and_sale(positions)
+        assert disposal.gain == pytest.approx(735.185, abs=0.01)
+        assert disposal.tax == pytest.approx(73.52, abs=0.01)
+        assert 73.64 - disposal.tax == pytest.approx(0.12, abs=0.01)
+
+    def test_the_tranche_makes_the_same_sale_free(self, positions):
+        """The reason a flat rate is wrong in both directions. This sale is
+        the first of its year and well inside a 10,000 EUR tranche, so its
+        marginal rate is zero and the bank's 73.64 is the figure to reclaim
+        rather than the figure to model."""
+        from portfolio.core.taxes import CapitalGainsTax, GainsLedger
+        sale = next(c for c in CONFIRMATIONS if c.side == "SELL")
+        buy = next(c for c in CONFIRMATIONS
+                   if c.isin == SEMIS and c.side == "BUY")
+        paid = float(buy.notional + buy.commission + buy.tob)
+        basis = paid * (float(sale.quantity) / float(buy.quantity))
+        gains = GainsLedger(CapitalGainsTax())      # the 10,000 default
+        disposal = gains.record(sale.date, SEMIS, float(sale.notional), basis)
+        assert disposal.gain > 700
+        assert disposal.tax == 0.0
+        assert gains.tax.headroom(gains.realised(2026)) == pytest.approx(
+            10_000.0 - disposal.gain, abs=0.01)
+
+    def test_it_is_reported_apart_from_transaction_costs(self, positions):
+        gains, _ = self.ledger_and_sale(positions)
+        text = "\n".join(gains.lines())
+        assert "Realised gains and the tax on them" in text
+        assert "next euro of gain taxed at" in text
+        assert "overstates the gain and the tax with it" in text
+
+
 class TestTheAccountType:
     def test_execution_only_is_recorded_where_the_boundary_is_argued(self):
         """The statement says Execution Only, and that is the classification

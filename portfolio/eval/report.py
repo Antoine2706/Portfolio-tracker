@@ -62,11 +62,36 @@ def _annualised(returns, periods_per_year: int) -> float:
 
 @dataclasses.dataclass(frozen=True)
 class Breakeven:
-    """The turnover at which a policy's gross edge pays for its own trading."""
+    """The turnover at which a policy's gross edge pays for its own trading.
+
+    Turnover is the right denominator for commission, transaction tax and
+    spread, all of which are proportional to what is traded. It is NOT the
+    right denominator for a capital gains tax, and saying so is the point of
+    `gains_note` below.
+
+    A tax on realised gains is proportional to what was *gained*, not to what
+    was traded: selling 2,000 EUR of a position that has doubled costs 100 EUR
+    at 10%, and selling 2,000 EUR of a flat position costs nothing. Two
+    policies at identical turnover therefore pay different amounts of it, and
+    the same policy pays different amounts in different windows. A breakeven
+    stated in turnover alone silently assumes that away.
+
+    So `gains_tax` is carried separately and reported as a second dimension
+    rather than folded into `unit_cost`. Folding it in would produce a single
+    tidy number that is wrong in a way nobody could see.
+    """
     edge_gross: float                    # annualised, policy minus benchmark
     unit_cost: float                     # cost per unit of one-way turnover
     actual_turnover: float               # annual, one-way
     breakeven_turnover: float | None     # annual, one-way; None if no edge
+    # Realised gains and the tax on them over the same window, annualised.
+    # None when the policy realised none, or when nothing has been recorded.
+    gains_realised: float | None = None      # EUR a year
+    gains_tax: float | None = None           # EUR a year
+    # The same tax as a fraction of the book a year, which is the unit
+    # `edge_gross` and `unit_cost` are in and therefore the only one in which
+    # the three can honestly be compared.
+    gains_tax_fraction: float | None = None
 
     @property
     def headroom(self) -> float | None:
@@ -93,6 +118,47 @@ class Breakeven:
             return head + f", so it keeps about {1 - 1 / room:.0%} of the edge."
         return (head + f", so it spends about {1 / room:.1f} times the edge on "
                 f"trading and the net result is negative by construction.")
+
+    def gains_note(self) -> "str | None":
+        """The second dimension, or why there is not one.
+
+        Stated whenever the policy sells, because a reader who has just been
+        given a breakeven in turnover is entitled to know that turnover does
+        not express this cost.
+        """
+        if self.gains_tax is None or self.gains_realised is None:
+            return None
+        opening = ("Breakeven above is stated in turnover, which does not "
+                   "express the capital gains tax: that is proportional to "
+                   "what was gained, not to what was traded.")
+        if self.gains_realised == 0:
+            return (f"{opening} This policy realised no gains at all, so the "
+                    f"tax does not enter. That is a property of this window "
+                    f"rather than of the policy: the same turnover on "
+                    f"holdings that had risen would have paid it.")
+        if self.gains_realised < 0:
+            return (f"{opening} This policy realised "
+                    f"{abs(self.gains_realised):,.0f} a year of LOSSES, so it "
+                    f"paid none of it. That is not a saving to carry forward: "
+                    f"the tranche is annual and losses shelter gains only "
+                    f"within the same calendar year, so a window that happens "
+                    f"to fall tells you nothing about what the same trading "
+                    f"costs in one that rises.")
+        share = (self.gains_tax_fraction / abs(self.edge_gross)
+                 if (self.edge_gross and self.gains_tax_fraction is not None)
+                 else None)
+        out = (f"{opening} This policy realised {self.gains_realised:+,.0f} of "
+               f"gains a year and paid {self.gains_tax:,.0f} of tax on them.")
+        if self.gains_tax == 0:
+            out += (" Nothing was due because the year's gains stayed inside "
+                    "the exempt tranche, which is a fact about the size of "
+                    "this book rather than about the policy: the same "
+                    "turnover on a larger one crosses it and pays.")
+        elif share is not None:
+            out += (f" That alone is {share:.0%} of the gross edge, and no "
+                    f"amount of turnover reduction removes it: only selling "
+                    f"less of what has risen does.")
+        return out
 
 
 @dataclasses.dataclass(frozen=True)
@@ -363,6 +429,10 @@ class Comparison:
             "-" * 64,
         ]
         out += ["  " + line for line in _wrap(self.breakeven.sentence())]
+        gains = self.breakeven.gains_note()
+        if gains:
+            out.append("")
+            out += ["  " + line for line in _wrap(gains)]
         out += ["", "Policy against benchmark", "-" * 64]
         for note in self.paired_lines():
             out += ["  " + line for line in _wrap(note)]
@@ -409,6 +479,7 @@ def compare(policy: BacktestResult, benchmark: BacktestResult, *,
             cost_model=None, trials: int = 1, trial_sharpe_sd: float = 0.0,
             overlap: int = 1, constraint_notes: "tuple[str, ...]" = (),
             weights: "dict[str, float] | None" = None,
+            capital_gains=None,
             periods_per_year: int = TRADING_DAYS_PER_YEAR) -> Comparison:
     """Summarise a policy against doing nothing.
 
@@ -447,6 +518,34 @@ def compare(policy: BacktestResult, benchmark: BacktestResult, *,
     unit_cost = (policy.total_cost / turnover_total) if turnover_total > 0 else 0.0
     breakeven = (edge / unit_cost) if (edge > 0 and unit_cost > 0) else None
 
+    # Realised gains and the tax on them, annualised over the same window.
+    # Kept out of `unit_cost` on purpose: dividing a gains tax by turnover
+    # would express it in the one unit that cannot carry it.
+    #
+    # In EUR, not in fractions of the book, because the exempt tranche is a
+    # euro amount. Computing the tax on gains expressed as fractions would
+    # compare 0.05 against a 10,000 threshold and the tranche would never
+    # bind -- a unit mismatch that would silently report zero tax forever.
+    gains_realised = gains_tax = gains_tax_fraction = None
+    account = float(getattr(cost_model, "account_value", 0.0) or 0.0)
+    if capital_gains is not None and len(policy.realised_gains) and account > 0:
+        years = max(len(policy.returns) / periods_per_year, 1e-9)
+        # `realised_gains` is a fraction of the book on the day it was
+        # realised; the index puts it back on the opening book, and the
+        # account value turns that into money.
+        index = (1.0 + policy.gross_returns).cumprod()
+        in_euros = (policy.realised_gains * index * account)
+        charged, running = 0.0, 0.0
+        for gain in in_euros:
+            gain = float(gain)
+            if gain == 0.0:
+                continue
+            charged += capital_gains.charge(gain, running)
+            running += gain
+        gains_realised = float(in_euros.sum()) / years
+        gains_tax = charged / years
+        gains_tax_fraction = gains_tax / account
+
     if cost_model is not None:
         assumptions = tuple(cost_model.assumptions())
         provenance = tuple(cost_model.provenance(weights).lines())
@@ -459,7 +558,9 @@ def compare(policy: BacktestResult, benchmark: BacktestResult, *,
 
     return Comparison(
         policy_name=policy.policy, net=net, gross=gross, benchmark=bench,
-        breakeven=Breakeven(edge_gross=edge, unit_cost=unit_cost,
+        breakeven=Breakeven(gains_realised=gains_realised, gains_tax=gains_tax,
+                            gains_tax_fraction=gains_tax_fraction,
+                            edge_gross=edge, unit_cost=unit_cost,
                             actual_turnover=annual_turnover,
                             breakeven_turnover=breakeven),
         total_cost=policy.total_cost, mean_turnover=policy.mean_turnover,

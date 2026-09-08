@@ -145,6 +145,13 @@ class BacktestResult:
     decisions: tuple[Decision, ...]
     warnings: tuple[str, ...]
     policy: str
+    # Gain realised on each execution day, as a fraction of the book at that
+    # date. Multiply by the book's value to get money. See `walk_forward`:
+    # with no opening basis supplied this is a LOWER BOUND, because the book
+    # is modelled as bought on day one and a real one carries gains already.
+    realised_gains: pd.Series = dataclasses.field(
+        default_factory=lambda: pd.Series(dtype=float))
+    basis_was_supplied: bool = False
 
     @property
     def total_cost(self) -> float:
@@ -191,6 +198,22 @@ class BacktestResult:
 # --------------------------------------------------------------------------
 # Weight arithmetic
 # --------------------------------------------------------------------------
+
+
+def _rescale_basis(basis: "dict[str, float]", g: float) -> None:
+    """Keep the basis in the same normalised units as the weights.
+
+    `_drift` divides every weight by (1 + g) so they keep summing to one. A
+    cost basis does not grow with the price -- that growth is precisely the
+    unrealised gain -- so it takes the same denominator and no numerator.
+    Skipping this would make the embedded gain of every holding decay towards
+    zero as the book rose, which is the opposite of the truth.
+    """
+    if g <= -1.0:
+        return
+    scale = 1.0 / (1.0 + g)
+    for k in list(basis):
+        basis[k] *= scale
 
 
 def _drift(weights: dict[str, float], returns: pd.Series
@@ -295,6 +318,7 @@ def walk_forward(panel: Panel, policy: Policy, *,
                  purge: int = 0,
                  min_observations: int = 60,
                  initial_weights: "dict[str, float] | None" = None,
+                 initial_basis: "dict[str, float] | None" = None,
                  frozen=frozenset()) -> BacktestResult:
     """Roll a policy through the panel, one decision at a time.
 
@@ -393,6 +417,23 @@ def walk_forward(panel: Panel, policy: Policy, *,
     pending_from: pd.Timestamp | None = None
     pending_view_end: pd.Timestamp | None = None
 
+    # Cost basis per holding, in the same normalised units as `weights`, so
+    # the embedded gain of holding i is 1 - basis_i / weight_i.
+    #
+    # Purely additive: nothing that already existed reads it, so the harness's
+    # returns, turnover, costs and decisions are bit-identical with it present.
+    # That matters because the calibration controls are validated against this
+    # file, and a change that moved any of them would invalidate them.
+    #
+    # `initial_basis` defaults to the opening weights, which models a book
+    # bought the day the backtest starts and therefore carrying no embedded
+    # gain. On a real book that is FALSE and the direction is known: the
+    # actual holdings have gains already, so a realised-gain figure computed
+    # from this default is a LOWER BOUND. `research.py` supplies the real
+    # basis where it has one, and the report says which it used.
+    basis = dict(initial_basis) if initial_basis is not None else dict(weights)
+    realised_gains: list[float] = []
+
     dates: list[pd.Timestamp] = []
     gross: list[float] = []
     net: list[float] = []
@@ -430,23 +471,56 @@ def walk_forward(panel: Panel, policy: Policy, *,
 
     decide(first_decision)
 
+    def rebalance_basis(before: "dict[str, float]",
+                        after: "dict[str, float]") -> float:
+        """Move the basis through one rebalance and return the gain realised.
+
+        Weighted average cost, the same convention `core.positions` uses and
+        the same one the broker uses, so the two cannot disagree about what a
+        disposal realised.
+
+        Selling a fraction f of a holding relieves the same fraction of its
+        basis, so the gain is  sold * (1 - basis_i / before_i)  -- the amount
+        sold times its embedded gain. Buying adds to the basis at cost, which
+        moves the embedded gain towards zero without realising anything.
+
+        In normalised units, so the caller multiplies by the book's value to
+        get money.
+        """
+        gained = 0.0
+        for k in set(before) | set(after):
+            was = float(before.get(k, 0.0))
+            now = float(after.get(k, 0.0))
+            held_basis = float(basis.get(k, 0.0))
+            if now < was - WEIGHT_EPSILON and was > 0:
+                sold = was - now
+                gained += sold * (1.0 - held_basis / was)
+                basis[k] = held_basis * (now / was)
+            elif now > was + WEIGHT_EPSILON:
+                basis[k] = held_basis + (now - was)
+        return gained
+
     for i in range(warmup, n):
         date = idx[i]
         prev_close = carried.iloc[i - 1]
         today_close = closes.iloc[i]
         cost = 0.0
         turn = 0.0
+        gained = 0.0
         used = {k for k, v in weights.items() if abs(v) > WEIGHT_EPSILON}
 
         if execution is Execution.NEXT_OPEN and pending is not None:
             today_open = panel.opens.iloc[i]
             r_overnight = today_open / prev_close - 1.0
             drifted, g1, missing = _drift(weights, r_overnight)
+            _rescale_basis(basis, g1)
             target = _apply_frozen(dict(pending.weights), drifted, frozen)
             turn = _turnover(target, drifted)
             cost = cost_model.cost(turn, drifted, target) if cost_model else 0.0
+            gained = rebalance_basis(drifted, target)
             r_intraday = today_close / today_open - 1.0
             weights, g2, missing2 = _drift(target, r_intraday)
+            _rescale_basis(basis, g2)
             gross_r = (1.0 + g1) * (1.0 + g2) - 1.0
             decisions.append(Decision(
                 decided_on=pending_from, executed_on=date,
@@ -463,6 +537,7 @@ def walk_forward(panel: Panel, policy: Policy, *,
         else:
             r_day = today_close / prev_close - 1.0
             weights, gross_r, missing = _drift(weights, r_day)
+            _rescale_basis(basis, gross_r)
             for isin in missing:
                 warnings.append(f"{isin} had no price on {date:%Y-%m-%d} "
                                 f"while held; valued at its last print and "
@@ -473,6 +548,7 @@ def walk_forward(panel: Panel, policy: Policy, *,
                 target = _apply_frozen(dict(pending.weights), weights, frozen)
                 turn = _turnover(target, weights)
                 cost = cost_model.cost(turn, weights, target) if cost_model else 0.0
+                gained = rebalance_basis(weights, target)
                 decisions.append(Decision(
                     decided_on=pending_from, executed_on=date,
                     view_ends=pending_view_end, weights_before=dict(weights),
@@ -486,6 +562,7 @@ def walk_forward(panel: Panel, policy: Policy, *,
         gross.append(float(gross_r))
         net.append(float(gross_r - cost))
         turns.append(float(turn))
+        realised_gains.append(float(gained))
         costs.append(float(cost))
         held_rows.append(dict(weights))
         measured.append(is_clean(i, used))
@@ -503,6 +580,9 @@ def walk_forward(panel: Panel, policy: Policy, *,
         measured=pd.Series(measured, index=index, name="measured"),
         turnover=pd.Series(turns, index=index, name="turnover"),
         costs=pd.Series(costs, index=index, name="cost"),
+        realised_gains=pd.Series(realised_gains, index=index,
+                                 name="realised_gain"),
+        basis_was_supplied=initial_basis is not None,
         decisions=tuple(decisions),
         warnings=tuple(dict.fromkeys(warnings)),
         policy=getattr(policy, "name", type(policy).__name__),
@@ -510,7 +590,19 @@ def walk_forward(panel: Panel, policy: Policy, *,
 
 
 class Hold:
-    """Propose exactly what is already held. Turnover zero, cost zero."""
+    """Propose exactly what is already held.
+
+    Turnover is one bar of drift per rebalance, not zero, and this said zero
+    until a test measured it. `observe` sees the book as it stood at the
+    view's last bar and the proposal executes at the next close, so a single
+    day's drift is traded back each time it runs -- 0.087% one-way on the
+    fixture in `test_capital_gains.py`.
+
+    It does not affect the benchmark, because `buy_and_hold` runs it with
+    `rebalance_every` longer than the panel and it therefore decides exactly
+    once. It would affect anything that ran `Hold` on a normal schedule, which
+    is why the number is stated here rather than rounded to zero in prose.
+    """
     name = "buy-and-hold"
 
     def observe(self, view: MarketView) -> Proposal:
