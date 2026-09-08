@@ -192,16 +192,53 @@ inner loop went stale the moment a move succeeded, drove one holding to
 −2,500 EUR of a 5,000 EUR purchase, and reached the order as a plausible 148
 shares of something the money could not buy.
 
-**The objective is not convex,** and saying so matters. The reported metric is
-`risk_contribution_spread` — a maximum minus a minimum — which is neither
-smooth nor convex; nor is the least-squares alternative, since risk shares are
-ratios of quadratics. The solve is therefore projected gradient descent on the
-smooth surrogate to *generate candidates*, and a multi-resolution pattern
-search on the reported metric to *choose between them*. Descending on the
-surrogate and calling its answer the floor was measurably beaten by a coarse
-brute-force grid: least squares equalises four holdings and abandons the
-fifth, while a range prefers lifting the laggards. The result is labelled
-"best found", and `test_allocate.py` checks it against a dense grid.
+**Dispersion is the coefficient of variation of the risk shares** — standard
+deviation over mean, zero when the contributions are equal, at most `√(m−1)`
+for `m` holdings — and it is *both* the reported metric and, squared, the
+objective. That identity is the point.
+
+It was a range, and that was the mistake underneath a year of symptoms. A
+range is a rank statistic: on six holdings it is decided by two and discards
+the other four, it is non-differentiable wherever the argmax or argmin changes
+hands, and a policy minimising it chases the worst laggard while ignoring the
+shape of everything else. Worse, nothing minimised it — the descent minimised
+a sum of squared deviations while the report printed a range, so the tool
+graded answers by a rule it had not used to produce them. A least-squares
+descent reaching 1.205 against a coarse grid's 1.136 was measuring that
+mismatch, and it was diagnosed as a solver failure and fixed by adding a
+search. The range is still printed, beside the dispersion and never instead of
+it, because it says how far apart the extremes are, which a CV does not.
+
+**The objective is smooth but not convex.** Risk shares are ratios of
+quadratics, so a convex feasible set does not make the problem convex — that
+inference was in the specification and does not follow. Three parts, each
+because something measurable went wrong without it:
+
+1. *Projected gradient descent on the objective itself*, with the gradient
+   derived in full (`objective_and_gradient`) and checked against central
+   differences, including over a subset where the mean of the chosen shares is
+   not constant — the half of the derivation a full-set check cannot see.
+2. *`aim_at_equal_risk`*, which hands the search the equal-risk portfolio in
+   b-space. Past the amount at which it becomes reachable it *is* the answer.
+   Without it the floor on a hedged eight-holding book reaches equal risk at
+   twice the book and loses it again at fifty times, a rise of 0.38.
+3. *A multi-resolution pattern search over pairwise exchanges.* Not a tidy-up:
+   the descent converges to points with a projected-gradient residual of 1e-16
+   — genuine constrained stationary points, unmoved by 25× the iterations —
+   from which an exchange of a third of the money reaches 0.56 where the
+   stationary point sat at 1.00.
+
+Two independent things check the result, which is labelled "best found": a
+dense brute-force grid on small books, and **`spinu_sweep`**, which solves the
+convex Maillard–Roncalli–Teiletche form sharpened by Spinu — minimise
+`0.5·w'Σw − λ·Σ log wᵢ`, whose stationarity condition *is* equal risk
+contribution — to global optimality over this same polytope, for a family of
+`λ`. One `λ` is not the answer: the budget and the lower bounds destroy the
+scale invariance that makes `λ` irrelevant unconstrained. What the family
+gives is certified points, and the requirement that the search never lose to
+one. It never has, and in one place by only 6e-4, which is what makes it a
+check rather than a formality. It is deliberately *not* a candidate inside
+`reachable_floor`; feeding it in would make the check vacuous.
 
 **The floor is monotone in the cash — only if every holding can receive it.**
 The proof is a rescaling: for `λ = (V+C₂)/(V+C₁)`, the vector `λx` has
@@ -242,11 +279,66 @@ fresh purchase at its broker is an ordinary order.
 `eval/replay.py` evaluates it by re-running the real ledger with only the
 destination changed — same dates, same amounts, so neither arm pays extra
 turnover. Dispersion is computed and carries no sampling error; volatility is
-estimated and carries its own. The whole-share remainder is carried to the
-next purchase, because over a ledger it compounded to 6.5% of the money and
-would otherwise leave one arm quietly part in cash. The replay is checked for
-look-ahead the same way the harness is: rewrite every price after a date and
-require every earlier decision back unchanged.
+estimated and carries its own, and the correlation between the two arms is
+measured and printed rather than asserted, because ρ decides how much of each
+marginal error cancels. The whole-share remainder is carried to the next
+purchase, because over a ledger it compounded to 6.5% of the money and would
+otherwise leave one arm quietly part in cash. A contribution is not a return
+and neither is a withdrawal: both are backed out before the value series is
+divided. The replay is checked for look-ahead the same way the harness is:
+rewrite every price after a date and require every earlier decision back
+unchanged — which is what rejected a single whole-panel covariance for the
+measurement and forced it to be point-in-time.
+
+**Disposals** are the one thing with no neutral answer, so both are offered
+and the report names which ran. `on_sale="prorata"` (default) applies each
+sale to *both* arms as the same proportional withdrawal: risk shares are
+homogeneous of degree zero, so it changes none of them in either arm, and the
+whole ledger is covered. The cost is that the actual arm is then "the
+purchases that were made, with disposals taken pro-rata" rather than the book
+that was held — deliberately, because selling a particular holding is a
+decision the allocator never makes and crediting one arm for it would measure
+that instead of the destination. `on_sale="stop"` ends at the first sale
+instead: every figure true of a real book, over a shorter window. Ignoring
+them, which this did, is the only wrong answer — the demo's "actual" arm went
+on holding a position the ledger had sold.
+
+## The pattern this project keeps finding
+
+Every defect of consequence here has had the same shape: **a confident output
+measuring something other than what it names.** Not a crash, not a wrong
+formula — a number or a sentence that is precise, plausible, and about a
+different quantity than its label. It is worth listing them, because the
+pattern is now the most reliable predictor of where the next one is.
+
+| # | Named as | Actually measured |
+|---|---|---|
+| 1 | a leak alarm on the policy | the level of the window, which the benchmark shared |
+| 2 | a day's return | a non-trading day, entered as 0.00% |
+| 3 | the standard error of a Sharpe ratio | a daily figure against a monthly count — wrong by √21 |
+| 4 | evidence the policy underperforms | the sign of the window, for a de-risking mandate; the same policy is "significant" the other way in a falling one |
+| 5 | why a trade could not be priced | *"an ETC is a debt security"* — of a property fund, in prose |
+| 6 | the risk-share dispersion of a book | a rank statistic on two holdings of six, while the solver minimised a different function entirely |
+| 7 | the volatility of two portfolios | the cash flowing into them, and a refusal to rank them justified by *"nearly the same portfolio"* for series correlating at 0.363 |
+| 8 | a gap worth closing | 1e-17 of solver residual, because the threshold was compared against exact zero and answered differently on two machines |
+
+Three of the eight were false sentences rather than false numbers (5, 7, and
+the "the structure cannot be fixed by contributions" that overclaimed what a
+search had established). Prose is not exempt from the standard and gets no
+review by default, which is why it is where they survive.
+
+The working rules that fall out of it, in the order they pay off:
+
+1. **Optimise and report the same function.** #6 existed only because they
+   differed; the solver was blamed for a year of symptoms that were the
+   objective's.
+2. **Compare a threshold against a scale, never against zero or an absolute.**
+   #8 and the scale-dependent "meaningful purchase" threshold are the same
+   error at different magnitudes.
+3. **Measure what you are about to assert.** #7's ρ, not "nearly the same".
+4. **Prove the check bites.** Half these were caught by a control that could
+   fail; a fixture that passes whether or not the fix is in is not a test, and
+   two of the fixtures here had silently become that.
 
 ## Why not Streamlit any more
 

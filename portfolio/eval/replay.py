@@ -152,6 +152,9 @@ class ReplayResult:
     measured: tuple[str, ...]           # instruments the dispersion covers, at the end
     unmeasured: tuple[str, ...]         # in the panel, too little history to
     opened_with: int                    # how many it covered on the first day
+    ledger_purchases: int               # purchases in the ledger the panel covers
+    withdrawals: int                    # disposals applied to both arms
+    on_sale: str                        # "prorata" or "stop"
     stopped_at: "pd.Timestamp | None"   # the first sale, where the replay ends
     skipped: tuple[str, ...]
 
@@ -183,9 +186,10 @@ class ReplayResult:
             "Replaying real purchases, destination changed",
             "=" * 64,
             "",
-            f"{self.purchases} purchases, {self.total_invested:,.0f} EUR, the "
-            f"same amounts on the same days in both arms. Neither arm pays "
-            f"extra turnover, so this isolates the destination.",
+            f"{self.purchases} of the ledger's {self.ledger_purchases} "
+            f"purchases, {self.total_invested:,.0f} EUR, the same amounts on "
+            f"the same days in both arms. Neither arm pays extra turnover, so "
+            f"this isolates the destination.",
             f"The allocator arm put in {self.allocated.invested:,.0f} EUR of "
             f"that and still holds {self.carried:,.0f} EUR it could not turn "
             f"into whole shares; the two together are the same money, not a "
@@ -246,6 +250,30 @@ class ReplayResult:
                 f"the policy comparison is made at matched risk rather than on "
                 f"a difference of levels. With {self.purchases} purchases this "
                 f"is not a ranking, and it was never going to be.")
+        if self.purchases < 5:
+            out += ["", f"READ THIS AS {self.purchases} POINTS, NOT AS A "
+                    f"SERIES. The mean dispersion above is an average over "
+                    f"the days between {self.purchases} decisions, and days "
+                    f"are not independent observations of a policy -- the "
+                    f"holdings only change when a purchase happens. Nothing "
+                    f"here is a distribution to test; it is a worked example "
+                    f"of what would have been bought."]
+        if self.withdrawals:
+            out += ["", f"{self.withdrawals} disposal"
+                    f"{'s' if self.withdrawals > 1 else ''} in the ledger, "
+                    f"applied to BOTH arms as the same proportional "
+                    f"withdrawal. Risk shares are homogeneous of degree zero, "
+                    f"so a pro-rata withdrawal changes none of them in either "
+                    f"arm: it is neutral to the quantity being compared. The "
+                    f"cost is that the actual arm is no longer the book that "
+                    f"was held -- it is the purchases that were made, with "
+                    f"disposals taken pro-rata. Selling a particular holding "
+                    f"is a decision of yours that the allocator never makes, "
+                    f"and crediting one arm for it would measure that instead "
+                    f"of the destination of the purchases. Use "
+                    f"`on_sale=\"stop\"` for the strict version, which "
+                    f"describes a book that really was held and covers less "
+                    f"of the ledger."]
         if self.stopped_at is not None:
             out += ["", f"The replay stops on {self.stopped_at:%Y-%m-%d}, the "
                     f"first sale in the ledger. Both arms have to hold the "
@@ -272,7 +300,8 @@ def _on_panel(when, dates) -> "pd.Timestamp | None":
 
 def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
                      buyable, lookback: int = 252, warmup: int = 60,
-                     among=None, sales=()) -> ReplayResult:
+                     among=None, sales=(), on_sale: str = "prorata"
+                     ) -> ReplayResult:
     """Run both arms through the same cash flows.
 
     `purchases` is an iterable of (date, isin, shares) -- the real ledger,
@@ -280,38 +309,60 @@ def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
     times that day's price and using a recorded amount at a different price
     would put the two arms on different money.
 
-    `sales` is the same for disposals, and the replay **stops** at the first
-    one rather than replaying past it. That is a limit of the experiment, not
-    an oversight, and it is worth being exact about why.
+    `sales` is the same for disposals, and `on_sale` says what to do with
+    them. Neither answer is free, so both are available and the report names
+    the one it used.
 
-    The comparison rests on both arms holding the same money at every moment,
-    so a withdrawal has to be applied to both. But the two arms do not hold the
-    same instruments, so there is no neutral rule for applying a concentrated
-    sale to the arm that did not make it. Selling the same euro amount pro-rata
-    is dispersion-neutral -- risk shares are homogeneous of degree zero, so
-    scaling a book down changes none of them -- which means the allocator arm
-    would carry a disposal that costs it nothing while the actual arm carries
-    the real, concentrated one that moves its risk shares a long way. The
-    comparison would then be measuring the sale rather than the destination of
-    the purchases, which is the one thing it exists to isolate.
+    "prorata" (the default) applies each disposal to *both* arms as a
+    proportional withdrawal of the same euro amount. Risk shares are
+    homogeneous of degree zero, so scaling a book down leaves every one of
+    them unchanged: the withdrawal is exactly neutral to the quantity being
+    compared, in both arms, and the two stay on identical cash flows
+    throughout. The whole ledger is then covered.
 
-    Replaying only up to the first sale keeps the claim clean and states what
-    it covers. Ignoring sales entirely -- which this did -- is the option that
-    is actually wrong: the demo ledger sells a 500-share position in October
-    and the "actual" arm went on holding it to the end of the panel, so the arm
-    labelled *what was bought* was a book nobody ever owned.
+    What that costs is worth stating plainly, because it is not nothing: the
+    actual arm is no longer the book that was held. It is "the purchases that
+    were made, with disposals taken pro-rata". Selling a specific holding is
+    itself a portfolio decision, and a good or bad one; letting the actual arm
+    execute its real concentrated sale would credit or debit the comparison
+    for selling skill, which is not what the allocator does and not what this
+    experiment asks. Removing that decision from both arms is what makes the
+    remaining difference attributable to the destination of the purchases.
+    A side effect is fractional share counts after a disposal, since a
+    proportional withdrawal is not a whole-share transaction; the purchases on
+    top of it are still whole shares.
+
+    "stop" ends the replay at the first disposal instead. Every figure then
+    describes a book that really was held, and the window can be much shorter
+    -- on a ledger that sells in month five, everything after month five is
+    gone.
+
+    Ignoring disposals is the one option that is simply wrong, and it is what
+    this did: the demo ledger sells a 500-share position in October and the
+    arm labelled *what was bought* went on holding it to the end of the panel,
+    so it was a book nobody ever owned.
     """
     keys = [str(c) for c in closes.columns]
     dates = closes.index
     filled = closes.ffill()
 
-    stops = [d for d in (_on_panel(w, dates) for w, *_ in sales) if d is not None]
-    stop = min(stops) if stops else None
+    if on_sale not in ("prorata", "stop"):
+        raise ValueError(f"on_sale must be 'prorata' or 'stop', not {on_sale!r}")
+    sold: "dict[pd.Timestamp, list[tuple[str, float]]]" = {}
+    for when, isin, shares in sales:
+        stamp = _on_panel(when, dates)
+        if stamp is not None:
+            sold.setdefault(stamp, []).append((str(isin), float(shares)))
+    stop = min(sold) if (sold and on_sale == "stop") else None
 
+    ledger_purchases = 0
     by_date: "dict[pd.Timestamp, list[tuple[str, float]]]" = {}
     for when, isin, shares in purchases:
         stamp = _on_panel(when, dates)
-        if stamp is None or (stop is not None and stamp >= stop):
+        if stamp is None:
+            continue
+        ledger_purchases += 1
+        if stop is not None and stamp >= stop:
             continue
         by_date.setdefault(stamp, []).append((str(isin), float(shares)))
 
@@ -322,6 +373,7 @@ def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
     flows_m: "list[float]" = []
     skipped: list[str] = []
     count, invested, invested_model = 0, 0.0, 0.0
+    withdrawals = 0
     # Whole shares leave a remainder on every purchase, and over a ledger it
     # compounds: on the fixture in `test_replay.py` it reached 6.5% of the
     # money, which would leave one arm quietly holding cash and make the two
@@ -382,6 +434,32 @@ def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
             invested_model += allocation.invested
             paid_m += float(allocation.invested)
             carry = float(allocation.leftover)
+
+        # Disposals, applied to BOTH arms as the same proportional
+        # withdrawal. Risk shares are homogeneous of degree zero, so scaling a
+        # book down changes none of them: the withdrawal is neutral to the
+        # quantity being compared, in both arms, and neither gains or loses a
+        # decision the allocator never makes.
+        for isin, shares in sold.get(day, []):
+            if isin not in actual or not np.isfinite(price.get(isin, np.nan)):
+                skipped.append(f"{day:%Y-%m-%d} {isin}: sold, but no price in "
+                               f"the panel, so the withdrawal was not applied")
+                continue
+            cash_out = float(shares) * float(price[isin])
+            withdrawals += 1
+            for book, paid in ((actual, "a"), (model, "m")):
+                worth = sum(book[k] * float(price[k]) for k in keys
+                            if np.isfinite(price.get(k, np.nan)))
+                if worth <= 0:
+                    continue
+                taken = min(cash_out, worth)
+                keep = 1.0 - taken / worth
+                for k in keys:
+                    book[k] *= keep
+                if paid == "a":
+                    paid_a -= taken
+                else:
+                    paid_m -= taken
 
         value_a = sum(actual[k] * float(price[k]) for k in keys
                       if np.isfinite(price.get(k, np.nan)))
@@ -467,5 +545,6 @@ def replay_purchases(closes: pd.DataFrame, purchases, *, costs,
         purchases=count, total_invested=invested, carried=carry,
         measured=tuple(measure_keys), unmeasured=tuple(
             k for k in keys if k not in measure_keys),
-        opened_with=len(first_keys),
+        opened_with=len(first_keys), ledger_purchases=ledger_purchases,
+        withdrawals=withdrawals, on_sale=on_sale,
         stopped_at=stop, skipped=tuple(dict.fromkeys(skipped)))

@@ -401,6 +401,14 @@ class TestAllocate:
         assert body["invested"] <= 5000.0 + 1e-6
         assert body["invested"] + body["leftover"] == pytest.approx(5000.0)
 
+    def test_the_range_comes_back_beside_the_dispersion(self, client):
+        """Descriptive, never instead of it. A range is decided by two
+        holdings and discards the rest, so it is not what anything minimises
+        and the page must not lead with it."""
+        body = client.post("/api/allocate", json={"amount": 5000}).json()
+        assert body["spread_now"] >= body["dispersion_now"]
+        assert body["spread_after"] >= body["dispersion_after"]
+
     def test_the_three_floors_come_back_ordered(self, client):
         body = client.post("/api/allocate", json={"amount": 5000}).json()
         assert body["floor_unlimited"] <= body["floor_at_cash"] + 1e-9
@@ -429,11 +437,19 @@ class TestAllocate:
 
     def test_an_unreachable_target_names_the_best_that_is_reachable(self, client):
         """"No" on its own is not a decision, and with a pinned holding it is
-        not even "as much as possible": there is a best amount."""
+        not even "as much as possible": there is a best amount.
+
+        A dispersion of zero is the target, because it is the one level that
+        is unreachable for a stated reason rather than by a number that would
+        need re-tuning whenever the metric changes: a holding that cannot
+        receive new money holds a weight nobody chose, so the contributions
+        cannot all be equal except by coincidence.
+        """
         body = client.post("/api/allocate",
-                           json={"amount": 5000, "target": 1.0}).json()
+                           json={"amount": 5000, "target": 0.0}).json()
+        assert body["pinned"], "nothing is pinned, so zero may be reachable"
         assert body["cash_for_target"] is None
-        assert body["best_reachable"] > 1.0
+        assert body["best_reachable"] > 0.0
         assert body["best_reachable_cash"] > 0
 
     def test_a_holding_that_cannot_receive_new_money_is_named(self, client):

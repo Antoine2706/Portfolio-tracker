@@ -256,21 +256,28 @@ def run_equal_risk_contribution(book: Book, *, lookback: int = 252,
     # check first: a policy that failed to equalise risk has not been
     # evaluated at all, whatever its Sharpe ratio came out as.
     if result.decisions:
-        from .agents.risk import risk_contribution_spread
+        from .agents.risk import risk_contribution_spread, risk_dispersion
         from .core.returns import simple_returns
         from .core.risk import covariance_matrix
         window = simple_returns(book.panel.closes).dropna().iloc[-lookback:]
         cov = covariance_matrix(window)
         among = [c for c in book.panel.closes.columns if c in book.tradeable]
-        before = risk_contribution_spread(book.weights, cov, among=among)
-        after = risk_contribution_spread(result.weights.iloc[-1].to_dict(),
-                                         cov, among=among)
+        final = result.weights.iloc[-1].to_dict()
+        # Both numbers, and the same two names the allocator uses, so
+        # "dispersion" means one thing in this project. The coefficient of
+        # variation uses every holding; the range is decided by two of them
+        # and is here because it says whether one holding is the problem.
         notes.append(
             f"risk-share dispersion across the {len(among)} tradeable "
-            f"holdings, as a fraction of their mean: {before:.2f} for the book "
-            f"as it stands, {after:.2f} after the policy. Lower is more equal; "
-            f"this is what the policy claims to do, measured separately from "
-            f"whether doing it paid.")
+            f"holdings: {risk_dispersion(book.weights, cov, among=among):.2f} "
+            f"for the book as it stands, "
+            f"{risk_dispersion(final, cov, among=among):.2f} after the policy "
+            f"(coefficient of variation, zero when the contributions are "
+            f"equal). The range over the same mean goes "
+            f"{risk_contribution_spread(book.weights, cov, among=among):.2f} "
+            f"to {risk_contribution_spread(final, cov, among=among):.2f}. "
+            f"Lower is more equal; this is what the policy claims to do, "
+            f"measured separately from whether doing it paid.")
 
     if refereed.adjustments:
         notes.append(f"{len(refereed.adjustments)} proposed trades were skipped "
@@ -285,7 +292,8 @@ def run_equal_risk_contribution(book: Book, *, lookback: int = 252,
 
 def replay_the_ledger(book: Book, *, mode: str = "user",
                       data_root: "pathlib.Path | None" = None,
-                      lookback: int = 252, warmup: int = 60):
+                      lookback: int = 252, warmup: int = 60,
+                      on_sale: str = "prorata"):
     """Re-run the real purchases with only the destination changed.
 
     The dates and the amounts are the ledger's, so both arms spend the same
@@ -313,4 +321,4 @@ def replay_the_ledger(book: Book, *, mode: str = "user",
     return replay_purchases(book.panel.closes, sorted(buys),
                             costs=book.costs, buyable=book.buyable,
                             lookback=lookback, warmup=warmup,
-                            sales=sorted(sales))
+                            sales=sorted(sales), on_sale=on_sale)

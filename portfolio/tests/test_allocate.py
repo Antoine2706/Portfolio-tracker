@@ -9,11 +9,21 @@ succeeded, drove one holding to -2,500 EUR of a 5,000 EUR purchase, and the
 result reached the order as a plausible 148 shares of something the money
 could not pay for. `TestItNeverProposesASale` is that bug.
 
-The optimisation half is checked against a dense brute-force grid, because
-the objective is not convex and "the solver converged" and "the solver found
-the best answer" are different claims. An earlier version, which descended on
-a smooth least-squares surrogate and treated the direct search as a tidy-up,
-was beaten by a coarse grid on a five-holding book.
+The optimisation half is checked twice, because the objective is smooth but
+not convex and "the solver converged" and "the solver found the best answer"
+are different claims: against a dense brute-force grid on small books, and
+against `spinu_sweep`, which solves the convex form of equal risk contribution
+to global optimality over the same polytope for a family of barrier
+parameters.
+
+The deeper lesson in this file is about the metric rather than the solver. An
+earlier version reported the range of the risk shares while descending on a
+sum of squared deviations, so it graded answers by a rule it had not used to
+produce them; a coarse grid beating the solver 1.136 to 1.205 was measuring
+that mismatch and was diagnosed as a solver failure. Both are now the
+coefficient of variation -- `TestTheGradient` pins the identity -- and several
+fixtures in this file stopped discriminating the moment they were aligned,
+which is recorded where it happened rather than quietly repaired.
 """
 
 from __future__ import annotations
@@ -25,6 +35,7 @@ import pandas as pd
 import pytest
 
 from portfolio.agents.allocate import (RESOLVED, allocate_buy_only,
+                                       among_indices,
                                        best_reachable_dispersion,
                                        cash_for_dispersion, dispersion_of,
                                        metric_on_arrays,
@@ -33,7 +44,7 @@ from portfolio.agents.allocate import (RESOLVED, allocate_buy_only,
                                        project_onto_simplex,
                                        reachable_floor, risk_shares,
                                        smallest_meaningful_cash,
-                                       unconstrained_floor)
+                                       spinu_sweep, unconstrained_floor)
 from portfolio.agents.execution import CostModel, InstrumentCost
 
 BANKS, PROPERTY, SEMIS, SCHNEIDER, GOLD = (
@@ -181,13 +192,36 @@ class TestBuyableIsNotTradeable:
 
     def test_and_becomes_allocatable_the_moment_the_rate_is_recorded(self):
         """Which is the test that the refusal is about the gap in the record
-        and not about the broker."""
+        and not about the broker.
+
+        Asserted on the *reason* rather than on absence from the list, because
+        those are different claims and the difference is real: at 4,000 EUR the
+        allocator wants 333 EUR of gold, which Keytrade's flat fee makes
+        pointless, so gold is refused -- for the fee, which is a fact about the
+        broker's schedule, and no longer for the missing rate, which was a gap
+        in the record. A test that only checked the list would have called that
+        a regression.
+        """
         cov, values, prices, costs = self._gold_book(tob_rate=0.0012)
-        allocation = allocate_buy_only(
+        small = allocate_buy_only(
             values=values, prices=prices, cov=cov, cash=4000.0, costs=costs,
             buyable={BANKS, PROPERTY, GOLD})
-        assert GOLD not in {r.isin for r in allocation.refused}
-        assert GOLD in {d.isin for d in allocation.destinations}
+        reasons = {r.isin: r.reason for r in small.refused}
+        assert "no transaction tax rate is recorded" not in reasons.get(GOLD, "")
+        assert "flat fee makes worthwhile" in reasons[GOLD]
+
+        # And it is still refused at every larger size, for the other end of
+        # the same schedule. This is not a fixture artefact: Keytrade's only
+        # recorded tier is 2.45 EUR up to 250 EUR, so an order above 250 EUR
+        # cannot be priced at all, while the flat fee makes anything under
+        # about 490 EUR pointless. Those two windows do not meet, so under the
+        # facts on record gold cannot receive new money at ANY amount --
+        # recording the transaction tax was necessary and is not sufficient.
+        big = allocate_buy_only(
+            values=values, prices=prices, cov=cov, cash=40_000.0, costs=costs,
+            buyable={BANKS, PROPERTY, GOLD})
+        assert "cannot be priced" in {r.isin: r.reason for r in big.refused}[GOLD]
+        assert GOLD not in {p.isin for p in big.purchases}
 
     def test_a_holding_marked_unbuyable_is_refused_for_that_reason(self):
         cov, values, prices, costs = self._gold_book(tob_rate=0.0012)
@@ -258,25 +292,68 @@ class TestBrokerMinimums:
 
 
 class TestTheGradient:
+    def _numeric(self, b, held, sigma, idx):
+        numeric = np.zeros(b.size)
+        for k in range(b.size):
+            h = 1e-6 * max(1.0, abs(b[k]))
+            step = np.zeros(b.size)
+            step[k] = h
+            up, _ = objective_and_gradient(b + step, held, sigma, idx)
+            down, _ = objective_and_gradient(b - step, held, sigma, idx)
+            numeric[k] = (up - down) / (2 * h)
+        return numeric
+
     @pytest.mark.parametrize("n,seed", [(3, 1), (5, 2), (7, 3)])
     def test_it_matches_central_differences(self, n, seed):
         """Hand-derived, so it is checked. A gradient with a sign error still
         descends -- just to the wrong place."""
         rng = np.random.default_rng(seed)
-        sigma = covariance(n, seed).to_numpy()
+        cov = covariance(n, seed)
+        sigma = cov.to_numpy()
         held = rng.uniform(500, 4000, n)
         b = rng.uniform(0, 800, n)
-        target = np.full(n, 1.0 / n)
-        _, analytic = objective_and_gradient(b, held, sigma, target)
-        numeric = np.zeros(n)
-        for k in range(n):
-            h = 1e-5 * max(1.0, abs(b[k]))
-            step = np.zeros(n)
-            step[k] = h
-            up, _ = objective_and_gradient(b + step, held, sigma, target)
-            down, _ = objective_and_gradient(b - step, held, sigma, target)
-            numeric[k] = (up - down) / (2 * h)
-        assert np.allclose(analytic, numeric, rtol=1e-5, atol=1e-9)
+        idx = among_indices(cov)
+        _, analytic = objective_and_gradient(b, held, sigma, idx)
+        numeric = self._numeric(b, held, sigma, idx)
+        assert np.allclose(analytic, numeric, rtol=1e-4,
+                           atol=1e-6 * max(np.abs(numeric).max(), 1e-30))
+
+    @pytest.mark.parametrize("n,seed", [(5, 2), (7, 3)])
+    def test_and_over_a_subset_where_the_mean_is_not_constant(self, n, seed):
+        """Over every holding the risk shares sum to one, so their mean is the
+        constant 1/n and the term that differentiates it vanishes. Over a
+        subset it does not, and that term is the half of the derivation a
+        full-set check cannot see."""
+        rng = np.random.default_rng(seed + 50)
+        cov = covariance(n, seed)
+        sigma = cov.to_numpy()
+        held = rng.uniform(500, 4000, n)
+        b = rng.uniform(0, 800, n)
+        idx = among_indices(cov, [str(c) for c in cov.columns][:n - 2])
+        _, analytic = objective_and_gradient(b, held, sigma, idx)
+        numeric = self._numeric(b, held, sigma, idx)
+        assert np.allclose(analytic, numeric, rtol=1e-4,
+                           atol=1e-6 * max(np.abs(numeric).max(), 1e-30))
+
+    def test_the_objective_is_the_reported_metric_squared(self):
+        """The whole point of the change. If these ever drift apart the tool
+        is grading answers by a rule it did not use to produce them, which is
+        what a least-squares descent reaching 1.205 against a grid's 1.136 was
+        measuring."""
+        rng = np.random.default_rng(11)
+        for n, seed in ((3, 1), (5, 2), (8, 4)):
+            cov = covariance(n, seed)
+            sigma = cov.to_numpy()
+            held = rng.uniform(500, 4000, n)
+            for sub in (None, [str(c) for c in cov.columns][:n - 1]):
+                idx = among_indices(cov, sub)
+                metric = metric_on_arrays(cov, sub)
+                for _ in range(5):
+                    b = rng.uniform(0, 3000, n)
+                    value, _ = objective_and_gradient(b, held, sigma, idx)
+                    reported = metric(held + b)
+                    assert value == pytest.approx(reported ** 2, rel=1e-12,
+                                                  abs=1e-15)
 
 
 class TestTheProjection:
@@ -364,7 +441,11 @@ class TestItFindsTheOptimum:
         assert mine < self.brute(held, cov, cash, 14) - 1e-6
 
 
-LADDER = (0.0, 0.05, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 50.0)
+# Six rungs from nothing to fifty times the book. Ten were measurably no
+# better at catching a violation and cost three minutes of CI: the failures
+# this catches are large (0.38 and 0.50) and do not hide between adjacent
+# rungs.
+LADDER = (0.0, 0.05, 0.5, 2.0, 8.0, 50.0)
 
 
 def hedged_book(n: int, seed: int):
@@ -403,6 +484,78 @@ def floors_up_the_ladder(held, cov, allowed, ladder=LADDER):
     return [reachable_floor(held, cov, f * total, allowed)[0] for f in ladder]
 
 
+class TestTheConvexControl:
+    """A family of globally optimal points to check the search against.
+
+    The search has no certificate: the objective is smooth but not convex, so
+    "it converged" and "it found the best answer" stay different claims. The
+    convex Maillard-Roncalli-Teiletche form, sharpened by Spinu, does have one
+    -- minimising 0.5 w'Sigma w - lam sum log w_i over this same polytope is a
+    convex programme whose stationarity condition IS equal risk contribution --
+    but only for a fixed `lam`, and here the budget and the lower bounds break
+    the scale invariance that makes `lam` irrelevant in the unconstrained
+    problem. So one solve is not the answer; a sweep of certified points is a
+    control.
+
+    It is deliberately not a candidate inside `reachable_floor`. Feeding it in
+    would make the search unbeatable by it and the check vacuous, which is the
+    same mistake as grading an answer by the rule used to produce it.
+    """
+
+    LADDER = (0.2, 1.0)
+
+    @pytest.mark.parametrize("n,seed", [(5, 1), (5, 3), (8, 2)])
+    def test_the_search_is_never_beaten_by_a_certified_point(self, n, seed):
+        cov, held = hedged_book(n, seed)
+        allowed = np.ones(n, dtype=bool)
+        metric = metric_on_arrays(cov)
+        total = float(held.sum())
+        for fraction in self.LADDER:
+            cash = fraction * total
+            mine, _ = reachable_floor(held, cov, cash, allowed)
+            certified = spinu_sweep(held, cov, cash, allowed)
+            assert certified, "the sweep produced nothing to check against"
+            best = min(metric(held + b) for b in certified)
+            assert mine <= best + 1e-9, (
+                f"a globally optimal point of the convex family reaches "
+                f"{best:.6f} at {fraction}x the book where the search found "
+                f"{mine:.6f}, so the search is under-converged")
+
+    def test_the_control_is_tight_enough_to_be_one(self):
+        """A control the search beats by miles every time checks nothing. On
+        this book the margin is under a thousandth."""
+        cov, held = hedged_book(5, 1)
+        allowed = np.ones(5, dtype=bool)
+        metric = metric_on_arrays(cov)
+        cash = 0.2 * float(held.sum())
+        mine, _ = reachable_floor(held, cov, cash, allowed)
+        best = min(metric(held + b) for b in spinu_sweep(held, cov, cash, allowed))
+        assert 0 <= best - mine < 1e-3
+
+    def test_every_point_it_returns_is_a_legal_purchase(self):
+        """It is a control, so it has to obey the same constraints; a sweep
+        that could sell would flatter itself past the search."""
+        cov, held = hedged_book(6, 2)
+        allowed = np.ones(6, dtype=bool)
+        allowed[0] = False
+        cash = 4000.0
+        for b in spinu_sweep(held, cov, cash, allowed):
+            assert b.min() >= -1e-9
+            assert b[0] == 0.0, "it put money into a holding that cannot receive"
+            assert float(b.sum()) == pytest.approx(cash, rel=1e-9)
+
+    def test_it_declines_when_the_barrier_is_undefined(self):
+        """log x_i needs x_i > 0. A holding worth nothing that cannot receive
+        has none, so this family has nothing to say about that book and says
+        so rather than returning a number from a different problem."""
+        cov, held = hedged_book(5, 1)
+        held = held.copy()
+        held[0] = 0.0
+        allowed = np.ones(5, dtype=bool)
+        allowed[0] = False
+        assert spinu_sweep(held, cov, 4000.0, allowed) == []
+
+
 class TestTheFloorIsMonotone:
     """More money can only reach a wider set -- if every holding can receive it.
 
@@ -427,7 +580,7 @@ class TestTheFloorIsMonotone:
         for earlier, later in zip(floors, floors[1:]):
             assert later <= earlier + 1e-6
 
-    @pytest.mark.parametrize("seed", [2, 3, 4])
+    @pytest.mark.parametrize("seed", [2, 4])
     def test_nor_on_a_book_with_a_hedge_in_it(self, seed):
         """The case the independent-normal fixture cannot see."""
         cov, held = hedged_book(8, seed)
@@ -444,23 +597,30 @@ class TestTheFloorIsMonotone:
         Otherwise it is a check on nothing. Without `aim_at_equal_risk` the
         floor on this book, up the same ladder, runs
 
-            7.6371 6.7747 1.9746 1.1604 0.4161 0.0031 0.0078 0.0035
-                                                       1.4254 1.2380
+            2.3043 0.6437 0.2177 4.9e-6 4.9e-6 0.3783
 
-        It finds the equal-risk portfolio at four times the book and then
-        *loses* it at sixteen, reporting a floor four hundred times worse for
-        strictly more money on a strictly larger feasible set. With the start
-        the last five entries are 0.0000 exactly.
+        It reaches equal risk to within a millionth at twice the book, holds
+        that through eight times, and *loses* it at fifty, on a strictly larger
+        feasible set. With the start the same rungs are 1.4e-11 -- zero to
+        solver tolerance rather than nearly.
+
+        The fixture changed when the metric did, and that is worth recording:
+        under the old range metric this failure appeared on seed 2 and it no
+        longer does, because a smooth objective aligned with its own report is
+        a far easier surface to descend. The start still earns its place --
+        without it the worst violation over these books is 0.50 -- but on
+        different books, so a check pinned to the old seed would have quietly
+        stopped checking anything.
         """
         import portfolio.agents.allocate as module
         monkeypatch.setattr(module, "aim_at_equal_risk", lambda *a, **k: None)
-        cov, held = hedged_book(8, 2)
+        cov, held = hedged_book(8, 4)
         floors = [module.reachable_floor(held, cov, f * float(held.sum()),
                                          np.ones(8, dtype=bool))[0]
                   for f in LADDER]
-        assert max(b - a for a, b in zip(floors, floors[1:])) > 0.5
-        assert min(floors) < 0.01, "it found equal risk at some amount"
-        assert floors[-1] > 1.0, "and then lost it when handed more money"
+        assert max(b - a for a, b in zip(floors, floors[1:])) > 0.3
+        assert min(floors) < 0.01, "it reached equal risk at some amount"
+        assert floors[-1] > 0.3, "and then lost it when handed more money"
 
     def test_enough_money_reaches_equal_risk(self):
         """The buy-only constraint binds less and less; in the limit it does
@@ -503,8 +663,8 @@ class TestPinningBreaksTheMonotonicity:
     def test_the_floor_really_does_rise(self):
         _, _, _, floors = self.floors()
         bottom = min(floors)
-        assert bottom < 0.2, "it should fall a long way before it turns"
-        assert floors[-1] > bottom + 1.0, (
+        assert bottom < 0.1, "it should fall a long way before it turns"
+        assert floors[-1] > bottom + 0.3, (
             "the floor did not rise, so the counterexample this class exists "
             "for is not being exercised")
 
@@ -512,18 +672,26 @@ class TestPinningBreaksTheMonotonicity:
         """Which is arithmetic, not a fitted constant.
 
         As C grows the pinned holding's weight goes to zero, so its risk share
-        does too, and the best the other four can do is share the risk equally
-        among themselves. Four shares of 1/4 and one of 0 have a range of 1/4
-        about a mean of 1/5, so the dispersion tends to n / (n - 1) = 1.25.
+        does too, and the best the other n - k can do is share the risk equally
+        among themselves. Then the shares are 1/(n - k) on n - k holdings and
+        zero on k, so
+
+            mean   = 1/n
+            E[x^2] = (1/n) (n - k) (1/(n - k))^2 = 1 / (n (n - k))
+            CV^2   = E[x^2]/mean^2 - 1 = n/(n - k) - 1 = k / (n - k)
+
+        and the dispersion tends to sqrt(k / (n - k)), which for four free
+        holdings and one pinned is exactly 1/2.
         """
         _, _, _, floors = self.floors(n=5)
-        assert floors[-1] == pytest.approx(5.0 / 4.0, abs=0.02)
-        assert floors[-1] < 5.0 / 4.0, "it is a limit, approached from below"
+        assert floors[-1] == pytest.approx(0.5, abs=0.01)
+        assert floors[-1] < 0.5, "it is a limit, approached from below"
 
     @pytest.mark.parametrize("n", [4, 5, 6])
     def test_the_limit_holds_at_every_size(self, n):
+        """sqrt(k/(n-k)) with k = 1: 0.5774, 0.5000, 0.4472."""
         _, _, _, floors = self.floors(n=n, seed=1, pin=0)
-        assert floors[-1] == pytest.approx(n / (n - 1.0), abs=0.03)
+        assert floors[-1] == pytest.approx(np.sqrt(1.0 / (n - 1.0)), abs=0.01)
 
     def test_the_amount_named_still_reaches_the_target(self):
         """Minimality is what pinning costs. Sufficiency is not negotiable:

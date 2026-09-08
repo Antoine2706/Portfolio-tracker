@@ -236,37 +236,110 @@ class TestAContributionIsNotAReturn:
         assert module  # the import is the point of the fixture path
 
 
-class TestSalesStopTheReplay:
-    """Ignoring them made the "actual" arm a book nobody owned."""
+class TestDisposals:
+    """Ignoring them made the "actual" arm a book nobody owned.
 
-    def test_the_replay_ends_at_the_first_sale(self):
+    Two policies, both defensible, both stated. Pro-rata covers the whole
+    ledger at the cost of the actual arm no longer being the book that was
+    held; stopping keeps every figure true of a real book at the cost of the
+    window. What is not defensible is silence.
+    """
+
+    def _with_a_sale(self, **kw):
         prices = panel()
         buys = concentrated(prices)
-        cut = buys[3][0]
-        result = run(prices, buys, sales=[(cut, "D", 10.0)])
-        assert result.stopped_at == cut
+        return prices, buys, run(prices, buys,
+                                 sales=[(buys[3][0], "D", 10.0)], **kw)
+
+    def test_stopping_ends_the_replay_at_the_first_sale(self):
+        prices, buys, result = self._with_a_sale(on_sale="stop")
+        assert result.stopped_at == buys[3][0]
         assert result.purchases == 3, "a purchase on or after the sale was replayed"
-        assert result.actual.dispersion.index.max() < cut
+        assert result.ledger_purchases == 8, "the ledger's own count is unchanged"
+        assert result.actual.dispersion.index.max() < buys[3][0]
 
-    def test_it_says_so_rather_than_quietly_covering_less(self):
-        prices = panel()
-        buys = concentrated(prices)
-        text = "\n".join(run(prices, buys,
-                             sales=[(buys[3][0], "D", 10.0)]).lines())
+    def test_and_says_so_rather_than_quietly_covering_less(self):
+        _, _, result = self._with_a_sale(on_sale="stop")
+        text = "\n".join(result.lines())
         assert "the first sale in the ledger" in text
-        assert "no neutral way to apply a concentrated sale" in text
+        assert "3 of the ledger's 8 purchases" in text
 
-    def test_a_ledger_with_no_sales_runs_to_the_end(self):
-        result = run()
+    def test_pro_rata_covers_the_whole_ledger(self):
+        _, _, result = self._with_a_sale()
         assert result.stopped_at is None
         assert result.purchases == 8
+        assert result.withdrawals == 1
+
+    def test_pro_rata_leaves_every_risk_share_untouched(self):
+        """The property that makes it neutral: risk shares are homogeneous of
+        degree zero, so scaling a book down changes none of them. Without it
+        the withdrawal would move the comparison in one arm and not the
+        other."""
+        prices = panel()
+        buys = concentrated(prices)
+        sale = buys[3][0]
+        plain = run(prices, buys)
+        sold = run(prices, buys, sales=[(sale, "D", 10.0)])
+        before = plain.actual.dispersion[plain.actual.dispersion.index <= sale]
+        after = sold.actual.dispersion[sold.actual.dispersion.index <= sale]
+        assert len(before) == len(after)
+        assert np.allclose(before.to_numpy(), after.to_numpy(), atol=1e-12)
+
+    def test_both_arms_are_scaled_by_the_same_money(self):
+        """The comparability condition survives the withdrawal."""
+        _, _, result = self._with_a_sale()
+        assert result.allocated.invested + result.carried == pytest.approx(
+            result.actual.invested, rel=1e-6)
+
+    def test_the_withdrawal_is_not_counted_as_a_loss(self):
+        """Money leaving is not the book falling, the same way money arriving
+        is not the book rising."""
+        prices = panel()
+        buys = concentrated(prices)
+        sale = buys[3][0]
+        result = run(prices, buys, sales=[(sale, "D", 10.0)])
+        moved = abs(float(result.actual.returns.get(sale, 0.0)))
+        assert moved < 0.15, (
+            f"the disposal day shows a {moved:.1%} return, so the withdrawal "
+            f"is being counted as performance")
+
+    def test_the_cost_of_pro_rata_is_named(self):
+        _, _, result = self._with_a_sale()
+        text = "\n".join(result.lines())
+        assert "no longer the book that was held" in text
+        assert "homogeneous of degree zero" in text
+
+    def test_a_ledger_with_no_sales_runs_to_the_end_either_way(self):
+        for policy in ("prorata", "stop"):
+            result = run(on_sale=policy)
+            assert result.stopped_at is None
+            assert result.purchases == 8 and result.withdrawals == 0
 
     def test_a_sale_after_the_panel_does_not_truncate_anything(self):
         prices = panel()
         late = prices.index[-1] + pd.Timedelta(days=30)
-        result = run(prices, sales=[(late, "D", 10.0)])
+        result = run(prices, sales=[(late, "D", 10.0)], on_sale="stop")
         assert result.stopped_at is None
         assert result.purchases == 8
+
+    def test_an_unknown_policy_is_refused_rather_than_guessed(self):
+        with pytest.raises(ValueError, match="on_sale"):
+            run(sales=[], on_sale="whatever")
+
+
+class TestASmallSampleSaysSo:
+    def test_a_handful_of_purchases_is_not_called_a_series(self):
+        """The mean dispersion is an average over days, and days are not
+        independent observations: the holdings only move when a purchase
+        happens. On a real ledger truncated at a sale this can be three."""
+        prices = panel()
+        few = concentrated(prices)[:3]
+        text = "\n".join(run(prices, few).lines())
+        assert "3 POINTS, NOT AS A SERIES" in text
+        assert "3 of the ledger's 3 purchases" in text
+
+    def test_and_stays_quiet_when_there_are_enough(self):
+        assert "NOT AS A SERIES" not in "\n".join(run().lines())
 
 
 class TestStaggeredListings:

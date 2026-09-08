@@ -77,35 +77,65 @@ amount it names really does reach the target, always; that no smaller amount
 does holds only when nothing is pinned. `test_allocate.py` checks the
 monotonicity where it is real and checks the counterexample where it is not.
 
-How it is solved, and why not the way the specification assumed
---------------------------------------------------------------
-The feasible set is convex. The objective is not, and it is worth being
-explicit about that rather than inheriting a false comfort: the reported
-dispersion is `risk_contribution_spread`, a maximum minus a minimum, which is
-neither smooth nor convex in the weights. Nor is the smooth least-squares
-alternative convex -- risk shares are ratios of quadratics.
+What "dispersion" means here, and why it is not a range
+-------------------------------------------------------
+The coefficient of variation of the risk shares: their standard deviation
+over their mean. Zero exactly when the contributions are equal, and bounded
+above by sqrt(m - 1) for m holdings, so it reads against a known scale.
 
-So the solve is in two steps, and the second one is the optimiser.
+It was a range -- maximum minus minimum, over the mean -- and that was the
+mistake underneath everything below. A range is a rank statistic: on six
+holdings it is decided by two of them and discards the other four, it is
+non-differentiable wherever the argmax or argmin changes hands, and a policy
+minimising it chases the single worst laggard while ignoring the shape of the
+rest. Worse, nothing actually minimised it: the descent minimised a sum of
+squared deviations and the report printed a range, so the tool graded answers
+by a rule it had not used to produce them. That mismatch is what a
+least-squares descent reaching 1.205 against a coarse grid's 1.136 was
+measuring. It read as a solver failure and it was an objective failure.
 
-1.  Projected gradient descent on the smooth surrogate
+The range is still printed, beside the dispersion and never instead of it,
+because it answers something a coefficient of variation does not: how far
+apart the extremes are, which is what says whether one holding is the
+problem.
 
-        F(b) = sum_i ( RC_i(v + b) - 1/n )^2
+How it is solved
+----------------
+The feasible set is convex. The objective is smooth but *not* convex -- risk
+shares are ratios of quadratics -- and the specification's claim that a convex
+feasible set makes the problem convex does not follow. So there is no
+certificate from the search itself, and every part below exists because
+something measurable went wrong without it.
 
-    with the gradient written out below rather than taken from a library,
-    projected onto the simplex { b >= 0, sum b = C } at every step, from many
-    starting points. This generates candidates; it does not choose between
-    them.
+1.  Projected gradient descent on the objective itself, which is the reported
+    dispersion squared. Not a surrogate: `dispersion_of` and
+    `objective_and_gradient` are the same function, so the descent and the
+    report cannot disagree about which of two allocations is better. Squared
+    only because a standard deviation has a square-root kink at zero, exactly
+    where the optimum is. The gradient is derived in full below rather than
+    taken from a library, and checked against central differences.
 
-2.  A multi-resolution pattern search on the reported metric itself, run from
-    every candidate and from raw simplex points besides. Least squares and a
-    range disagree about more than the last decimal -- the worked numbers are
-    in `pattern_search` -- so descending on the surrogate and calling its
-    answer the floor was measurably beaten by a coarse brute-force grid.
+2.  `aim_at_equal_risk` hands the search the equal-risk portfolio mapped into
+    b-space. Past the amount at which that portfolio becomes reachable it *is*
+    the answer, and no agnostic start finds it: without this the floor on a
+    hedged book found equal risk at four times the book and lost it again at
+    sixteen.
+
+3.  A multi-resolution pattern search over pairwise exchanges, from every
+    candidate. Smooth is not convex, and this is not a tidy-up: on one
+    eight-holding book the descent converged to a point with a
+    projected-gradient residual of 1e-16 -- a genuine constrained stationary
+    point, not a stall, and more iterations do not move it -- from which the
+    exchange search escaped by moving a third of the money, taking the
+    dispersion from 1.00 to 0.56.
 
 The result is labelled "best found", not "the minimum", because on a
-non-convex objective those are different claims. `test_allocate.py` checks it
-against a dense brute-force search on small books, which is the only way to
-tell the two apart.
+non-convex objective those are different claims. Two independent things check
+it: a dense brute-force grid on small books, and `spinu_sweep`, which solves
+the convex Maillard-Roncalli-Teiletche/Spinu form to global optimality over
+this same polytope for a family of barrier parameters. The search has never
+lost to either, and by a margin as small as 6e-4 in one place, which is what
+makes it a check rather than a formality.
 
 Buy-only is a constraint of the problem, not a preference. A negative
 purchase is a sale, so the search asserts non-negativity and the order
@@ -123,11 +153,14 @@ import numpy as np
 import pandas as pd
 
 from ..core.risk import risk_decomposition
-from .risk import equal_risk_weights, risk_contribution_spread
+from .risk import (equal_risk_weights, risk_contribution_spread,
+                   risk_dispersion)
 
 __all__ = ["project_onto_simplex", "risk_shares", "dispersion_of",
-           "metric_on_arrays", "objective_and_gradient", "solve_continuous",
-           "pattern_search", "aim_at_equal_risk", "reachable_floor",
+           "spread_of", "among_indices", "metric_on_arrays",
+           "objective_and_gradient", "solve_continuous",
+           "pattern_search", "spinu_sweep", "aim_at_equal_risk",
+           "reachable_floor",
            "unconstrained_floor",
            "Purchase", "Refusal", "Destination", "BuyOnlyAllocation",
            "allocate_buy_only", "cash_for_dispersion", "pinned_holdings",
@@ -205,10 +238,28 @@ def risk_shares(x: np.ndarray, sigma: np.ndarray) -> np.ndarray:
 
 
 def dispersion_of(x, cov: pd.DataFrame, among=None) -> float:
-    """The reported metric: largest gap between risk shares, over their mean.
+    """The reported metric: coefficient of variation of the risk shares.
 
     Delegates to `agents.risk` so the allocator and the equal risk policy
     cannot drift into reporting two different numbers under one name.
+
+    It is also, squared, exactly what the solver minimises. That identity is
+    the point of it and it was not true before: the report was a range and the
+    descent minimised a sum of squares, so the two disagreed about which of
+    two allocations was better and the tool was grading answers by a rule it
+    had not used to produce them.
+    """
+    keys = [str(c) for c in cov.columns]
+    weights = {k: float(v) for k, v in zip(keys, np.asarray(x, dtype=float))}
+    return risk_dispersion(weights, cov, among=among)
+
+
+def spread_of(x, cov: pd.DataFrame, among=None) -> float:
+    """The range of the risk shares, over their mean. Descriptive only.
+
+    Printed beside the dispersion because it answers something the coefficient
+    of variation does not -- how far apart the extremes are, which is what
+    tells you whether one holding is the problem. Nothing minimises it.
     """
     keys = [str(c) for c in cov.columns]
     weights = {k: float(v) for k, v in zip(keys, np.asarray(x, dtype=float))}
@@ -224,10 +275,8 @@ def metric_on_arrays(cov: pd.DataFrame, among=None):
     exactly, because a fast path that is only nearly the reported one is a
     tool optimising something it does not print.
     """
-    keys = [str(c) for c in cov.columns]
     sigma = cov.to_numpy(dtype=float)
-    idx = np.array([keys.index(k) for k in (among if among is not None else keys)],
-                   dtype=int)
+    idx = among_indices(cov, among)
 
     def metric(x: np.ndarray) -> float:
         if idx.size == 0:
@@ -236,61 +285,99 @@ def metric_on_arrays(cov: pd.DataFrame, among=None):
         mean = float(chosen.mean())
         if mean == 0:
             return 0.0
-        return float((chosen.max() - chosen.min()) / abs(mean))
+        return float(chosen.std(ddof=0) / abs(mean))
 
     return metric
 
 
+def among_indices(cov: pd.DataFrame, among=None) -> np.ndarray:
+    """Positions in the covariance matrix of the holdings the metric covers."""
+    keys = [str(c) for c in cov.columns]
+    return np.array([keys.index(k) for k in
+                     (among if among is not None else keys)], dtype=int)
+
+
 def objective_and_gradient(b: np.ndarray, held: np.ndarray, sigma: np.ndarray,
-                           target: np.ndarray) -> "tuple[float, np.ndarray]":
-    """The smooth surrogate and its exact gradient.
+                           among: np.ndarray) -> "tuple[float, np.ndarray]":
+    """The objective -- the reported metric, squared -- and its exact gradient.
 
-        F(b) = sum_i ( RC_i(x) - t_i )^2,        x = held + b
+    Not a surrogate. `dispersion_of` is the coefficient of variation of the
+    risk shares and this is its square, so the descent and the report are the
+    same function and cannot disagree about which of two allocations is
+    better. Squared because the square is smooth everywhere including at the
+    optimum, where a standard deviation has a square-root kink, and because
+    minimising a non-negative quantity and minimising its square are the same
+    problem.
 
-    Differentiating RC_i = x_i s_i / q with s = Sigma x and q = x' Sigma x:
+    Write A for the holdings the metric covers, m = |A|, and
+
+        RC_i = x_i s_i / q,   s = Sigma x,   q = x' Sigma x,   x = held + b
+        mu   = (1/m) sum_{i in A} RC_i
+        P    = (1/m) sum_{i in A} RC_i^2
+        g    = P / mu^2 - 1                      = CV^2
+
+    Differentiating a risk share,
 
         d RC_i / d x_k = ( [i = k] s_i + x_i Sigma_ik ) / q  -  2 RC_i s_k / q
 
-    and so, writing d_i = RC_i - t_i,
+    so for any coefficient vector c that is zero outside A the weighted sum
+    collapses to one expression, which is the only piece of arithmetic here:
 
-        dF / d x_k = (2/q) [ d_k s_k + (Sigma (d * x))_k - 2 s_k (d . RC) ]
+        G(c)_k = ( c_k s_k + (Sigma (c * x))_k - 2 s_k (c . RC) ) / q
 
-    Written out rather than differentiated numerically: a finite-difference
-    gradient on a ratio of quadratics loses most of its precision near the
-    optimum, which is exactly where the optimiser needs it. `test_allocate.py`
-    checks this against central differences anyway, because a hand-derived
-    gradient with a sign error still descends -- just to the wrong place.
+    Then dP/dx = (2/m) G(RC_A) and d mu/dx = (1/m) G(1_A), giving
+
+        dg/dx = ( 2 / (m mu^2) ) [ G(RC_A) - (P / mu) G(1_A) ]
+
+    The formula checks itself when A is every holding: the shares sum to one
+    whatever x is, so mu is the constant 1/m and its gradient must vanish.
+    Substituting c = 1 gives G(1)_k = (s_k + s_k - 2 s_k) / q = 0, which it
+    does. `test_allocate.py` checks the whole thing against central
+    differences anyway, because a hand-derived gradient with a sign error
+    still descends -- just to the wrong place.
     """
     x = held + b
     s = sigma @ x
     q = float(x @ s)
-    if q <= 0:
+    if q <= 0 or among.size == 0:
         return 0.0, np.zeros_like(b)
     rc = (x * s) / q
-    d = rc - target
-    grad = (2.0 / q) * (d * s + sigma @ (d * x) - 2.0 * s * float(d @ rc))
-    return float(d @ d), grad
+    chosen = rc[among]
+    m = float(among.size)
+    mu = float(chosen.mean())
+    if mu == 0:
+        return 0.0, np.zeros_like(b)
+    p = float((chosen * chosen).mean())
 
+    def weighted(c: np.ndarray) -> np.ndarray:
+        return (c * s + sigma @ (c * x) - 2.0 * s * float(c @ rc)) / q
 
-def _equal_target(n: int) -> np.ndarray:
-    return np.full(n, 1.0 / n, dtype=float)
+    carrier = np.zeros_like(rc)
+    carrier[among] = chosen
+    ones = np.zeros_like(rc)
+    ones[among] = 1.0
+    grad = (2.0 / (m * mu * mu)) * (weighted(carrier) - (p / mu) * weighted(ones))
+    # Clamped because p / mu^2 - 1 is a difference of two numbers that agree to
+    # every digit once the shares are equal, so rounding can put it just below
+    # zero exactly where the answer is right.
+    return max(p / (mu * mu) - 1.0, 0.0), grad
 
 
 def _descend(start: np.ndarray, held: np.ndarray, sigma: np.ndarray,
-             cash: float, free: np.ndarray, target: np.ndarray, *,
+             cash: float, free: np.ndarray, among: np.ndarray, *,
              steps: int, tolerance: float) -> np.ndarray:
-    """One projected-gradient descent on the surrogate, from one start."""
+    """One projected-gradient descent on the objective, from one start."""
     n = held.size
     b = start.copy()
     full = np.zeros(n)
     full[free] = b
-    value, grad = objective_and_gradient(full, held, sigma, target)
+    value, grad = objective_and_gradient(full, held, sigma, among)
     step = max(cash, 1.0) / max(float(np.abs(grad[free]).max()), 1e-30)
     for _ in range(steps):
         moved = project_onto_simplex(b - step * grad[free], cash)
         trial = np.zeros(n)
         trial[free] = moved
-        trial_value, trial_grad = objective_and_gradient(trial, held, sigma, target)
+        trial_value, trial_grad = objective_and_gradient(trial, held, sigma, among)
         if trial_value < value:
             improvement = value - trial_value
             b, value, grad = moved, trial_value, trial_grad
@@ -330,10 +417,12 @@ def starting_points(cash: float, free: int, seed: int = 20260908,
 
 
 def solve_continuous(held: np.ndarray, sigma: np.ndarray, cash: float,
-                     allowed: np.ndarray, *, steps: int = 400,
-                     randoms: int = 12,
+                     allowed: np.ndarray, among: np.ndarray, *,
+                     steps: int = 400, randoms: int = 12,
                      tolerance: float = 1e-14) -> "list[np.ndarray]":
     """Candidate allocations: one descent per start, all of them returned.
+
+    `among` is the index array the metric covers, from `among_indices`.
 
     `allowed` is a boolean mask of the holdings new money may go into.
     Everything else is pinned at zero purchase -- it still sits in the
@@ -350,10 +439,9 @@ def solve_continuous(held: np.ndarray, sigma: np.ndarray, cash: float,
     free = np.nonzero(allowed)[0]
     if cash <= 0 or free.size == 0:
         return [np.zeros(n, dtype=float)]
-    target = _equal_target(n)
     out = []
     for start in starting_points(cash, int(free.size), randoms=randoms):
-        b = _descend(start, held, sigma, cash, free, target,
+        b = _descend(start, held, sigma, cash, free, among,
                      steps=steps, tolerance=tolerance)
         full = np.zeros(n, dtype=float)
         full[free] = b
@@ -364,24 +452,27 @@ def solve_continuous(held: np.ndarray, sigma: np.ndarray, cash: float,
 def pattern_search(b: np.ndarray, held: np.ndarray, metric,
                    allowed: np.ndarray, cash: float, *,
                    resolution: float = 1e-7) -> np.ndarray:
-    """Descend on the REPORTED metric by moving cash between holdings.
+    """Descend on the same metric by moving cash between holdings.
 
-    This is the optimiser, not a tidy-up. The gradient descent above
-    minimises a sum of squared deviations; the number printed and compared
-    against is a maximum minus a minimum, and on a real book the two disagree
-    about more than the last decimal. On the five-holding fixture in
-    `test_allocate.py` least squares reaches risk shares
+    Not a tidy-up, and no longer a correction for the descent optimising
+    something other than the report -- it now optimises exactly the report.
+    This exists because smooth is not convex.
 
-        0.011  0.252  0.252  0.232  0.252     range 0.241, squares 0.0448
+    The measurement. On the eight-holding hedged book in `test_allocate.py`
+    the projected-gradient descent converges to a point whose
+    projected-gradient residual is 1e-16 of the purchase: a genuine
+    constrained stationary point, not an early stop, and raising the step
+    budget from 400 to 10,000 does not move it. Its risk shares are
 
-    by equalising four holdings and abandoning the fifth, while the range
-    metric prefers
+        0.237  0.191  0.172 -0.052  0.168  0.218 -0.121  0.185
 
-        0.072  0.295  0.299  0.072  0.263     range 0.227, squares 0.0557
+    with dispersion 1.00. Moving a third of the money between holdings reaches
 
-    which lifts the laggards at the cost of spreading the rest. A range is
-    determined by two coordinates and is blind to everything between them, so
-    no smooth surrogate is a substitute for descending on it directly.
+        0.165  0.148  0.131  0.176  0.132  0.161 -0.058  0.145
+
+    at 0.56. No line search finds that from there, because it is not downhill
+    in any single direction; a pairwise exchange finds it because it is a
+    different basin, not a further step in the same one.
 
     The search is a multi-resolution pattern search: sweep every ordered pair
     of holdings moving a fixed quantum from one to the other, repeat while
@@ -427,6 +518,98 @@ def pattern_search(b: np.ndarray, held: np.ndarray, metric,
             f"which is a sale. Buy-only is a constraint of the problem, not a "
             f"preference, so this is a bug rather than a result.")
     return best
+
+
+def spinu_sweep(held: np.ndarray, cov: pd.DataFrame, cash: float,
+                allowed: np.ndarray, among=None, *, rungs: int = 21,
+                steps: int = 800) -> "list[np.ndarray]":
+    """Certified points from the convex form of equal risk contribution.
+
+    A control, not part of the answer, and deliberately kept out of
+    `reachable_floor` so that it stays an independent check on it.
+
+    The formulation is Maillard, Roncalli and Teiletche's, sharpened by Spinu
+    (2013): over x > 0,
+
+        f(x) = 0.5 x' Sigma x  -  lam * sum_{i in A} log x_i
+
+    is convex -- a positive semi-definite quadratic plus a sum of convex
+    terms -- and its stationarity condition is
+
+        (Sigma x)_i = lam / x_i,   i.e.   x_i (Sigma x)_i = lam  for all i,
+
+    which is equal risk contributions exactly. Since x = v + b is affine in b
+    and the buy-only set { b >= 0, sum b = C, b_i = 0 where pinned } is a
+    polytope, the whole problem stays convex over it: projected gradient with
+    a backtracking step converges to the *global* optimum, and any point it
+    returns has a certificate the multi-start search does not.
+
+    The catch, which is the reason this is a sweep rather than one solve. In
+    the unconstrained problem `lam` is irrelevant: the objective is scale
+    invariant up to an additive constant, so any `lam` gives the same weights
+    once normalised. Here the budget is pinned and the weights carry lower
+    bounds `w_i >= v_i / (V + C)`, that invariance is gone, and `lam` becomes
+    a real parameter whose value changes the answer. One `lam` is not a
+    substitute for a search over the polytope. What the family gives is a
+    one-parameter set of globally certified points, cheap and reproducible,
+    and `test_allocate.py` requires that the search never loses to it. If it
+    ever does, the search is under-converged -- which is the failure mode that
+    took a hand-run brute-force grid to notice last time.
+
+    Empty when the barrier is not defined: a holding in the metric's set that
+    is worth nothing and cannot receive has x_i = 0, so log x_i is not finite
+    and this family has nothing to say about that book.
+    """
+    n = held.size
+    free = np.nonzero(allowed)[0]
+    idx = among_indices(cov, among)
+    if cash <= 0 or free.size == 0 or idx.size == 0:
+        return []
+    sigma = cov.to_numpy(dtype=float)
+    barrier = np.zeros(n, dtype=bool)
+    barrier[idx] = True
+    start = np.zeros(n, dtype=float)
+    start[free] = cash / free.size
+    if float((held + start)[barrier].min()) <= 0:
+        return []
+
+    def value(b: np.ndarray) -> float:
+        x = held + b
+        if float(x[barrier].min()) <= 0:
+            return float("inf")
+        return float(0.5 * x @ sigma @ x - lam * np.log(x[barrier]).sum())
+
+    def gradient(b: np.ndarray) -> np.ndarray:
+        x = held + b
+        g = sigma @ x
+        g[barrier] -= lam / x[barrier]
+        return g
+
+    # A scale for lam from the problem itself rather than a guess: at a point
+    # where the contributions are equal, x' Sigma x = sum_i x_i (Sigma x)_i =
+    # m * lam, so lam ~ (x' Sigma x) / m at the starting point is the right
+    # order of magnitude whatever the covariance's units are.
+    x0 = held + start
+    anchor = float(x0 @ sigma @ x0) / float(idx.size)
+    out: "list[np.ndarray]" = []
+    for power in np.linspace(-3.0, 3.0, rungs):
+        lam = anchor * float(10.0 ** power)
+        b = start.copy()
+        here = value(b)
+        step = 1.0 / max(float(np.abs(gradient(b)[free]).max()), 1e-30)
+        for _ in range(steps):
+            moved = np.zeros(n, dtype=float)
+            moved[free] = project_onto_simplex(
+                b[free] - step * gradient(b)[free], cash)
+            there = value(moved)
+            if there < here - 1e-18:
+                b, here, step = moved, there, step * 1.5
+            else:
+                step *= 0.4
+                if step <= 1e-24:
+                    break
+        out.append(b)
+    return out
 
 
 def aim_at_equal_risk(held: np.ndarray, cov: pd.DataFrame, cash: float,
@@ -542,6 +725,7 @@ def reachable_floor(held: np.ndarray, cov: pd.DataFrame, cash: float,
     metric = metric_on_arrays(cov, among)
     free = np.nonzero(allowed)[0]
     candidates = solve_continuous(held, sigma, cash, allowed,
+                                  among_indices(cov, among),
                                   randoms=12 if thorough else 2)
     aim = aim_at_equal_risk(held, cov, cash, allowed)
     if aim is not None:
@@ -767,6 +951,8 @@ class BuyOnlyAllocation:
     destinations: tuple[Destination, ...]
     dispersion_now: float
     dispersion_after: float              # on the EXECUTABLE, rounded order
+    spread_now: float                    # the range, descriptive only
+    spread_after: float
     floor_at_cash: float                 # continuous best found at this cash
     floor_unlimited: float               # what selling could reach
     cost_parts: "dict[str, float]"
@@ -878,13 +1064,24 @@ class BuyOnlyAllocation:
             + " + ".join(f"{v:,.2f} {k}" for k, v in self.cost_parts.items() if v),
             "",
             "Dispersion of risk shares", "-" * 64,
-            f"  now                      {self.dispersion_now:>8.4f}",
-            f"  after this purchase      {self.dispersion_after:>8.4f}",
-            f"  floor at this amount     {self.floor_at_cash:>8.4f}   "
-            f"best reachable buy-only",
-            f"  floor with no limit      {self.floor_unlimited:>8.4f}   "
-            f"what selling could reach",
+            f"  {'':24}{'CV':>10}{'range':>10}",
+            f"  now                      {self.dispersion_now:>10.4f}"
+            f"{self.spread_now:>10.4f}",
+            f"  after this purchase      {self.dispersion_after:>10.4f}"
+            f"{self.spread_after:>10.4f}",
+            f"  floor at this amount     {self.floor_at_cash:>10.4f}"
+            f"{'':10}   best reachable buy-only",
+            f"  floor with no limit      {self.floor_unlimited:>10.4f}"
+            f"{'':10}   what selling could reach",
             "",
+            f"  CV is the coefficient of variation of the risk shares -- their "
+            f"standard deviation over their mean, zero when the contributions "
+            f"are equal, at most sqrt(m - 1) for m holdings. It is what is "
+            f"minimised and what is reported, and they are the same number. "
+            f"The range is the largest gap between any two shares over the "
+            f"same mean; it is descriptive, it is decided by two holdings out "
+            f"of {len(self.destinations) or 'several'}, and nothing optimises "
+            f"it.",
             f"  This purchase closes {self.closable:.1%} of the gap between the "
             f"book as it stands and equal risk contribution. Whole shares cost "
             f"{self.rounding_penalty:.4f} of that against the continuous "
@@ -949,6 +1146,7 @@ def allocate_buy_only(*, values: "dict[str, float]", prices: "dict[str, float]",
                                     "number of shares cannot be worked out"))
 
     dispersion_now = dispersion_of(held, cov, among)
+    spread_now = spread_of(held, cov, among)
     floor_unlimited = unconstrained_floor(cov, among)
 
     # Solve, drop what the fees make pointless, solve again. Bounded by the
@@ -978,6 +1176,7 @@ def allocate_buy_only(*, values: "dict[str, float]", prices: "dict[str, float]",
     # is proof the search did not reach the floor. Reporting the search's
     # answer anyway would print a floor the tool has already been under.
     dispersion_after = dispersion_of(after, cov, among)
+    spread_after = spread_of(after, cov, among)
     floor_at_cash = min(floor_at_cash, dispersion_after)
 
     total_value = float(held.sum())
@@ -1023,6 +1222,7 @@ def allocate_buy_only(*, values: "dict[str, float]", prices: "dict[str, float]",
         destinations=tuple(destinations),
         dispersion_now=dispersion_now,
         dispersion_after=dispersion_after,
+        spread_now=spread_now, spread_after=spread_after,
         floor_at_cash=floor_at_cash, floor_unlimited=floor_unlimited,
         cost_parts={k: v for k, v in parts.items() if v},
         meaningful_cash=smallest_meaningful_cash(

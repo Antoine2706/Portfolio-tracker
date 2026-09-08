@@ -168,9 +168,10 @@ def _backtest(args: argparse.Namespace) -> int:
         # keep return claims honest. Its claim is about risk structure, and
         # that is computed rather than estimated.
         try:
-            replay = replay_the_ledger(book, mode=args.mode,
-                                       data_root=args.data_root,
-                                       lookback=args.lookback)
+            replay = replay_the_ledger(
+                book, mode=args.mode, data_root=args.data_root,
+                lookback=args.lookback,
+                on_sale="stop" if args.stop_at_first_sale else "prorata")
         except ValueError as exc:
             print(f"Could not replay the ledger: {exc}", file=sys.stderr)
             return 2
@@ -563,6 +564,11 @@ def build_parser() -> argparse.ArgumentParser:
                           help="pre-registered attempts, for the deflated Sharpe")
     backtest.add_argument("--trial-spread", type=float, default=0.0,
                           help="spread of Sharpe estimates across those trials")
+    backtest.add_argument("--stop-at-first-sale", action="store_true",
+                          help="allocator only: end the replay at the first "
+                               "disposal instead of applying it to both arms "
+                               "pro-rata. Every figure then describes a book "
+                               "that really was held, over a shorter window")
     backtest.add_argument("--register", action="store_true",
                           help="append this attempt to the pre-registration log")
     backtest.set_defaults(func=_backtest)

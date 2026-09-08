@@ -724,8 +724,14 @@ class AllocationOut(BaseModel):
     refused: list[AllocationRefusal]
     # Three floors, not one: where the book is, the best reachable with this
     # much money, and the best reachable if selling were allowed.
+    # `dispersion_*` is the coefficient of variation of the risk shares --
+    # what the solver minimises and what the page leads with. `spread_*` is
+    # the range over the same mean, descriptive only: it says how far apart
+    # the extremes are, which a CV does not, and nothing optimises it.
     dispersion_now: float
     dispersion_after: float
+    spread_now: float
+    spread_after: float
     floor_at_cash: float
     floor_unlimited: float
     rounding_penalty: float

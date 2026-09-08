@@ -80,24 +80,83 @@ __all__ = ["equal_risk_weights", "risk_contribution_spread",
            "EqualRiskContribution"]
 
 
+def _chosen_shares(weights, cov: pd.DataFrame, among=None) -> np.ndarray:
+    decomposition = risk_decomposition(weights, cov)
+    keys = [str(c) for c in cov.columns]
+    percent = dict(zip(keys, decomposition.percent))
+    return np.array([percent[k] for k in (among if among is not None else keys)],
+                    dtype=float)
+
+
+def risk_dispersion(weights, cov: pd.DataFrame, among=None) -> float:
+    """Coefficient of variation of the risk contributions: sd over mean.
+
+    How unequal the risk contributions are, using every holding. Zero exactly
+    when they are equal, and bounded above by sqrt(m - 1) for m holdings --
+    the value when one holding carries all the risk -- so it can be read
+    against a known scale rather than against experience.
+
+    This is the number to minimise and the number to report, and they have to
+    be the same number. `risk_contribution_spread` below is the other choice,
+    and it was the wrong one: a maximum minus a minimum is a rank statistic
+    decided by two holdings, blind to the four between them, and
+    non-differentiable wherever the argmax or argmin changes hands. Optimising
+    a smooth surrogate while reporting a range is optimising one thing and
+    grading another, and it showed: a least-squares descent reached 1.205
+    where a coarse brute-force grid found 1.136 on the same book, which reads
+    as a solver failure and was an objective mismatch.
+
+    Two uncorrelated assets, one twice as volatile. Equal risk is two thirds
+    and one third, and the dispersion there is zero:
+
+    >>> cov = pd.DataFrame([[0.01, 0.0], [0.0, 0.04]], index=["A", "B"],
+    ...                    columns=["A", "B"])
+    >>> round(risk_dispersion({"A": 2 / 3, "B": 1 / 3}, cov), 12)
+    0.0
+
+    Equal *money* is not equal risk here: the volatile asset carries four
+    fifths of it, and two shares of 0.8 and 0.2 about a mean of 0.5 have a
+    standard deviation of 0.3, so the coefficient of variation is 0.6:
+
+    >>> round(risk_dispersion({"A": 0.5, "B": 0.5}, cov), 10)
+    0.6
+
+    The upper bound is reached when one holding carries everything, which for
+    two assets is sqrt(1) = 1:
+
+    >>> round(risk_dispersion({"A": 1.0, "B": 0.0}, cov), 10)
+    1.0
+    """
+    chosen = _chosen_shares(weights, cov, among)
+    if chosen.size == 0:
+        return 0.0
+    mean = float(chosen.mean())
+    if mean == 0:
+        return 0.0
+    # Population sd, not the sample one: these are the whole book, not a draw
+    # from it, and dividing by m - 1 would make a two-holding book's number
+    # incomparable with a ten-holding book's.
+    return float(chosen.std(ddof=0) / abs(mean))
+
+
 def risk_contribution_spread(weights, cov: pd.DataFrame,
                              among=None) -> float:
     """Largest gap between any two risk contributions, as a fraction of the mean.
 
-    The acceptance test for the solver: zero means the contributions really
-    are equal. Reported rather than asserted silently, so a policy can say
-    how well it solved its own problem.
+    Descriptive, and reported beside `risk_dispersion` rather than in place of
+    it. It answers a question a coefficient of variation does not -- how far
+    apart the extremes are -- which is worth knowing when deciding whether one
+    holding is the problem. It is not what anything optimises, because it is a
+    rank statistic: on six holdings it is decided by two of them and discards
+    the other four.
     """
-    decomposition = risk_decomposition(weights, cov)
-    keys = [str(c) for c in cov.columns]
-    percent = dict(zip(keys, decomposition.percent))
-    chosen = [percent[k] for k in (among if among is not None else keys)]
-    if not chosen:
+    chosen = _chosen_shares(weights, cov, among)
+    if chosen.size == 0:
         return 0.0
-    mean = float(np.mean(chosen))
+    mean = float(chosen.mean())
     if mean == 0:
         return 0.0
-    return float((max(chosen) - min(chosen)) / abs(mean))
+    return float((chosen.max() - chosen.min()) / abs(mean))
 
 
 def _sweep(sigma: np.ndarray, w: np.ndarray, free: list[int], lam: float,

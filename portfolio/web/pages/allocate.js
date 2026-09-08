@@ -100,7 +100,8 @@ function Headline({ result, ccy }) {
 /* ---------------- the four floors ---------------- */
 
 const FLOOR_HELP = {
-  now: "Largest gap between any two risk shares, over their mean. Zero means every holding carries the same share of the book's volatility.",
+  now: "Coefficient of variation of the risk shares: their standard deviation over their mean. Zero when every holding carries the same share of the book's volatility, at most √(m−1) for m holdings. This is what the solver minimises and what it reports — the same number, so it cannot grade an answer by a rule it did not use to produce it.",
+  spread: "Largest gap between any two risk shares, over the same mean. Descriptive only. It says how far apart the extremes are, which a coefficient of variation does not, but it is decided by two holdings and discards the rest, so nothing optimises it.",
   after: "Recomputed on the whole-share order below, not on the continuous solution. What you would actually own.",
   floor: "The best any buy-only purchase of this size reaches. Buy-only reduces an overweight risk share only by dilution, so this is usually well above zero.",
   unlimited: "What selling could reach: the equal risk contribution portfolio itself. Shown so the buy-only floor is read against something rather than against an assumed zero.",
@@ -109,9 +110,10 @@ const FLOOR_HELP = {
 function Floors({ result }) {
   const n = (v) => (v == null ? fmt.DASH : fmt.num(v, { decimals: 4 }));
   return html`<div class="kpi-grid">
-    <${KpiTile} label=${html`Dispersion now <${Help} text=${FLOOR_HELP.now} />`} value=${n(result.dispersion_now)} />
+    <${KpiTile} label=${html`Dispersion now <${Help} text=${FLOOR_HELP.now} />`} value=${n(result.dispersion_now)}
+      sub=${html`range ${n(result.spread_now)} <${Help} text=${FLOOR_HELP.spread} />`} />
     <${KpiTile} label=${html`After this purchase <${Help} text=${FLOOR_HELP.after} />`} value=${n(result.dispersion_after)}
-      sub=${`closes ${fmt.pct(result.closable)} of the gap`} />
+      sub=${`closes ${fmt.pct(result.closable)} of the gap · range ${n(result.spread_after)}`} />
     <${KpiTile} label=${html`Floor at this amount <${Help} text=${FLOOR_HELP.floor} />`} value=${n(result.floor_at_cash)}
       sub=${`whole shares cost ${fmt.num(result.rounding_penalty, { decimals: 4 })}`} />
     <${KpiTile} label=${html`Floor if selling were allowed <${Help} text=${FLOOR_HELP.unlimited} />`} value=${n(result.floor_unlimited)}

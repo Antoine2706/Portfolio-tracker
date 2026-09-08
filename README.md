@@ -145,6 +145,17 @@ drift removed. New money is the one rebalancing channel that costs nothing
 extra, because the purchase was going to happen anyway. So the allocator
 chooses **where** it goes, subject to `b ≥ 0`: it never proposes a sale.
 
+**Dispersion** here is the coefficient of variation of the risk shares — their
+standard deviation over their mean, zero when every holding carries the same
+share of the volatility, at most √(m−1) for m holdings. It is what the solver
+minimises *and* what it reports, which sounds like a tautology and is the fix
+for a real defect: it used to report a range (max − min, over the mean) while
+minimising a sum of squared deviations, so the tool graded answers by a rule it
+had not used to produce them. A range is also a rank statistic — on six
+holdings it is decided by two and discards the other four. It is still printed,
+beside the dispersion and never instead of it, because it says how far apart
+the extremes are.
+
 Buy-only can only reduce an overweight risk share by dilution, so the output
 carries three numbers rather than one — where the book is now, the best
 reachable *with this much money*, and the best reachable if selling were
@@ -155,10 +166,10 @@ what the best reachable is and at what amount, because "no" on its own is
 not a decision. And it says when the destination hardly matters:
 
 > At 200 EUR this hardly moves the book: the best any purchase this size
-> reaches is 24.4355 against 25.1094 now. The smallest purchase that closes a
-> worthwhile share of the gap is about 390 EUR.
+> reaches is 1.2126 against 1.2299 now. The smallest purchase that closes a
+> worthwhile share of the gap is about 732 EUR.
 >
-> Best and worst destinations differ by 1.824 of dispersion, so the choice is
+> Best and worst destinations differ by 0.031 of dispersion, so the choice is
 > worth making.
 
 Two sentences, because they answer different questions and merging them once
@@ -196,8 +207,20 @@ The allocator is evaluated by **replaying the real ledger** — same dates,
 same amounts, destination changed — because its claim is about risk
 structure, not return. Dispersion is computed rather than estimated, so that
 comparison carries no sampling error; realised volatility is estimated and
-carries its standard error, and with eight purchases the report says plainly
-that it is not a ranking.
+carries its standard error, and the correlation between the two arms is
+measured and printed rather than described, because that is what decides how
+much of each marginal error cancels. Below five purchases the report says
+`READ THIS AS n POINTS, NOT AS A SERIES` and explains why.
+
+Disposals have no neutral treatment, so both are offered and the report names
+which ran. By default a sale is applied to *both* arms as the same
+proportional withdrawal: risk shares are homogeneous of degree zero, so it
+changes none of them in either arm, and the whole ledger is covered — at the
+cost of the actual arm being "the purchases that were made, with disposals
+taken pro-rata" rather than the book that was held. That is deliberate:
+selling a particular holding is a decision the allocator never makes, and
+crediting one arm for it would measure that instead of the destination.
+`--stop-at-first-sale` gives the strict version over a shorter window.
 
 reports the policy gross, net and against the benchmark, then the **breakeven
 turnover** — the level at which the gross edge is entirely consumed by the
