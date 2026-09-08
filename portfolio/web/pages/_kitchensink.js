@@ -189,9 +189,9 @@ function ChartGrid({ snapshot }) {
   return html`<div class="grid">
     <div class="col-8"><${Chart} title="Portfolio vs benchmark" caption=${`TWR index, 100 at ${fmt.date(p.dates[0])} · crosshair tooltip lists both series`} option=${lineOpt} deps=${deps} height=${280} table=${lineTable}
       actions=${html`<${RangeSelector} value=${range} onChange=${setRange} />`} empty=${p.reason || "No performance data"} /></div>
-    <div class="col-4"><${Chart} title="Allocation by value" caption="Treemap · one sequential hue, larger = more saturated" option=${treeOpt} deps=${deps} height=${280} table=${treeTable} /></div>
+    <div class="col-4"><${Chart} title="Allocation by value" caption="Treemap · area is value; one sequential hue where no day change is supplied, diverging gain/loss where it is" option=${treeOpt} deps=${deps} height=${280} table=${treeTable} /></div>
     <div class="col-6"><${Chart} title="Risk share minus weight" caption="Diverging bars · warm = carries more risk than capital, neutral zero line" option=${divOpt} deps=${deps} height=${Math.max(180, div.length * 30 + 56)} table=${divTable} /></div>
-    <div class="col-6"><${Chart} title="Correlation" caption=${`${r.window ? r.window.effective : "—"} trading days · cool −1 · neutral 0 · warm +1`} option=${heatOpt} deps=${deps} height=${Math.max(260, corrY.length * 40 + 90)} table=${heatTable} /></div>
+    <div class="col-6"><${Chart} title="Correlation" caption=${`${r.window ? r.window.effective : "—"} trading days · scale centred on zero, extent set by the strongest pair · diagonal masked`} option=${heatOpt} deps=${deps} height=${Math.max(260, corrY.length * 40 + 90)} table=${heatTable} /></div>
     <div class="col-6"><${Chart} title="Drawdown" caption="Area below zero in the loss colour; benchmark as a quiet line" option=${ddOpt} deps=${deps} height=${220} table=${ddTable} /></div>
     <div class="col-6"><${Chart} title="Monthly returns" caption="Green = gain, red = loss, neutral at zero" option=${monthOpt} deps=${deps} height=${Math.max(120, years.length * 36 + 60)} table=${monthTable} /></div>
     <div class="col-6"><${Chart} title="Exposure by issuer" caption="One series → one colour, sorted, labels at the tip" option=${barOpt} deps=${deps} height=${Math.max(160, issuers.length * 32 + 48)} table=${barTable} /></div>

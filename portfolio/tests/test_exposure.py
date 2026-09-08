@@ -41,9 +41,22 @@ class TestExposureBy:
         labels = {s.key: s.label for s in exposure_by(VALUES, instruments, "asset_class")}
         assert labels == {"ETF": "ETF", "ETC": "ETC (commodity)"}
 
-    def test_blank_issuer_is_named_unknown(self, instruments):
+    def test_blank_issuer_is_backfilled_from_the_fund_name(self, instruments):
+        """B was constructed with issuer="", and is an iShares fund by name.
+
+        An issuer breakdown with a large Unknown slice is a data quality
+        report, not a portfolio insight, so the model derives what it can.
+        """
+        assert instruments[B].issuer == "iShares"
         slices = exposure_by(VALUES, instruments, "issuer")
-        assert [(s.key, s.value) for s in slices] == [("WisdomTree", 1700.0), (UNKNOWN, 800.0)]
+        assert [(s.key, s.value) for s in slices] == [("WisdomTree", 1700.0), ("iShares", 800.0)]
+
+    def test_unrecognised_issuer_is_still_named_unknown(self):
+        """The fallback must survive: derivation is a heuristic, not a promise."""
+        odd = Instrument(B, "Some Unbranded Tracker", AssetClass.ETF, "EUR", issuer="")
+        assert odd.issuer == ""
+        slices = exposure_by({B: 100.0}, {B: odd}, "issuer")
+        assert [(s.key, s.value) for s in slices] == [(UNKNOWN, 100.0)]
 
     def test_missing_instrument_is_unknown(self):
         slices = exposure_by({A: 100.0}, {}, "issuer")
@@ -59,8 +72,7 @@ class TestExposureBy:
 
     def test_sorted_by_value_then_key(self, instruments):
         slices = exposure_by({A: 500.0, B: 500.0, C: 500.0}, instruments, "issuer")
-        assert [s.key for s in slices] == [UNKNOWN, "WisdomTree"] or \
-            [s.key for s in slices] == ["WisdomTree", UNKNOWN]
+        assert [s.key for s in slices] == ["WisdomTree", "iShares"]
         assert slices[0].value >= slices[1].value
 
     def test_tie_broken_by_key(self, instruments):

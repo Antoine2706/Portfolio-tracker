@@ -10,7 +10,7 @@
    bars/cells, legend only for >= 2 series, text in text tokens, no dual axes.
    Every builder has a table twin helper (seriesTable, categoryTable, matrixTable). */
 
-import { useLayoutEffect, useEffect, useRef } from "/static/vendor/preact-htm.module.js";
+import { html, useLayoutEffect, useEffect, useRef } from "/static/vendor/preact-htm.module.js";
 import { tokens, alpha, inkOn } from "/static/lib/theme.js";
 import { useStore } from "/static/lib/store.js";
 import * as fmt from "/static/lib/format.js";
@@ -523,20 +523,28 @@ export function divergingBarOption({ names = [], values = [], extent, format = "
 }
 
 /**
- * heatmapOption({ xLabels, yLabels, matrix, min:-1, max:1, format, showValues })
+ * heatmapOption({ xLabels, yLabels, matrix, min:-1, max:1, format, showValues, mask })
  * Diverging cool ↔ neutral ↔ warm. Cells carry their own tooltip.
+ *
+ * `mask(x, y)` marks cells that are structurally uninformative — the diagonal
+ * of a correlation grid, where every value is 1.00 by definition. Masked cells
+ * are drawn flat and unlabelled in a second series that the visualMap does not
+ * touch, so they cannot be the brightest thing on screen while carrying no
+ * information, and they do not stretch the colour domain either.
  */
-export function heatmapOption({ xLabels = [], yLabels = [], matrix = [], min = -1, max = 1, format, showValues = true, theme, cellLabel, tipLabels } = {}) {
+export function heatmapOption({ xLabels = [], yLabels = [], matrix = [], min = -1, max = 1, format, showValues = true, theme, cellLabel, tipLabels, tipYLabels, mask } = {}) {
   const t = tokens(theme);
   const fmtV = format || ((v) => fmt.num(v, { decimals: 2 }));
-  // the column axis may carry short codes (tickers); the tooltip names in full
+  // the axes may carry short codes (tickers); the tooltip names in full
   const tipX = tipLabels || xLabels;
+  const tipY = tipYLabels || yLabels;
   const data = [];
+  const masked = [];
   for (let y = 0; y < yLabels.length; y++) {
     for (let x = 0; x < xLabels.length; x++) {
       const v = matrix[y] ? matrix[y][x] : null;
       if (v == null) continue;
-      data.push([x, y, v]);
+      (mask && mask(x, y) ? masked : data).push([x, y, v]);
     }
   }
   const mid = (min + max) / 2;
@@ -552,7 +560,7 @@ export function heatmapOption({ xLabels = [], yLabels = [], matrix = [], min = -
       ...tooltipBase(t),
       trigger: "item",
       position: "top",
-      formatter: (p) => tipElement(`${yLabels[p.value[1]]} × ${tipX[p.value[0]]}`, [{ color: colorAt(p.value[2]), kind: "swatch", value: fmtV(p.value[2]) }]),
+      formatter: (p) => tipElement(`${tipY[p.value[1]]} × ${tipX[p.value[0]]}`, [{ color: colorAt(p.value[2]), kind: "swatch", value: fmtV(p.value[2]) }]),
     },
     xAxis: {
       type: "category", data: xLabels, position: "top",
@@ -574,6 +582,8 @@ export function heatmapOption({ xLabels = [], yLabels = [], matrix = [], min = -
       left: "center", bottom: 0,
       itemWidth: 8, itemHeight: 120,
       calculable: false,
+      // series 0 only: the masked cells in series 1 keep their flat fill
+      seriesIndex: 0,
       inRange: { color: [t.divCool, t.divNeutral, t.divWarm] },
       text: [fmtV(max), fmtV(min)],
       textStyle: { color: t.text3, fontSize: 10 },
@@ -585,34 +595,63 @@ export function heatmapOption({ xLabels = [], yLabels = [], matrix = [], min = -
       itemStyle: { borderColor: t.chartSurface, borderWidth: 2, borderRadius: 3 },
       label: { show: showValues, fontSize: 11, formatter: (p) => (cellLabel ? cellLabel(p.value[2], p.value[0], p.value[1]) : fmtV(p.value[2])) },
       emphasis: { itemStyle: { borderColor: t.text, borderWidth: 1.5 } },
+    }, {
+      // Masked cells: present so the grid keeps its shape, recessive so they
+      // never compete with a real reading. Not covered by the visualMap.
+      type: "heatmap",
+      silent: true,
+      data: masked.map(([x, y, v]) => ({ value: [x, y, v] })),
+      itemStyle: { color: t.gridline, borderColor: t.chartSurface, borderWidth: 2, borderRadius: 3 },
+      label: { show: false },
     }],
   };
 }
 
 /**
- * treemapOption({ items: [{ name, value, sub }], currency, total, format })
- * Allocation by magnitude: one sequential hue, larger = darker (light) or
- * lighter (dark) — never categorical.
+ * treemapOption({ items: [{ name, value, sub, change }], currency, total, format, changeExtent })
+ *
+ * Area is value. That is the encoding a treemap exists for, and it is already
+ * unambiguous, so tinting the same variable a second time by lightness spends
+ * the colour channel on information the reader has. Where an item carries a
+ * signed `change`, colour is given to that instead: gain green, loss red,
+ * neutral at zero, on the app-wide polarity convention. Two channels, two
+ * variables — what each holding is worth, and what it did today.
+ *
+ * Without any `change` values it falls back to the single sequential hue,
+ * which is honest for a plain allocation picture: one variable, one channel,
+ * and lightness carrying no second claim.
  */
-export function treemapOption({ items = [], currency = "EUR", format, theme, total } = {}) {
+export function treemapOption({ items = [], currency = "EUR", format, theme, total, changeExtent, changeFormat } = {}) {
   const t = tokens(theme);
   const values = items.map((i) => i.value || 0);
   const sum = total ?? values.reduce((a, b) => a + b, 0);
   const maxV = Math.max(...values, 1e-9);
   const minV = Math.min(...values, maxV);
   const fmtV = format || ((v) => fmt.money(v, currency, { compact: true }));
+  const fmtC = changeFormat || ((v) => fmt.pct(v, { signed: true }));
   const steps = t.sequential;
   const stepFor = (v) => {
     // magnitude relative to the largest item, on a 7-step ramp (index 1..6 keeps extremes readable)
     const r = maxV === minV ? 1 : (v - minV) / (maxV - minV);
     return steps[Math.min(steps.length - 1, 1 + Math.round(r * (steps.length - 2)))];
   };
+  // Scaled to the day actually being shown, with a floor so a quiet session is
+  // not amplified into a dramatic one. A fixed extent would leave every tile
+  // neutral on most days; an unfloored one would make ±0.05% look like a rout.
+  const changes = items.map((i) => i.change).filter((v) => v != null);
+  const byChange = changes.length > 0;
+  const cMax = Math.max(0.005, changeExtent ?? Math.max(0, ...changes.map(Math.abs)));
+  const changeColor = (v) => {
+    if (v == null) return t.divNeutral;
+    return mixHex(t.divNeutral, v >= 0 ? t.good : t.bad, Math.min(1, Math.abs(v) / cMax));
+  };
   const data = items.map((i) => {
-    const color = i.color || stepFor(i.value || 0);
+    const color = i.color || (byChange ? changeColor(i.change) : stepFor(i.value || 0));
     return {
       name: i.name,
       value: i.value,
       sub: i.sub,
+      change: i.change,
       weight: sum ? (i.value || 0) / sum : null,
       itemStyle: { color, borderColor: t.chartSurface, borderWidth: 0, gapWidth: 2 },
       label: { color: inkOn(color) },
@@ -626,6 +665,9 @@ export function treemapOption({ items = [], currency = "EUR", format, theme, tot
       formatter: (p) => tipElement(p.name, [
         { name: "value", value: fmtV(p.value), color: p.color, kind: "swatch" },
         { name: "weight", value: fmt.pct(p.data.weight) },
+        ...(byChange && p.data.change != null
+          ? [{ name: "today", value: fmtC(p.data.change), polarity: fmt.polarityClass(p.data.change) }]
+          : []),
       ], p.data.sub),
     },
     series: [{
@@ -923,12 +965,21 @@ export function seriesTable({ dates = [], series = [], format = "num", currency 
   return { columns, rows };
 }
 
-/** categoryTable({ categories, values, format, label, valueLabel }) */
-export function categoryTable({ categories = [], values = [], format = "num", currency = "EUR", label = "Category", valueLabel = "Value", extra = [] } = {}) {
+/** categoryTable({ categories, values, format, label, valueLabel, valueClass })
+ *
+ * `valueClass(v)` returns a CSS class for the value cell, so a chart's table
+ * twin can carry the same colour encoding as its marks. A table that shows
+ * the same numbers in a different colour from the chart it toggles with is
+ * two claims about one quantity.
+ */
+export function categoryTable({ categories = [], values = [], format = "num", currency = "EUR", label = "Category", valueLabel = "Value", extra = [], valueClass } = {}) {
   const f = format === "pp" ? (v) => fmt.pp(v, { signed: true }) : valueFormatter(format, currency);
   const columns = [
     { key: "name", label, sortable: true },
-    { key: "value", label: valueLabel, align: "right", format: f, sortable: true },
+    valueClass
+      ? { key: "value", label: valueLabel, align: "right", sortable: true,
+          render: (row, v) => html`<span class=${valueClass(v)}>${f(v, row)}</span>` }
+      : { key: "value", label: valueLabel, align: "right", format: f, sortable: true },
     ...extra,
   ];
   const rows = categories.map((c, i) => ({ id: c, name: c, value: values[i] ?? null }));

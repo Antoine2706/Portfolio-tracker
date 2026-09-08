@@ -105,7 +105,7 @@ function valueOption({ dates, value, invested, benchmark, benchmarkName, flows, 
     let v = null, inv = null;
     for (const p of list) {
       if (p.seriesType === "scatter") {
-        for (const f of (p.data && p.data.flows) || []) foot.push(`${f.type} ${fmt.money(Math.abs(f.amount), currency)} · ${fmt.shortName(f.name, 28)}`);
+        for (const f of (p.data && p.data.flows) || []) foot.push(`${f.type} ${fmt.money(Math.abs(f.amount), currency)} · ${f.short_name || f.name}`);
         continue;
       }
       if (p.value == null) continue;
@@ -204,7 +204,13 @@ function ValueChart({ perf, benchmarks, selectedBenchmark, base }) {
 
 /* ---------------- allocation + exposure ---------------- */
 
-const EXPOSURE_DIMS = [["asset_class", "Asset class"], ["base_currency", "Base currency"], ["issuer", "Issuer"]];
+// Base currency only. Asset class and issuer were both largely legible from
+// the treemap beside them -- the tiles are already the holdings, and a reader
+// who knows the holdings knows their wrappers and providers. Currency is the
+// one of the three that the treemap genuinely cannot show, and a book split
+// 60/40 between euro and dollar assets is carrying a real exposure that
+// appears nowhere else on the page.
+const EXPOSURE_DIMS = [["base_currency", "Currency exposure"]];
 
 function ExposureBars({ exposure }) {
   const t = tokens();
@@ -231,13 +237,26 @@ function ExposureBars({ exposure }) {
 function AllocationCard({ holdings, exposure, base }) {
   const theme = useStore((s) => s.theme);
   const [view, setView] = useState("treemap");
-  const items = useMemo(() => holdings.filter((h) => h.value != null && h.value > 0).sort((a, b) => b.value - a.value)
-    .map((h) => ({ isin: h.isin, name: h.name, value: h.value, weight: h.weight, sub: [h.symbol, h.isin].filter(Boolean).join(" · ") })), [holdings]);
+  const items = useMemo(() => {
+    const rows = holdings.filter((h) => h.value != null && h.value > 0).sort((a, b) => b.value - a.value)
+      .map((h) => ({
+        isin: h.isin, name: h.short_name || h.name, full: h.name,
+        value: h.value, weight: h.weight, change: h.day_change_pct,
+        sub: [h.symbol, h.isin].filter(Boolean).join(" · "),
+      }));
+    // A tile is identified by its label when clicked, so two holdings that
+    // shorten to the same label would send both clicks to the first one.
+    const seen = new Map();
+    for (const r of rows) seen.set(r.name, (seen.get(r.name) || 0) + 1);
+    return rows.map((r) => (seen.get(r.name) > 1 && r.isin
+      ? { ...r, name: `${r.name} · ${r.isin.slice(-4)}` } : r));
+  }, [holdings]);
   const table = useMemo(() => ({
     columns: [
-      { key: "name", label: "Holding", render: (r, v) => html`<div class="truncate" style="max-width:220px" title=${v}>${fmt.shortName(v, 32)}<span class="cell-sub">${r.sub}</span></div>` },
+      { key: "name", label: "Holding", render: (r, v) => html`<div class="truncate" style="max-width:220px" title=${r.full}>${v}<span class="cell-sub">${r.sub}</span></div>` },
       { key: "value", label: "Value", format: "money", formatOptions: { currency: base }, numeric: true },
       { key: "weight", label: "Weight", format: "pct", numeric: true },
+      { key: "change", label: "Today", format: "pct", formatOptions: { signed: true }, numeric: true, polarity: true },
     ],
     rows: items.map((i) => ({ id: i.isin, ...i })),
   }), [items, base]);
@@ -249,13 +268,18 @@ function AllocationCard({ holdings, exposure, base }) {
   const build = () => {
     if (!items.length) return null;
     if (view === "bars") {
-      return barOption({ categories: items.map((i) => fmt.shortName(i.name, 30)), values: items.map((i) => i.weight ?? 0), horizontal: true, format: "pct", showLabels: true });
+      return barOption({ categories: items.map((i) => i.name), values: items.map((i) => i.weight ?? 0), horizontal: true, format: "pct", showLabels: true });
     }
     return treemapOption({ items, currency: base });
   };
   const height = view === "bars" ? Math.max(300, items.length * 26 + 40) : 300;
+  const priced = items.filter((i) => i.change != null).length;
   return html`<${Chart} title="Allocation" class="col-4"
-    caption=${view === "bars" ? "Weight of each holding in portfolio value. Click a bar for the holding." : "Area is value; the darker the tile, the larger the holding. Click a tile for the holding."}
+    caption=${view === "bars"
+      ? "Weight of each holding in portfolio value. Click a bar for the holding."
+      : (priced
+        ? "Area is value, colour is today's move — green up, red down, deepest at the day's largest mover. Click a tile for the holding."
+        : "Area is value. No day change is available yet, so colour carries nothing. Click a tile for the holding.")}
     height=${height} deps=${[items, view, theme]} table=${table} onEvents=${{ click: onClick }} empty="No priced holdings"
     actions=${html`<${Segmented} size="sm" ariaLabel="Allocation view" value=${view} onChange=${setView}
       options=${[{ value: "treemap", label: "Treemap" }, { value: "bars", label: "Bars" }]} />`}
@@ -336,7 +360,7 @@ function MoverRow({ h, base }) {
   const path = `/holdings/${h.isin}`;
   return html`<a class="ov-row" href=${href(path)} onClick=${go(path)} title=${h.name}>
     <span class="ov-row-text">
-      <span class="ov-row-name">${fmt.shortName(h.name, 30)}</span>
+      <span class="ov-row-name" title=${h.name}>${h.short_name || h.name}</span>
       <span class="ov-row-sub">${h.symbol || h.isin}${h.weight != null ? ` · ${fmt.pct(h.weight)} of value` : ""}</span>
     </span>
     <span class="ov-row-spark"><${Sparkline} values=${h.sparkline || []} area=${false} endDot=${false} /></span>
@@ -360,7 +384,7 @@ function WatchRow({ w }) {
   const path = `/holdings/${w.isin}`;
   return html`<a class="ov-row" href=${href(path)} onClick=${go(path)} title=${w.name}>
     <span class="ov-row-text">
-      <span class="ov-row-name">${fmt.shortName(w.name, 30)}</span>
+      <span class="ov-row-name" title=${w.name}>${w.short_name || w.name}</span>
       <span class="ov-row-sub">${w.symbol || w.isin}</span>
     </span>
     ${w.in_risk_model

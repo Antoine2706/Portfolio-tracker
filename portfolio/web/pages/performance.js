@@ -52,7 +52,7 @@ function perfAlerts(perf, holdings) {
   const out = [];
   for (const isin of perf.missing || []) {
     const h = (holdings || []).find((x) => x.isin === isin);
-    out.push({ code: `missing:${isin}`, severity: "SERIOUS", title: `${h ? fmt.shortName(h.name, 40) : isin}: no price history`, detail: "Excluded from every figure on this page.", isins: [isin], route: `#/instruments/${isin}` });
+    out.push({ code: `missing:${isin}`, severity: "SERIOUS", title: `${h ? (h.short_name || h.name) : isin}: no price history`, detail: "Excluded from every figure on this page.", isins: [isin], route: `#/instruments/${isin}` });
   }
   (perf.warnings || []).forEach((w, i) => out.push({ code: `warn:${i}`, severity: "WARNING", title: w, detail: "", isins: [], route: "" }));
   return out;
@@ -144,7 +144,7 @@ function DrawdownChart({ perf, benchName, s }) {
 
 function ContributionChart({ perf, base }) {
   const items = useMemo(() => [...(perf.contributions || [])].sort((a, b) => Math.abs(b.contribution) - Math.abs(a.contribution)), [perf]);
-  const names = items.map((c) => fmt.shortName(c.name, 26));
+  const names = items.map((c) => c.short_name || c.name);
   const values = items.map((c) => c.contribution);
   const table = useMemo(() => {
     const t = categoryTable({ categories: names, values, format: "pct-signed", label: "Holding", valueLabel: "Contribution", extra: [{ key: "pnl", label: "P&L", numeric: true, render: colorCell("money-signed", { currency: base }) }] });
@@ -234,7 +234,7 @@ function PerHoldingChart({ perf, holdings, base }) {
       const h = (holdings || []).find((x) => x.isin === isin);
       const name = (h && h.name) || names[isin] || isin;
       const last = [...values].reverse().find((v) => v != null) ?? 0;
-      return { isin, name: fmt.shortName(name, 22), values, value: last };
+      return { isin, name, values, value: last };
     });
     const folded = foldOther(entries.map((e) => ({ ...e })), { limit: 8 });
     const series = folded.map((e) => (e.isOther

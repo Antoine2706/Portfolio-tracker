@@ -115,6 +115,17 @@ def patch(isin: str, req: S.InstrumentPatch,
             if not req.name.strip():
                 raise ValidationError("an instrument needs a name")
             inst.override("name", req.name.strip())
+        if req.short_name is not None:
+            short = req.short_name.strip()
+            if short:
+                inst.override("short_name", short)
+            else:
+                # Clearing returns the label to its derived form. Storing a
+                # blank as a manual override would pin the instrument to
+                # having no label at all, which is never what clearing a
+                # field means.
+                inst.short_name = ""
+                inst.manual_overrides.discard("short_name")
         if req.issuer is not None:
             inst.override("issuer", req.issuer.strip())
         if req.asset_class is not None:

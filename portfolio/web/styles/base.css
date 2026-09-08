@@ -98,6 +98,18 @@ code, kbd, pre, .mono { font-family: var(--font-mono); font-size: .92em; }
 .num, .tabular { font-variant-numeric: tabular-nums; }
 .pos { color: var(--color-good); }
 .neg { color: var(--color-bad); }
+
+/* Divergence: risk share minus capital share. Bound to the SAME diverging
+   tokens the divergence chart paints its bars with, so a holding cannot read
+   red in one and grey in the other on the same screen. This is a different
+   axis from .pos/.neg -- more risk than capital is not a loss, it is an
+   imbalance -- which is why it gets its own pair rather than reusing the
+   gain/loss colours. Zero takes the faintest ink rather than --div-neutral:
+   that token is a bar fill and would be invisible as text, and "nothing to
+   see here" is the meaning it has to carry in both media. */
+.div-warm { color: var(--div-warm); }
+.div-cool { color: var(--div-cool); }
+.div-zero { color: var(--color-text-3); }
 .muted { color: var(--color-text-2); }
 .faint { color: var(--color-text-3); }
 .small { font-size: var(--fs-sm); }

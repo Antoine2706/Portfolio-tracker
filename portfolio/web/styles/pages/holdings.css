@@ -77,8 +77,9 @@
 .hd-price-stale .badge { height: 16px; padding: 0 5px; }
 .hd-cell-two { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
 .hd-cell-two .cell-sub { margin-top: 0; }
-.hd-div-warm { color: var(--color-bad); }
-.hd-div-cool { color: var(--color-text-2); }
+/* Divergence ink lives in base.css as .div-warm / .div-cool / .div-zero,
+   bound to the chart's own tokens. It was here, bound to the status colours,
+   which is how the table came to disagree with the chart beside it. */
 
 /* footer */
 .hd-tablebox .table tfoot td { color: var(--color-text); }

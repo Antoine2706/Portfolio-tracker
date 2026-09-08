@@ -24,6 +24,7 @@ import pandas as pd
 from ..core.alerts import build_alerts
 from ..core.exposure import exposures
 from ..core.models import Amendment, Instrument, Transaction
+from ..core.naming import short_names as derive_short_names
 from ..core.money import BASE_CURRENCY, FxRates, MissingRate, convert
 from ..core.overview import day_change, position_totals, sparkline
 from ..core.performance import (ValueHistory, drawdown_series, holding_contributions,
@@ -77,7 +78,8 @@ class Analysis:
     twr: pd.Series | None
     benchmark: Benchmark
     lookback: int
-    names: dict[str, str]
+    names: dict[str, str]                      # registered, for tooltips
+    short_names: dict[str, str]                # label form, for axes and cells
 
 
 # --------------------------------------------------------------------------
@@ -161,7 +163,9 @@ def _money(amount: Decimal, currency: str):
 def instrument_out(inst: Instrument, transactions: list[Transaction]) -> S.InstrumentOut:
     n = sum(1 for t in transactions if t.isin == inst.isin)
     return S.InstrumentOut(
-        isin=inst.isin, name=inst.name, issuer=inst.issuer,
+        isin=inst.isin, name=inst.name, short_name=inst.display_name,
+        short_name_is_manual=inst.is_overridden("short_name"),
+        issuer=inst.issuer,
         asset_class=inst.asset_class.value, base_currency=inst.base_currency,
         primary_symbol=inst.primary_symbol, exchange=inst.exchange,
         quote_currency=inst.quote_currency, provider_symbols=dict(inst.provider_symbols),
@@ -170,11 +174,14 @@ def instrument_out(inst: Instrument, transactions: list[Transaction]) -> S.Instr
 
 
 def transaction_out(t: Transaction, names: dict[str, str],
-                    voided_by: dict[str, Amendment] | None = None) -> S.TransactionOut:
+                    voided_by: dict[str, Amendment] | None = None,
+                    short_names: dict[str, str] | None = None) -> S.TransactionOut:
     amendment = (voided_by or {}).get(t.id)
     return S.TransactionOut(
         id=t.id, date=t.date.isoformat(), isin=t.isin,
-        name=names.get(t.isin, t.isin), type=t.type.value,
+        name=names.get(t.isin, t.isin),
+        short_name=(short_names or {}).get(t.isin) or names.get(t.isin, t.isin),
+        type=t.type.value,
         quantity=float(t.quantity), price_per_unit=float(t.price_per_unit),
         currency=t.currency, fees=float(t.fees), gross=float(t.gross.amount),
         net=float(t.cash_flow().amount), note=t.note,
@@ -199,6 +206,10 @@ def build(*, instruments: dict[str, Instrument], all_instruments: dict[str, Inst
     base = config.base_currency
     today = dt.date.today()
     names = {isin: inst.name for isin, inst in all_instruments.items()}
+    # The label form, carried beside the legal form rather than instead of it.
+    # A chart axis and a tooltip want different strings, and deciding which is
+    # which in the browser would put that judgement somewhere untested.
+    short_names = derive_short_names(all_instruments)
     fx = market.fx
 
     # ---- positions and the holdings table --------------------------------
@@ -216,11 +227,12 @@ def build(*, instruments: dict[str, Instrument], all_instruments: dict[str, Inst
                 prices_base[row.isin] = unit
 
     # ---- risk --------------------------------------------------------------
-    risk_state = _risk(held, market, instruments, names, benchmark, lookback, values)
+    risk_state = _risk(held, market, instruments, names, short_names, benchmark,
+                       lookback, values)
 
     # ---- performance -----------------------------------------------------
     perf_state = _performance(transactions, instruments, market, benchmark, names,
-                              positions, base, fx)
+                              short_names, positions, base, fx)
 
     # ---- holdings rows ---------------------------------------------------
     day_changes = {}
@@ -244,6 +256,7 @@ def build(*, instruments: dict[str, Instrument], all_instruments: dict[str, Inst
                                    today, fx, base)
         holdings.append(S.Holding(
             isin=row.isin, name=row.name,
+            short_name=short_names.get(row.isin) or row.name,
             symbol=symbol_for(inst) if inst else None,
             asset_class=inst.asset_class.value if inst else "OTHER",
             issuer=inst.issuer if inst else "", exchange=inst.exchange if inst else "",
@@ -279,7 +292,8 @@ def build(*, instruments: dict[str, Instrument], all_instruments: dict[str, Inst
         if hist is not None and len(hist) > MIN_OBSERVATIONS:
             vol = float(annualise_volatility(float(simple_returns(hist).std(ddof=1))))
         watchlist.append(S.WatchlistItem(
-            isin=isin, name=inst.name, symbol=symbol_for(inst),
+            isin=isin, name=inst.name, short_name=inst.display_name,
+            symbol=symbol_for(inst),
             price=_f(pos.quote.price.amount) if pos.quote else None,
             price_currency=pos.quote.price.currency if pos.quote else None,
             day_change_pct=dc.pct if dc else None, volatility=vol,
@@ -351,7 +365,8 @@ def build(*, instruments: dict[str, Instrument], all_instruments: dict[str, Inst
         corr=risk_state.corr, decomposition=risk_state.decomposition,
         model_weights=risk_state.weights, alignment=risk_state.alignment,
         portfolio_returns=risk_state.portfolio_returns, history=perf_state.history,
-        twr=perf_state.twr, benchmark=benchmark, lookback=lookback, names=names)
+        twr=perf_state.twr, benchmark=benchmark, lookback=lookback, names=names,
+        short_names=short_names)
 
 
 # --------------------------------------------------------------------------
@@ -390,6 +405,7 @@ def _unavailable(reason: str, actual: int) -> S.Risk:
 
 def _risk(held: dict[str, Decimal], market: MarketSnapshot,
           instruments: dict[str, Instrument], names: dict[str, str],
+          short_names: dict[str, str],
           benchmark: Benchmark, lookback: int, values: dict[str, float]) -> _RiskState:
     if len(held) < 2:
         return _RiskState(_unavailable(
@@ -456,7 +472,9 @@ def _risk(held: dict[str, Decimal], market: MarketSnapshot,
     marginal = {isin: float(annualise_volatility(float(mc)))
                 for isin, mc in zip(decomposition.instruments, decomposition.marginal)}
     total_value = sum(values.get(i, 0.0) for i in used)
-    div_rows = [S.DivergenceRow(isin=r.isin, name=r.name, weight=r.weight,
+    div_rows = [S.DivergenceRow(isin=r.isin, name=r.name,
+                                short_name=r.display,
+                                weight=r.weight,
                                 risk_share=r.risk_share, divergence=r.divergence,
                                 marginal=marginal.get(r.isin, 0.0), sentence=r.sentence())
                 for r in rows]
@@ -502,18 +520,24 @@ def _risk(held: dict[str, Decimal], market: MarketSnapshot,
         max_drawdown=dd.max_drawdown, current_drawdown=dd.current_drawdown,
         beta=beta_value, beta_benchmark=benchmark.label if beta_value is not None else None,
         standalone=[S.Standalone(isin=str(isin), name=names.get(str(isin), str(isin)),
+                                 short_name=short_names.get(str(isin)) or str(isin),
                                  volatility=float(vol),
                                  multiple=float(vol) / BROAD_EUROPEAN_EQUITY_VOLATILITY,
                                  weight=w.get(str(isin), 0.0))
                     for isin, vol in standalone.items()],
         correlation=S.Correlation(isins=[str(c) for c in corr.columns],
                                   names=[names.get(str(c), str(c)) for c in corr.columns],
+                                  short_names=[short_names.get(str(c)) or str(c)
+                                               for c in corr.columns],
                                   matrix=[[float(x) for x in row] for row in corr.to_numpy()]),
         pairs=[S.Pair(a=p.a, b=p.b, a_name=names.get(p.a, p.a), b_name=names.get(p.b, p.b),
+                      a_short=short_names.get(p.a) or p.a,
+                      b_short=short_names.get(p.b) or p.b,
                       correlation=p.correlation, sentence=sentence)
                for p, sentence in zip(pairs, sentences)],
         clusters=[S.Cluster(members=list(c.members),
                             names=[names.get(m, m) for m in c.members],
+                            short_names=[short_names.get(m) or m for m in c.members],
                             mean_correlation=c.mean_correlation,
                             min_correlation=c.min_correlation,
                             combined_weight=c.combined_weight) for c in clusters],
@@ -553,6 +577,7 @@ def _empty_performance(reason: str) -> S.Performance:
 
 def _performance(transactions: list[Transaction], instruments: dict[str, Instrument],
                  market: MarketSnapshot, benchmark: Benchmark, names: dict[str, str],
+                 short_names: dict[str, str],
                  positions: dict[str, Position], base: str,
                  fx: FxRates | None) -> _PerfState:
     if not transactions:
@@ -620,6 +645,7 @@ def _performance(transactions: list[Transaction], instruments: dict[str, Instrum
         yearly_rows.append(S.YearlyReturn(year=year, ret=_f(ret), benchmark_ret=b))
 
     contributions = [S.Contribution(isin=c.isin, name=names.get(c.isin, c.isin),
+                                    short_name=short_names.get(c.isin) or c.isin,
                                     pnl=c.pnl, contribution=c.contribution)
                      for c in holding_contributions(history)]
 
@@ -629,7 +655,8 @@ def _performance(transactions: list[Transaction], instruments: dict[str, Instrum
         if amount is None:
             continue
         flows.append(S.Flow(date=t.date.isoformat(), amount=amount, type=t.type.value,
-                            isin=t.isin, name=names.get(t.isin, t.isin)))
+                            isin=t.isin, name=names.get(t.isin, t.isin),
+                            short_name=short_names.get(t.isin) or t.isin))
 
     rolling_vol = rolling_volatility(twr, window=ROLLING_WINDOW)
     rolling_b = (rolling_beta(twr, bench_daily, window=ROLLING_WINDOW)
@@ -665,6 +692,8 @@ def _performance(transactions: list[Transaction], instruments: dict[str, Instrum
         per_holding_value={str(c): _values(history.per_holding[c], dates)
                            for c in history.per_holding.columns},
         holding_names={str(c): names.get(str(c), str(c)) for c in history.per_holding.columns},
+        holding_short_names={str(c): short_names.get(str(c)) or str(c)
+                             for c in history.per_holding.columns},
         missing=[names.get(m, m) for m in history.missing],
         warnings=list(history.warnings))
     return _PerfState(out=out, history=history, twr=twr)
@@ -724,8 +753,10 @@ def holding_detail(analysis: Analysis, isin: str,
             rho = float(analysis.corr.loc[isin, other])
             correlations.append(S.Pair(
                 a=isin, b=str(other), a_name=analysis.names.get(isin, isin),
-                b_name=analysis.names.get(str(other), str(other)), correlation=rho,
-                sentence=""))
+                b_name=analysis.names.get(str(other), str(other)),
+                a_short=analysis.short_names.get(isin) or isin,
+                b_short=analysis.short_names.get(str(other)) or str(other),
+                correlation=rho, sentence=""))
         correlations.sort(key=lambda p: p.correlation, reverse=True)
 
     voided_by = {a.target_id: a for a in amendments}
@@ -736,6 +767,6 @@ def holding_detail(analysis: Analysis, isin: str,
     return S.HoldingDetail(
         holding=holding, instrument=instrument_out(inst, analysis.transactions),
         prices=prices, drawdown=dd, markers=markers,
-        transactions=[transaction_out(t, analysis.names, voided_by)
+        transactions=[transaction_out(t, analysis.names, voided_by, analysis.short_names)
                       for t in sorted(own, key=lambda x: (x.date, x.id), reverse=True)],
         stats=stats, correlations=correlations)

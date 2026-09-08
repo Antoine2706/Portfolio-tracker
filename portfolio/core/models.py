@@ -35,6 +35,7 @@ import uuid
 from decimal import Decimal
 
 from .money import BASE_CURRENCY, Money, normalise_currency
+from .naming import derive_issuer, shorten_name
 
 __all__ = [
     "AssetClass", "TransactionType", "AmendmentAction", "Transaction",
@@ -260,6 +261,7 @@ class Instrument:
     asset_class: AssetClass = AssetClass.ETF
     base_currency: str = BASE_CURRENCY
     issuer: str = ""
+    short_name: str = ""                     # blank means "derive from name"
     primary_symbol: str = ""
     exchange: str = ""                       # MIC of the primary listing
     quote_currency: str = ""                 # currency of the primary listing
@@ -280,6 +282,27 @@ class Instrument:
             self.quote_currency, _ = normalise_currency(self.quote_currency)
         if not self.name.strip():
             raise ValidationError("an instrument needs a name")
+        if not self.issuer.strip():
+            # An issuer breakdown reading "Unknown 12%" is a data quality
+            # report wearing the costume of a portfolio insight. Almost every
+            # fund name begins with its provider, so derive rather than
+            # display the gap. Not recorded as a manual override: a later
+            # resolution is welcome to replace it with the registered name.
+            derived = derive_issuer(self.name)
+            if not derived and self.asset_class is AssetClass.EQUITY:
+                # A single stock is its own issuer, minus the legal form.
+                derived = shorten_name(self.name, limit=64)
+            self.issuer = derived
+
+    @property
+    def display_name(self) -> str:
+        """The name to put on a chart axis or in a dense table.
+
+        Derived when `short_name` is blank rather than stored eagerly, so that
+        editing the legal name updates the label too -- unless the user has
+        pinned a short name of their own, in which case theirs stands.
+        """
+        return self.short_name.strip() or shorten_name(self.name, self.issuer)
 
     # -- manual override bookkeeping ---------------------------------------
 

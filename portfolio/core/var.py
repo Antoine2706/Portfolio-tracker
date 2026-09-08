@@ -51,7 +51,7 @@ from .risk import portfolio_return_series
 __all__ = [
     "VarEstimate", "WorstPeriod", "Scenario",
     "historical_var", "parametric_var", "cornish_fisher_var", "var_report",
-    "worst_periods", "stress_scenarios", "norm_ppf", "norm_pdf",
+    "worst_periods", "stress_scenarios", "norm_ppf", "norm_pdf", "norm_cdf",
     "cornish_fisher_quantile", "sample_skew_kurtosis",
 ]
 

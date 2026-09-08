@@ -83,7 +83,7 @@ const strike = (row, content) => (row.voided ? html`<span class="tx-strike" titl
 function columns(base, onVoid) {
   return [
     { key: "date", label: "Date", width: 104, render: (r, v) => strike(r, fmt.date(v)) },
-    { key: "name", label: "Instrument", primary: true, render: (r, v) => html`<div class="truncate" style="max-width:240px" title=${v}>${strike(r, fmt.shortName(v, 34))}<span class="cell-sub">${r.isin}</span></div>` },
+    { key: "name", label: "Instrument", primary: true, render: (r, v) => html`<div class="truncate" style="max-width:240px" title=${v}>${strike(r, r.short_name || v)}<span class="cell-sub">${r.isin}</span></div>` },
     { key: "type", label: "Type", render: (r, v) => html`<span class="row" style="gap:4px"><${TxTypeBadge} type=${v} />${r.voided ? html`<${Badge} kind="neutral" outline title=${r.void_reason || "Voided"}>void<//>` : null}</span>` },
     { key: "quantity", label: "Qty", numeric: true, render: (r, v) => strike(r, fmt.qty(v)) },
     { key: "price_per_unit", label: "Price", numeric: true, render: (r, v) => strike(r, fmt.money(v, r.currency)) },

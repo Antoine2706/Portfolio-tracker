@@ -53,10 +53,10 @@ function riskAlerts(risk) {
   }
   for (const c of risk.clusters || []) {
     if (c.members.length < 2) continue;
-    out.push({ code: `cluster:${c.members.join(",")}`, severity: c.members.length >= 3 ? "SERIOUS" : "WARNING", title: `${c.members.length} holdings move as one bet: ${c.names.map((n) => fmt.shortName(n, 24)).join(", ")}`, detail: `Mean correlation ${fmt.num(c.mean_correlation)}, lowest pair ${fmt.num(c.min_correlation)}${c.combined_weight != null ? `, ${fmt.pct(c.combined_weight)} of capital between them` : ""}. Pairwise comparison cannot see a group; this is why effective holdings leads.`, isins: c.members, route: "#/simulator" });
+    out.push({ code: `cluster:${c.members.join(",")}`, severity: c.members.length >= 3 ? "SERIOUS" : "WARNING", title: `${c.members.length} holdings move as one bet: ${(c.short_names || c.names).join(", ")}`, detail: `Mean correlation ${fmt.num(c.mean_correlation)}, lowest pair ${fmt.num(c.min_correlation)}${c.combined_weight != null ? `, ${fmt.pct(c.combined_weight)} of capital between them` : ""}. Pairwise comparison cannot see a group; this is why effective holdings leads.`, isins: c.members, route: "#/simulator" });
   }
   for (const p of risk.pairs || []) {
-    out.push({ code: `pair:${p.a}:${p.b}`, severity: "WARNING", title: `${fmt.shortName(p.a_name, 28)} and ${fmt.shortName(p.b_name, 28)} move together ${fmt.pct(p.correlation, { decimals: 0 })} of the time`, detail: p.sentence, isins: [p.a, p.b], route: `#/holdings/${p.a}` });
+    out.push({ code: `pair:${p.a}:${p.b}`, severity: "WARNING", title: `${p.a_short || p.a_name} and ${p.b_short || p.b_name} move together ${fmt.pct(p.correlation, { decimals: 0 })} of the time`, detail: p.sentence, isins: [p.a, p.b], route: `#/holdings/${p.a}` });
   }
   return out;
 }
@@ -99,8 +99,8 @@ function Headline({ risk }) {
       </div>
       ${head ? html`<div class="risk-headline-metric">
         <span class="caps">Largest gap between capital and risk</span>
-        <span class=${["risk-headline-value", head.divergence > 0 ? "hd-div-warm" : "hd-div-cool"].join(" ")}>${fmt.pp(head.divergence)}</span>
-        <span class="risk-headline-sub">${fmt.shortName(head.name, 40)} · ${fmt.pct(head.weight)} of the money, ${fmt.pct(head.risk_share)} of the risk</span>
+        <span class=${["risk-headline-value", fmt.divergenceClass(head.divergence)].join(" ")}>${fmt.pp(head.divergence)}</span>
+        <span class="risk-headline-sub" title=${head.name}>${head.short_name || head.name} · ${fmt.pct(head.weight)} of the money, ${fmt.pct(head.risk_share)} of the risk</span>
       </div>` : null}
     </div>
   <//>`;
@@ -111,15 +111,18 @@ function Headline({ risk }) {
 function DivergenceChart({ risk }) {
   const theme = useStore((s) => s.theme);
   const rows = risk.divergence || [];
-  const names = rows.map((r) => fmt.shortName(r.name, 30));
+  const names = rows.map((r) => r.short_name || r.name);
   const values = rows.map((r) => r.divergence);
   const table = useMemo(() => {
-    const t = categoryTable({ categories: names, values, format: "pp", label: "Holding", valueLabel: "Divergence" });
+    // valueClass makes the chart's built-in table twin carry the same ink as
+    // the bars. Without it this was a third rendering of the same quantity,
+    // uncoloured, one keystroke away from the other two.
+    const t = categoryTable({ categories: names, values, format: "pp", label: "Holding", valueLabel: "Divergence", valueClass: fmt.divergenceClass });
     t.rows.forEach((r, i) => { r.id = rows[i].isin; });
     return t;
   }, [rows]);
   return html`<${Chart} title="Capital share against risk share"
-    caption="How far each holding's share of the risk sits from its share of the money. Warm bars carry more risk than capital; bars at zero are behaving as expected and have earned no attention."
+    caption="How far each holding's share of the risk sits from its share of the money. Warm bars carry more risk than capital, cool bars less; bars at zero are behaving as expected and have earned no attention."
     height=${Math.max(200, rows.length * 34 + 40)} deps=${[rows, theme]} table=${table} empty="No decomposition"
     onEvents=${{ click: (p) => { const r = rows[p.dataIndex]; if (r) navigate(`/holdings/${r.isin}`); } }}
     buildOption=${() => (rows.length ? divergingBarOption({ names, values, sentences: rows.map((r) => r.sentence) }) : null)} />`;
@@ -128,11 +131,14 @@ function DivergenceChart({ risk }) {
 function DivergenceTable({ risk }) {
   const rows = useMemo(() => (risk.divergence || []).map((r) => ({ ...r, id: r.isin })), [risk]);
   const columns = useMemo(() => [
-    { key: "name", label: "Instrument", primary: true, render: (r, v) => html`<div class="truncate" style="max-width:240px" title=${v}>${v}<span class="cell-sub">${r.isin}</span></div>` },
+    // The label form, with the registered name on the tooltip. This column
+    // was the worst offender: "iShares MSCI Europe Industrials Sector ..."
+    // spent its width on the four characters every row shared.
+    { key: "name", label: "Instrument", primary: true, render: (r, v) => html`<div class="truncate" style="max-width:240px" title=${v}>${r.short_name || v}<span class="cell-sub">${r.isin}</span></div>` },
     { key: "weight", label: "Capital weight", format: "pct", numeric: true, title: "Share of portfolio value" },
     { key: "risk_share", label: "Risk share", format: "pct", numeric: true, title: "Share of portfolio volatility this holding contributes" },
     { key: "divergence", label: "Divergence", numeric: true, title: "Risk share minus weight, in percentage points",
-      render: (r, v) => html`<span class=${v > 0.0005 ? "hd-div-warm" : "hd-div-cool"}>${fmt.pp(v)}</span>` },
+      render: (r, v) => html`<span class=${fmt.divergenceClass(v)}>${fmt.pp(v)}</span>` },
     { key: "marginal", label: "Marginal", format: "pct", numeric: true, title: "How much annualised portfolio volatility moves per extra unit of weight here (MCTR)" },
   ], []);
   return html`<${Card} title="Risk contribution" caption="Sorted by the size of the gap. Marginal is what one more euro here would do to portfolio volatility — the number the simulator works from." flush>
@@ -169,7 +175,7 @@ function Metrics({ risk }) {
 function StandaloneChart({ risk }) {
   const theme = useStore((s) => s.theme);
   const rows = risk.standalone || [];
-  const names = rows.map((r) => fmt.shortName(r.name, 28));
+  const names = rows.map((r) => r.short_name || r.name);
   const values = rows.map((r) => r.volatility);
   const table = useMemo(() => {
     const t = categoryTable({ categories: names, values, format: "pct", label: "Holding", valueLabel: "Annualised volatility",
@@ -193,29 +199,60 @@ function StandaloneChart({ risk }) {
 function CorrelationCard({ risk, symbols }) {
   const theme = useStore((s) => s.theme);
   const corr = risk.correlation;
-  const labels = corr ? corr.names.map((n) => fmt.shortName(n, 22)) : [];
-  // Columns carry the ticker (venue suffix dropped): six 44px cells cannot
-  // hold six names, and the matrix is symmetric so the rows name them anyway.
+  const labels = corr ? corr.names : [];
+  // Tickers on BOTH axes. A correlation matrix is symmetric, so labelling the
+  // rows one way and the columns another invites the reader to look for a
+  // difference that is not there; and a 44px cell cannot hold a fund name in
+  // either direction. Full names live in the tooltip and in the table twin.
   const codes = corr ? corr.isins.map((isin, i) => {
     const s = symbols && symbols[isin];
-    return s ? String(s).split(".")[0] : fmt.shortName(corr.names[i], 8);
+    return s ? String(s).split(".")[0] : (corr.short_names || corr.names)[i];
   }) : [];
-  const table = useMemo(() => (corr ? matrixTable({ xLabels: labels, yLabels: labels, matrix: corr.matrix, cornerLabel: "" }) : null), [corr]);
+
+  // The colour domain is symmetric about zero but scaled to THIS grid, not to
+  // the theoretical [-1, 1]. Real holdings sit in a band -- 0.15 to 0.81 is
+  // typical for a diversified book -- and a scale stretched to the full
+  // theoretical range spends almost all of its contrast on values that never
+  // occur, leaving every real cell the same muted colour. Zero stays at the
+  // neutral midpoint, so negative correlation still reads cool and its
+  // absence stays visible; only the extent moves.
+  //
+  // The diagonal is excluded from the extent as well as from the display: it
+  // is 1.00 by definition, and letting it set the domain would restore
+  // exactly the flattening this is fixing.
+  const extent = useMemo(() => {
+    if (!corr) return 1;
+    let m = 0;
+    for (let y = 0; y < corr.matrix.length; y++) {
+      for (let x = 0; x < corr.matrix[y].length; x++) {
+        if (x === y) continue;
+        const v = corr.matrix[y][x];
+        if (v != null) m = Math.max(m, Math.abs(v));
+      }
+    }
+    // A floor stops a grid of near-zero correlations from being amplified
+    // into a dramatic-looking picture of nothing.
+    return Math.max(0.1, m);
+  }, [corr]);
+
+  // The table twin has room the grid does not, so it names the rows properly
+  // and keeps the tickers only where the columns are narrow.
+  const table = useMemo(() => (corr ? matrixTable({ xLabels: codes, yLabels: (corr.short_names || corr.names), matrix: corr.matrix, cornerLabel: "" }) : null), [corr]);
   const pairs = risk.pairs || [];
   const clusters = (risk.clusters || []).filter((c) => c.members.length >= 2);
   const footer = html`<div class="risk-corr-foot">
     ${clusters.length ? clusters.map((c) => html`<div key=${c.members.join()} class="risk-cluster">
       <span class="caps">Cluster</span>
-      ${c.names.map((n, i) => html`<a key=${c.members[i]} class="risk-chip" href=${href(`/holdings/${c.members[i]}`)} onClick=${go(`/holdings/${c.members[i]}`)} title=${n}>${fmt.shortName(n, 26)}</a>`)}
+      ${c.names.map((n, i) => html`<a key=${c.members[i]} class="risk-chip" href=${href(`/holdings/${c.members[i]}`)} onClick=${go(`/holdings/${c.members[i]}`)} title=${n}>${(c.short_names || c.names)[i]}</a>`)}
       <span>mean ρ ${fmt.num(c.mean_correlation)}${c.combined_weight != null ? ` · ${fmt.pct(c.combined_weight)} of capital` : ""}</span>
     </div>`) : null}
     ${!pairs.length && !clusters.length ? html`<div class="risk-quiet"><${Icon} name="checkCircle" size=${14} />No pair above ${fmt.num(risk.threshold, { decimals: 2 })}. Nothing here is two tickers on one bet.</div>` : null}
     ${pairs.length && !clusters.length ? html`<div class="risk-quiet"><${Icon} name="alertTriangle" size=${14} />${fmt.count(pairs.length, "pair")} above ${fmt.num(risk.threshold, { decimals: 2 })} — listed under the notice at the top of the page.</div>` : null}
   </div>`;
   return html`<${Chart} class="col-6" title="Correlation"
-    caption=${`Pairwise, over the window. The scale stays centred on zero even when every value sits on the warm side: nothing on the cool side means nothing here hedges anything else, and that is itself the finding. Pairs above ${fmt.num(risk.threshold, { decimals: 2 })} are flagged.`}
-    height=${corr ? Math.max(260, corr.isins.length * 34 + 90) : 260} deps=${[corr, theme]} table=${table} empty="No correlation matrix" footer=${footer}
-    buildOption=${() => (corr ? heatmapOption({ xLabels: codes, tipLabels: labels, yLabels: labels, matrix: corr.matrix, min: -1, max: 1, showValues: corr.isins.length <= 10 }) : null)} />`;
+    caption=${`Pairwise, over the window. The scale stays centred on zero — nothing on the cool side means nothing here hedges anything else, and that is itself the finding — but it runs to ±${fmt.num(extent, { decimals: 2 })}, the strongest pair in this grid, so the values you actually have get the full range of colour. The diagonal is greyed: it is 1.00 by definition and says nothing. Pairs above ${fmt.num(risk.threshold, { decimals: 2 })} are flagged.`}
+    height=${corr ? Math.max(260, corr.isins.length * 34 + 90) : 260} deps=${[corr, theme, extent]} table=${table} empty="No correlation matrix" footer=${footer}
+    buildOption=${() => (corr ? heatmapOption({ xLabels: codes, yLabels: codes, tipLabels: labels, tipYLabels: labels, matrix: corr.matrix, min: -extent, max: extent, mask: (x, y) => x === y, showValues: corr.isins.length <= 10 }) : null)} />`;
 }
 
 /* ---------------- value at risk ---------------- */

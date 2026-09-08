@@ -30,6 +30,7 @@ import dataclasses
 import enum
 
 from .models import Instrument
+from .naming import short_names
 from .report import HoldingsTable
 from .returns import AlignmentReport
 from .risk import ConcentrationStats, CorrelationCluster, CorrelationPair
@@ -78,8 +79,16 @@ class Alert:
 
 
 def _name(instruments: dict[str, Instrument], isin: str) -> str:
-    inst = instruments.get(isin) if instruments else None
-    return inst.name if inst is not None else isin
+    """The short display name. An alert title is a label, not a record.
+
+    Derived across the whole universe rather than per instrument, so two funds
+    tracking the same thing from different houses never both come back as the
+    same string -- an alert naming two holdings identically is worse than one
+    that spells them out in full.
+    """
+    if not instruments:
+        return isin
+    return short_names(instruments).get(isin, isin)
 
 
 def _mentions_stale_price(warning: str) -> bool:
@@ -135,12 +144,14 @@ def build_alerts(holdings: HoldingsTable, instruments, *,
         stale = [w for w in row.warnings if _mentions_stale_price(w)]
         if stale:
             out.append(Alert("stale_price", Severity.WARNING,
-                             f"Price for {row.name} is not current", " ".join(stale),
+                             f"Price for {_name(instruments, row.isin)} is not "
+                             f"current", " ".join(stale),
                              (row.isin,), ROUTES["holdings"]))
         if row.weight is not None and float(row.weight) > max_weight:
             out.append(Alert(
                 "concentrated_holding", Severity.WARNING,
-                f"{row.name} is {float(row.weight):.0%} of the portfolio",
+                f"{_name(instruments, row.isin)} is {float(row.weight):.0%} "
+                f"of the portfolio",
                 f"Above the {max_weight:.0%} limit for a single holding. Whatever happens "
                 f"to this one position happens to the portfolio.",
                 (row.isin,), ROUTES["risk"]))
@@ -175,7 +186,7 @@ def build_alerts(holdings: HoldingsTable, instruments, *,
         out.append(Alert(
             "correlated_pair", Severity.WARNING,
             f"{_name(instruments, pair.a)} and {_name(instruments, pair.b)} move together",
-            pair.sentence({i: inst.name for i, inst in instruments.items()}),
+            pair.sentence(short_names(instruments)),
             (pair.a, pair.b), ROUTES["risk"]))
 
     if alignment is not None:

@@ -76,7 +76,8 @@ class Totals(BaseModel):
 
 class Holding(BaseModel):
     isin: str
-    name: str
+    name: str                           # the registered name, for detail and tooltips
+    short_name: str                     # the label form, for charts and dense tables
     symbol: str | None
     asset_class: str
     issuer: str
@@ -111,6 +112,7 @@ class Holding(BaseModel):
 class WatchlistItem(BaseModel):
     isin: str
     name: str
+    short_name: str
     symbol: str | None
     price: float | None
     price_currency: str | None
@@ -131,6 +133,7 @@ class Flow(BaseModel):
     type: str
     isin: str
     name: str
+    short_name: str
 
 
 class PerformanceSummary(BaseModel):
@@ -176,6 +179,7 @@ class YearlyReturn(BaseModel):
 class Contribution(BaseModel):
     isin: str
     name: str
+    short_name: str
     pnl: float
     contribution: float
 
@@ -201,7 +205,8 @@ class Performance(BaseModel):
     rolling_volatility: Series
     rolling_beta: Series
     per_holding_value: dict[str, list[float | None]]
-    holding_names: dict[str, str] = {}  # ISIN -> display name, closed positions included
+    holding_names: dict[str, str] = {}  # ISIN -> registered name, closed positions too
+    holding_short_names: dict[str, str] = {}   # ISIN -> label form, same coverage
     missing: list[str]
     warnings: list[str]
 
@@ -226,6 +231,7 @@ class Window(BaseModel):
 class DivergenceRow(BaseModel):
     isin: str
     name: str
+    short_name: str
     weight: float
     risk_share: float
     divergence: float
@@ -245,6 +251,7 @@ class Metric(BaseModel):
 class Standalone(BaseModel):
     isin: str
     name: str
+    short_name: str
     volatility: float
     multiple: float                     # times a broad European index
     weight: float
@@ -252,7 +259,8 @@ class Standalone(BaseModel):
 
 class Correlation(BaseModel):
     isins: list[str]
-    names: list[str]
+    names: list[str]                    # registered names, for the tooltip
+    short_names: list[str]              # label form, when a ticker is unavailable
     matrix: list[list[float]]
 
 
@@ -261,6 +269,8 @@ class Pair(BaseModel):
     b: str
     a_name: str
     b_name: str
+    a_short: str
+    b_short: str
     correlation: float
     sentence: str
 
@@ -268,6 +278,7 @@ class Pair(BaseModel):
 class Cluster(BaseModel):
     members: list[str]
     names: list[str]
+    short_names: list[str]
     mean_correlation: float
     min_correlation: float
     combined_weight: float | None
@@ -409,6 +420,8 @@ class HoldingDetail(BaseModel):
 class InstrumentOut(BaseModel):
     isin: str
     name: str
+    short_name: str                     # always filled: derived when not set by hand
+    short_name_is_manual: bool          # so the form can say whether it is derived
     issuer: str
     asset_class: str
     base_currency: str
@@ -425,6 +438,7 @@ class InstrumentOut(BaseModel):
 
 class InstrumentPatch(BaseModel):
     name: str | None = None
+    short_name: str | None = None       # "" clears it, returning to the derived form
     issuer: str | None = None
     asset_class: str | None = None
     base_currency: str | None = None
@@ -491,6 +505,7 @@ class TransactionOut(BaseModel):
     date: str
     isin: str
     name: str
+    short_name: str
     type: str
     quantity: float
     price_per_unit: float
@@ -581,6 +596,7 @@ class SimulatedHolding(BaseModel):
 class Trade(BaseModel):
     isin: str
     name: str
+    short_name: str
     action: str
     amount: float
     units: float | None

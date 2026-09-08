@@ -158,7 +158,9 @@ class TestRules:
             ("excluded_from_risk_model", Severity.INFO), ("window_shortened", Severity.INFO)]
         excluded, shortened = alerts
         assert excluded.isins == (C,) and excluded.route == "#/instruments"
-        assert "Amundi Global Luxury" in excluded.title and "below the 60 minimum" in excluded.detail
+        # The title carries the short display name -- an alert title is a
+        # label, not a record -- and the ISIN is on the alert for the link.
+        assert "Global Luxury" in excluded.title and "below the 60 minimum" in excluded.detail
         assert shortened.isins == (B,) and "200 days" in shortened.title
 
     def test_full_window_raises_nothing(self, ledger, instruments):

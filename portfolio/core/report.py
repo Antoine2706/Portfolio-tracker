@@ -26,6 +26,7 @@ from decimal import Decimal
 import pandas as pd
 
 from .models import Instrument
+from .naming import short_names
 from .money import BASE_CURRENCY, FxRates, Money
 from .positions import Position
 from .returns import AlignmentReport
@@ -188,10 +189,15 @@ class DivergenceRow:
     supporting evidence for this column.
     """
     isin: str
-    name: str
+    name: str                    # the registered name, for tooltips and detail
     weight: float
     risk_share: float
     divergence: float
+    label: str = ""              # the short display name; falls back to `name`
+
+    @property
+    def display(self) -> str:
+        return self.label or self.name
 
     @property
     def divergence_pp(self) -> float:
@@ -212,7 +218,14 @@ class DivergenceRow:
         return "risk matches capital"
 
     def sentence(self) -> str:
-        return (f"{self.name} is {self.weight:.1%} of your money but "
+        """The headline sentence, in the short name.
+
+        A sentence is prose, and prose reads badly with a share-class suffix
+        in the middle of it: "iShares MSCI Europe Industrials Sector UCITS ETF
+        EUR Acc is 44.1% of your money" spends eight words before saying
+        anything. The registered name stays on the row for the tooltip.
+        """
+        return (f"{self.display} is {self.weight:.1%} of your money but "
                 f"{self.risk_share:.1%} of your risk "
                 f"({self.divergence:+.1%}).")
 
@@ -225,10 +238,12 @@ def divergence_rows(decomposition: RiskDecomposition,
     against intuition is the first thing on screen, whichever direction it errs.
     """
     frame = decomposition.as_frame()
+    labels = short_names(instruments)
     rows = [
         DivergenceRow(
             isin=str(isin),
             name=instruments[isin].name if isin in instruments else str(isin),
+            label=labels.get(str(isin), str(isin)),
             weight=float(row["weight"]),
             risk_share=float(row["pct_of_risk"]),
             divergence=float(row["pct_of_risk"] - row["weight"]),
@@ -278,11 +293,15 @@ def risk_metrics(decomposition: RiskDecomposition,
                f"Your holdings are about {diversification:.1f} times as "
                f"diversified as owning just one of them. 1.0 would mean they "
                f"all move together."),
+        # Both halves round the same number the same way. They did not: the
+        # headline showed one decimal and the sentence below rounded to zero,
+        # so a book of seven could read "6.8 of 7" above "about 7 independent
+        # ones" -- a sentence contradicting the figure directly above it.
         Metric("Effective holdings",
                f"{concentration_stats.effective_holdings:.1f} "
                f"of {concentration_stats.actual_holdings}",
                f"{concentration_stats.actual_holdings} positions behaving like "
-               f"about {concentration_stats.effective_holdings:.0f} independent "
+               f"about {concentration_stats.effective_holdings:.1f} independent "
                f"ones. This is the measure that sees a cluster of holdings all "
                f"making the same bet; comparing pairs one at a time cannot."),
     ]

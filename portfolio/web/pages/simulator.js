@@ -364,7 +364,7 @@ function pairedOption(rows, measure, marginalBefore) {
   const t = tokens();
   const { before, after } = measureSeries(rows, measure, marginalBefore);
   const opt = barOption({
-    categories: rows.map((r) => fmt.shortName(r.name, 26)),
+    categories: rows.map((r) => r.name),
     horizontal: true, format: "pct",
     series: [{ name: "Before", values: before, color: t.text3 }, { name: "After", values: after, color: t.accent }],
   });

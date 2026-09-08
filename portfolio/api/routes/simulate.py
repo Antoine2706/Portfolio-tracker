@@ -87,9 +87,11 @@ def simulate(req: S.SimulateRequest, svc: PortfolioService = Depends(service)) -
     trades = trades_to_target(values, targets_after, prices=analysis.prices_base,
                               total=after_total, min_amount=req.min_trade)
     names = analysis.names
+    shorts = analysis.short_names
     return S.SimulationOut(
         holdings=[S.SimulatedHolding(
-            isin=h.isin, name=names.get(h.isin, h.isin), value_before=h.value_before,
+            isin=h.isin, name=shorts.get(h.isin) or names.get(h.isin, h.isin),
+            value_before=h.value_before,
             value_after=h.value_after, weight_before=h.weight_before,
             weight_after=h.weight_after, risk_before=h.risk_before,
             risk_after=h.risk_after, marginal_after=h.marginal_after)
@@ -101,7 +103,9 @@ def simulate(req: S.SimulateRequest, svc: PortfolioService = Depends(service)) -
         diversification_after=result.diversification_after,
         max_risk_share_before=result.max_risk_share_before,
         max_risk_share_after=result.max_risk_share_after,
-        trades=[S.Trade(isin=t.isin, name=names.get(t.isin, t.isin), action=t.action,
+        trades=[S.Trade(isin=t.isin, name=names.get(t.isin, t.isin),
+                        short_name=shorts.get(t.isin) or names.get(t.isin, t.isin),
+                        action=t.action,
                         amount=t.amount, units=t.units,
                         price=analysis.prices_base.get(t.isin),
                         weight_before=t.weight_before, weight_after=t.weight_after)

@@ -56,7 +56,7 @@ function rowAlerts(holdings, unpriced) {
   const out = [];
   const seen = new Set();
   for (const h of holdings) {
-    const name = fmt.shortName(h.name, 40);
+    const name = h.short_name || h.name;
     if (h.price == null) { seen.add(h.isin); out.push({ code: `unpriced:${h.isin}`, severity: "SERIOUS", title: `${name}: no price`, detail: h.price_note || "Held, but no price could be found — excluded from value, weight and the risk model.", isins: [h.isin], route: `#/holdings/${h.isin}` }); }
     if (h.price_is_stale) out.push({ code: `stale:${h.isin}`, severity: "WARNING", title: `${name}: price is stale`, detail: h.price_note, isins: [h.isin], route: `#/holdings/${h.isin}` });
     for (const w of h.warnings || []) out.push({ code: `warn:${h.isin}:${w.slice(0, 24)}`, severity: "WARNING", title: name, detail: w, isins: [h.isin], route: `#/holdings/${h.isin}` });
@@ -112,11 +112,16 @@ function weightCell(row, v) {
   return html`<span class="hd-weight"><span>${fmt.pct(v)}</span><span class="hd-weight-bar" aria-hidden="true"><span style=${`width:${w}%`}></span></span></span>`;
 }
 
+const DIVERGENCE_TITLE = {
+  "div-warm": "Carries more of the risk than of the capital",
+  "div-cool": "Carries less of the risk than of the capital",
+  "div-zero": "Risk and capital share are in line",
+};
+
 function divergenceCell(row, v) {
   if (v == null) return fmt.DASH;
-  // Warm = carries more of the risk than of the capital; the benign direction stays quiet.
-  const warm = v > 0.0005;
-  return html`<span class=${warm ? "hd-div-warm" : "hd-div-cool"} title=${warm ? "Carries more of the risk than of the capital" : "Carries no more of the risk than of the capital"}>${fmt.pp(v)}</span>`;
+  const cls = fmt.divergenceClass(v);
+  return html`<span class=${cls} title=${DIVERGENCE_TITLE[cls]}>${fmt.pp(v)}</span>`;
 }
 
 /* ---------------- tables ---------------- */

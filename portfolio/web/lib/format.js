@@ -223,6 +223,18 @@ export function polarityClass(v) {
   return v > 0 ? "pos" : "neg";
 }
 
+/** "div-warm" | "div-cool" | "div-zero" for a divergence figure.
+
+    A separate axis from polarityClass: carrying more risk than capital is an
+    imbalance, not a loss, so it takes the diverging pair rather than the
+    gain/loss pair. The sign rule is exactly the one divergingBarOption uses
+    on its bars -- above zero warm, below cool, at zero neutral -- so the
+    table and the chart beside it cannot disagree. */
+export function divergenceClass(v) {
+  if (isNil(v)) return "div-zero";
+  return v > 0 ? "div-warm" : v < 0 ? "div-cool" : "div-zero";
+}
+
 /** Arrow glyph for a delta: "▲" / "▼" / "". */
 export function arrow(v) {
   if (isNil(v) || v === 0) return "";
