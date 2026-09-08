@@ -33,6 +33,7 @@ import { Tabs } from "/static/components/Tabs.js";
 import { Help } from "/static/components/Tooltip.js";
 import { toast } from "/static/components/Toast.js";
 import { api, errorMessage } from "/static/lib/api.js";
+import { parseAmount } from "/static/lib/amount.js";
 import { barOption, tipElement } from "/static/lib/charts.js";
 import { tokens } from "/static/lib/theme.js";
 import { useStore } from "/static/lib/store.js";
@@ -80,15 +81,17 @@ let remembered = null;
 
 /* ---------------- helpers ---------------- */
 
-/** "1,250.5" | "1 250,5" | "-300" → number | null. Blank is null, not zero. */
+/** "1,250.5" | "1 250,5" | "-300" → number | null. Blank is null, not zero.
+
+    Delegates to the shared reader rather than carrying its own copy. It used
+    to have one, and that copy read "10.000" as ten -- which is how ten
+    thousand is written in half of Europe. An ambiguous entry now comes back
+    null and the field simply does not act on it, which is worse than the
+    explanation the allocate page gives but far better than acting on a
+    number a thousand times too small. */
 function parseNum(s) {
   if (s == null) return null;
-  let t = String(s).trim().replace(/\s/g, "").replace(/€|%/g, "");
-  if (!t) return null;
-  if (t.includes(",") && !t.includes(".")) t = t.replace(",", ".");
-  else t = t.replace(/,/g, "");
-  const n = Number(t);
-  return Number.isFinite(n) ? n : null;
+  return parseAmount(String(s).replace(/%/g, "")).value;
 }
 
 const nearZero = (v) => v == null || Math.abs(v) < 1e-9;

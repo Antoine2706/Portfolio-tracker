@@ -38,23 +38,13 @@ import { KpiTile } from "/static/components/KpiTile.js";
 import { Field, Input } from "/static/components/Field.js";
 import { Help } from "/static/components/Tooltip.js";
 import { allocate, errorMessage } from "/static/lib/api.js";
+import { parseAmount } from "/static/lib/amount.js";
 import * as fmt from "/static/lib/format.js";
 
 const SUBTITLE = "New money is the one rebalancing channel that costs nothing extra, because the purchase was going to happen anyway. This chooses where it goes. It never proposes a sale.";
 
 /** The last amount and answer, kept for the session so returning restores them. */
 let remembered = null;
-
-/** "1 250,5" | "1,250.5" | "€5000" → number | null. Blank is null, not zero. */
-function parseAmount(s) {
-  if (s == null) return null;
-  let t = String(s).trim().replace(/\s/g, "").replace(/€|EUR/gi, "");
-  if (!t) return null;
-  if (t.includes(",") && !t.includes(".")) t = t.replace(",", ".");
-  else t = t.replace(/,/g, "");
-  const n = Number(t);
-  return Number.isFinite(n) ? n : null;
-}
 
 /* ---------------- the headline ---------------- */
 
@@ -223,6 +213,43 @@ function Target({ result, ccy }) {
   return html`<${Card} title="What would that take?" class="stack gap-1">${body}${caveat}<//>`;
 }
 
+/** What the typed string was understood to mean, shown under the field.
+
+    Two jobs. On an unambiguous entry it echoes the amount back formatted, so
+    a misread is visible before the button is pressed rather than inferred
+    afterwards from a strange answer. On an ambiguous one -- "10.000", which
+    is ten thousand in Brussels and ten in London -- it refuses and offers
+    both readings as buttons.
+
+    The refusal is the part that matters. The previous parser read "10.000"
+    as ten, silently, and the page then proposed buying one share: no error,
+    no warning, and a result that looks like a broken page rather than a
+    misread number. */
+function Reading({ read, ccy, onPick }) {
+  if (read.state === "empty") return null;
+  if (read.state === "invalid") {
+    return html`<div class="field-hint" role="status">That is not a number.</div>`;
+  }
+  if (read.state === "ambiguous") {
+    const [big, small] = read.readings;
+    return html`<div class="field-hint" role="status">
+      Ambiguous:${" "}<strong>${fmt.money(big, ccy, { decimals: 0 })}</strong> or${" "}
+      <strong>${fmt.money(small, ccy)}</strong>? A dot or comma with three
+      digits after it is a thousands separator in some places and a decimal
+      point in others, and nothing here settles which you meant.${" "}
+      <${Button} size="sm" variant="secondary" onClick=${() => onPick(big)}>
+        ${fmt.money(big, ccy, { decimals: 0 })}<//>${" "}
+      <${Button} size="sm" variant="secondary" onClick=${() => onPick(small)}>
+        ${fmt.money(small, ccy)}<//>
+    </div>`;
+  }
+  // htm collapses the newline before an interpolation, which is how this
+  // project previously shipped "14.7135against" and "WheatJE00BN7KB664".
+  return html`<div class="field-hint" role="status">Understood as${" "}
+    <strong>${fmt.money(read.value, ccy)}</strong>.</div>`;
+}
+
+
 /* ---------------- the page ---------------- */
 
 export default function AllocatePage({ snapshot }) {
@@ -234,8 +261,10 @@ export default function AllocatePage({ snapshot }) {
   const [error, setError] = useState(null);
   const seq = useRef(0);
 
-  const cash = parseAmount(amount);
-  const wanted = parseAmount(target);
+  const read = parseAmount(amount);
+  const readTarget = parseAmount(target);
+  const cash = read.value;
+  const wanted = readTarget.value;
   const valid = cash != null && cash > 0;
 
   const run = async () => {
@@ -287,6 +316,7 @@ export default function AllocatePage({ snapshot }) {
           <${Field} label="New money" id="alloc-amount" hint="The lump you are about to invest.">
             <${Input} id="alloc-amount" numeric autoFocus value=${amount} placeholder="5000" prefix="€"
               onInput=${(e) => setAmount(e.target.value)} onKeyDown=${onKey} />
+            <${Reading} read=${read} ccy=${ccy} onPick=${(v) => setAmount(String(v))} />
           <//>
           <${Field} id="alloc-target" hint="Optional. Answers: what would reaching that take?"
             label=${html`Target dispersion <${Help} text="The inverse question, and usually the decision-relevant one. If reaching 1.0 would take 40,000 EUR on a 17,000 EUR book, the structure cannot be fixed by contributions and the real choice is whether to sell." />`}>
