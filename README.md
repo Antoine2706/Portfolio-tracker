@@ -131,6 +131,55 @@ refused to.
 portfolio backtest erc      # equal risk contribution against buy-and-hold
 ```
 
+### The bid-ask spread, which appears on no document
+
+```bash
+portfolio spreads           # each instrument's spread, from its own bars
+portfolio spreads --write   # commit the ones that clear every gate
+portfolio controls --spread # prove the estimator recovers spreads it wasn't told
+```
+
+Commission and transaction tax are printed on the confirmation. The spread is
+paid *inside* the execution price, so there is no arithmetic that recovers it
+from anything the broker sent — and it is the largest single component of the
+cost model. Until now it was a flat 8 bps for every instrument, which cannot
+be right for a €12bn core tracker and a thin thematic fund at once.
+
+It is now estimated per instrument by **EDGE** (Ardia, Guidotti & Kroencke,
+*JFE* 161, 2024), written out in `core/spread.py` rather than imported. The
+mid-range (h+l)/2 is bounce-free when a bar holds both a buy and a sell, so
+pairing it against the open and the previous close isolates s²/4 four separate
+ways — Roll's covariance argument, run against a clean price rather than
+another contaminated one.
+
+**It has a noise floor of about 4 bps and says so.** At zero true spread it
+reports 3.97 bps off 500 daily bars, because √|s²| folds a mean-zero
+distribution onto the positive side. That floor thins only as n^(−¼) —
+measured at 0.85 per doubling against a predicted 0.841 — so a 2 bps floor
+would need twenty-four years of bars. This cannot resolve the tightest
+trackers from daily data, and the tier system exists so it never claims to:
+
+| tier | meaning |
+|---|---|
+| `observed` | somebody watched it. Outranks everything below, and `--write` will not overwrite it |
+| `estimated` | EDGE on that instrument's own bars, clearing **all** of: two standard errors clear of zero *on s²*, at or above half a tick, off at least 60 bars |
+| `assumed` | the declared constant, for everything else |
+
+An estimate that fails a gate is discarded, not shaded — a 4 bps reading at
+the noise floor and a real 4 bps spread are the same number, and only one is a
+measurement. The tick is inferred from the prices themselves (the coarsest
+grid essentially every print falls on) rather than from a table of venue rules
+nobody here could check.
+
+Five controls back it, and they are the reason to believe any of the above:
+a positive sweep from 2 to 100 bps reporting bias and dispersion at each rung,
+a negative control measuring the floor and checking it thins as sampling noise
+must, a standard error checked against the dispersion it claims to predict, a
+resolution control, and a refusal below a minimum bar count. Plus a ranking
+check on the result as a whole: estimated spread against median daily traded
+value, because an ordering that contradicts liquidity is more likely a wiring
+fault than a market fact, and `--write` refuses when it fails.
+
 ### Directing new money
 
 ```bash

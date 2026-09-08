@@ -37,6 +37,32 @@ prices", Journal of Financial Economics 161 (2024) 103916, known as EDGE.
 Written out here rather than imported, so that the mathematics is readable in
 the same place as everything else in this project.
 
+Where this came from, since it matters what is checked and what is taken
+------------------------------------------------------------------------
+The paper itself could not be read from the machine this was written on. What
+was read is the authors' own reference implementation, the `bidask` package
+they publish alongside it. So:
+
+  * The **moment conditions** below -- which products isolate ``s^2/4``, and
+    why the mid-range is the quantity that makes them work -- are derived
+    here and can be checked line by line against the algebra. They are not
+    transcribed.
+  * The **specific pairing** into ``x1`` and ``x2``, the variance weighting
+    between them, and the exact form of the ``p_o`` and ``p_c`` corrections
+    are taken from that implementation. The derivation above explains why
+    each has the expectation it does; it does not establish that this pairing
+    is the variance-minimising one, which is the paper's contribution and is
+    taken on the authors' word.
+  * The **behaviour** is not taken on anyone's word. `eval/spread_controls.py`
+    imposes known spreads on simulated markets and checks they come back, and
+    that is what this ships on. A test also checks agreement with the
+    reference package when it happens to be installed -- 3.5e-18 over 300
+    random panels -- which catches a transcription slip but proves nothing
+    the paper claims.
+
+Anything below stated as a fact about the estimator's behaviour was measured;
+anything stated about why the estimator is *optimal* is the paper's claim.
+
 Let the efficient (unobserved) log price follow a process with uncorrelated
 increments, and let an observed transaction log price be the efficient price
 plus a bounce term ``+-s/2``, where ``s`` is the effective spread as a
