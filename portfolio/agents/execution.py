@@ -228,6 +228,11 @@ class InstrumentCost:
     # confirmations and 7.00 EUR flat on a share, at the same broker in the
     # same month. A schedule keyed on the broker alone gets one of those wrong
     # whichever way it is written.
+    # How the half-spread above was arrived at: "observed", "estimated", or
+    # "" meaning the declared constant. `spread_observed` predates this and
+    # remains the boolean the cost split uses; this is the finer statement,
+    # and the two agree because an observed spread sets both.
+    spread_source: str = ""
     commission: float | None = None      # None = use the broker schedule
     commission_observed: bool = False
     venue: str = ""                      # MIC off the confirmation
@@ -275,6 +280,13 @@ class Provenance:
     cost_assumed: float
     cost_spread_estimated: float = 0.0
     weighted: bool = False               # were real weights supplied?
+    # How each instrument's half-spread was arrived at: "observed" (a document
+    # or a quote screen), "estimated" (EDGE on its own bars, having cleared
+    # every gate in `agents/spreads.py`), or "assumed" (the declared
+    # constant). Separate from the tax provenance above and reported
+    # separately, because until this existed the spread was in the assumed
+    # column by construction and the sentence saying so could never change.
+    spread_tiers: tuple = ()             # (isin, tier) pairs
 
     @property
     def instruments(self) -> int:
@@ -327,6 +339,29 @@ class Provenance:
                          f"is paid inside the execution price and appears on "
                          f"no contract note")
             out.append(line + ".")
+
+        if self.spread_tiers:
+            counts: dict = {}
+            for _, tier in self.spread_tiers:
+                counts[tier] = counts.get(tier, 0) + 1
+            total = len(self.spread_tiers)
+            measured = counts.get("estimated", 0) + counts.get("observed", 0)
+            if measured:
+                parts = [f"{count} {tier}"
+                         for tier, count in sorted(counts.items())]
+                out.append(
+                    f"Half-spread: {', '.join(parts)} across {total} "
+                    f"instrument{'' if total == 1 else 's'}. An estimated "
+                    f"spread is EDGE on that instrument's own open, high, low "
+                    f"and close, kept only where it stands two standard errors "
+                    f"clear of zero and above half a tick; the rest keep the "
+                    f"declared constant.")
+            else:
+                out.append(
+                    f"Half-spread: every one of the {total} is the declared "
+                    f"constant. None of their price histories can support an "
+                    f"estimate that is distinguishable from the estimator's "
+                    f"own noise floor.")
         return out
 
 
@@ -606,9 +641,17 @@ class CostModel:
         assumed: list[str] = []
         unpriced: list[str] = []
         cost_observed = cost_assumed = cost_spread = 0.0
+        tiers = []
 
         for isin in isins:
             facts = self.facts(isin)
+            # Recorded for every instrument, including the ones with no tax
+            # band: whether its spread was measured is a separate question
+            # from whether its trades can be priced at all, and skipping the
+            # unpriced ones here would quietly shrink the denominator.
+            tiers.append((isin, facts.spread_source
+                          or ("observed" if facts.spread_observed
+                              else "assumed")))
             if facts.tob_rate is None:
                 unpriced.append(isin)
                 continue
@@ -649,7 +692,8 @@ class CostModel:
             weight_assumed=sum(share[i] for i in assumed),
             weight_unpriced=sum(share[i] for i in unpriced),
             cost_observed=cost_observed, cost_assumed=cost_assumed,
-            cost_spread_estimated=cost_spread, weighted=bool(weights))
+            cost_spread_estimated=cost_spread, weighted=bool(weights),
+            spread_tiers=tuple(tiers))
 
 
 def cost_table(instruments) -> dict:
@@ -687,6 +731,7 @@ def cost_table(instruments) -> dict:
                              else float(inst.half_spread_bps)),
             spread_observed=bool(inst.spread_observed
                                  and inst.half_spread_bps is not None),
+            spread_source=(inst.spread_source or "").strip().lower(),
             buy_tax_rate=float(inst.buy_tax_rate),
             commission=(None if inst.commission is None
                         else float(inst.commission)),

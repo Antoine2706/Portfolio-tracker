@@ -56,7 +56,7 @@ from .eval.report import Comparison, compare
 
 __all__ = ["Book", "load_book", "run_equal_risk_contribution",
            "allocate_new_money", "replay_the_ledger", "names_the_window",
-           "dominant_holding"]
+           "dominant_holding", "survey_spreads", "SpreadSurvey"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -398,3 +398,156 @@ def replay_the_ledger(book: Book, *, mode: str = "user",
                             costs=book.costs, buyable=book.buyable,
                             lookback=lookback, warmup=warmup,
                             sales=sorted(sales), on_sale=on_sale)
+
+
+# --------------------------------------------------------------------------
+# The bid-ask spread, per instrument, off each instrument's own bars
+# --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class SpreadSurvey:
+    """What every instrument's spread is, and how much of it is evidence."""
+    decisions: dict                      # isin -> agents.spreads.SpreadDecision
+    ranking: object                      # agents.spreads.RankingCheck
+    names: dict
+    fallback_bps: float
+    refused: dict                        # isin -> why no bars at all
+
+    def lines(self) -> list[str]:
+        from .agents.spreads import ASSUMED, ESTIMATED
+
+        out = ["Bid-ask spread by instrument", "=" * 74, "",
+               "The largest component of the cost model and the only one that "
+               "appears on no",
+               "document. Estimated from each instrument's own open, high, "
+               "low and close.", ""]
+        for isin, d in sorted(self.decisions.items(),
+                              key=lambda kv: -kv[1].half_spread_bps):
+            label = self.names.get(isin, "")
+            out.append(f"{isin}  {label}")
+            out.append(f"    {d.half_spread_bps:6.1f} bps  [{d.source}]"
+                       f"{'  CLAMPED TO TICK' if d.clamped_to_tick else ''}")
+            for line in d.reason.splitlines():
+                out.append(f"           {line}")
+            rho = None if d.estimate is None else d.estimate.autocorrelation
+            if rho is not None:
+                # The standard error treats the per-bar series as independent,
+                # which was measured to hold on simulated bars. Real bars have
+                # volatility clustering the simulation does not, so the number
+                # is printed for every instrument and called out when it is
+                # large enough to make the error bar optimistic. Reported
+                # rather than corrected: raising `lags` on this evidence would
+                # be fitting the standard error to one sample of one series.
+                loud = " -- LARGE; the error bar above is optimistic" \
+                    if abs(rho) > 0.10 else ""
+                out.append(f"           per-bar autocorrelation {rho:+.3f} "
+                           f"(the error bar assumes ~0){loud}")
+            out.append("")
+
+        for isin, why in sorted(self.refused.items()):
+            out.append(f"{isin}  {self.names.get(isin, '')}")
+            out.append(f"    no bars: {why}")
+            out.append("")
+
+        estimated = [i for i, d in self.decisions.items() if d.source == ESTIMATED]
+        assumed = ([i for i, d in self.decisions.items() if d.source == ASSUMED]
+                   + list(self.refused))
+        out.append("-" * 74)
+        out.append(f"{len(estimated)} of {len(estimated) + len(assumed)} "
+                   f"instruments carry a measured spread; {len(assumed)} keep "
+                   f"the declared")
+        out.append(f"{self.fallback_bps:.0f} bps because their own data cannot "
+                   f"support anything better.")
+        if estimated:
+            got = [self.decisions[i].half_spread_bps for i in estimated]
+            out.append(f"Measured spreads run {min(got):.1f} to {max(got):.1f} "
+                       f"bps -- a factor of {max(got) / min(got):.1f} that a "
+                       f"single constant")
+            out.append("could not express, which is the whole reason to "
+                       "estimate rather than assume.")
+        out.append("")
+        out.extend(self.ranking.line().splitlines())
+        return out
+
+
+def survey_spreads(book: Book, *, mode: str = "user",
+                   data_root: "pathlib.Path | None" = None,
+                   provider: str = "yfinance",
+                   fallback_bps: float = 8.0) -> SpreadSurvey:
+    """Estimate the spread for every instrument in the book.
+
+    Fetches unadjusted OHLC through the cache, runs EDGE on each instrument
+    separately, infers each one's tick from its own prices, and applies the
+    three-tier rule. Nothing is written to the instrument records here; that
+    is `portfolio spreads --write`, so that looking is not the same action as
+    committing.
+
+    Every instrument is estimated on its own bars and nothing is pooled. Two
+    funds tracking the same index on two venues have different spreads, and
+    the venue is the reason.
+    """
+    from .agents.spreads import decide_spread, ranking_is_plausible
+    from .core.spread import edge, infer_tick_size
+    from .data.cache import PriceCache
+    from .data.market import MarketData
+
+    root = pathlib.Path(data_root) if data_root else None
+    store = DataStore.open(DataMode(mode), root=root)
+    if provider == "fixture":
+        from .data.providers.fixture import FixtureProvider
+        market_provider = FixtureProvider()
+    else:
+        from .data.providers.yahoo import YahooProvider
+        market_provider = YahooProvider()
+
+    cache_dir = store.root / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = PriceCache(cache_dir / f"bars-{market_provider.name}.sqlite")
+    # Only to resolve the fetch handle: the same ISIN-to-symbol rule the price
+    # loader uses, rather than a second one that could drift from it.
+    resolver = MarketData(market_provider, cache)
+    decisions, refused, spreads, liquidity, names = {}, {}, {}, {}, {}
+
+    for isin, inst in book.instruments.items():
+        names[isin] = getattr(inst, "name", "") or ""
+        symbol = resolver.symbol_for(inst)
+        if not symbol:
+            refused[isin] = "no provider symbol is recorded for it"
+            continue
+        frame = None
+        cached = cache.get_bars(symbol)
+        if cached is not None and not cache.bars_predate_volume(symbol):
+            frame = cached[0]
+        if frame is None or frame.empty:
+            try:
+                frame = market_provider.bars(symbol)
+            except Exception as exc:
+                refused[isin] = f"{type(exc).__name__}: {exc}"
+                continue
+            cache.put_bars(symbol, frame)
+
+        prices = frame[["open", "high", "low", "close"]]
+        estimate = edge(prices["open"].to_numpy(), prices["high"].to_numpy(),
+                        prices["low"].to_numpy(), prices["close"].to_numpy())
+        tick = infer_tick_size(prices.to_numpy().ravel())
+        price = float(frame["close"].iloc[-1])
+        decision = decide_spread(estimate, price=price, tick=tick,
+                                 fallback_bps=fallback_bps)
+        decisions[isin] = decision
+        if decision.is_evidence:
+            spreads[isin] = decision.half_spread_bps
+        # Liquidity for the ranking check: median daily traded value, which
+        # is independent of anything the estimator saw. Median rather than
+        # mean because one index-rebalance day can carry a tenth of a small
+        # fund's annual volume, and a mean would rank the book by whether
+        # each fund happened to have had one.
+        if "volume" in frame.columns:
+            traded = (frame["volume"] * frame["close"]).dropna()
+            if len(traded) >= 20 and float(traded.median()) > 0:
+                liquidity[isin] = float(traded.median())
+
+    cache.close()
+    return SpreadSurvey(decisions=decisions,
+                        ranking=ranking_is_plausible(spreads, liquidity),
+                        names=names, fallback_bps=fallback_bps, refused=refused)

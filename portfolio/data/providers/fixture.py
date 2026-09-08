@@ -161,6 +161,80 @@ class FixtureProvider(MarketDataProvider):
             raise ProviderError(self.name, f"no history returned for {symbol}")
         return series
 
+    def fixture_half_spread_bps(self, symbol: str) -> float:
+        """The half-spread this fixture will actually impose on `symbol`.
+
+        Exposed so a test can check the estimator against a number it was
+        never handed, end to end through the cache and the CLI. Spread from 4
+        to 45 bps across the universe, which straddles the estimator's
+        measured noise floor on purpose: the offline demo should contain
+        instruments it can resolve and instruments it must decline.
+        """
+        return 4.0 + (_seed(symbol, 11) % 4100) / 100.0
+
+    def bars(self, symbol: str, start: dt.date | None = None) -> pd.DataFrame:
+        """OHLC built around the close path, with a per-symbol spread imposed.
+
+        The bar generator is written here rather than borrowed from
+        `eval/spread_controls.py` for two reasons. The layering forbids it --
+        `data/` may not import `eval/` -- and independently of that, an
+        end-to-end test is worth more when the thing generating the data and
+        the thing validating the estimator are not the same code.
+
+        Within each day the efficient log price runs a **Brownian bridge**
+        from the previous close to this one, every step prints at the bid or
+        the ask, and the bar is the first, largest, smallest and last of those
+        prints.
+
+        A bridge rather than a free walk, and it took a measurement to find
+        out why it matters. The first version added an independent intraday
+        walk to each day, restarting it at zero every morning. That leaves a
+        discontinuity between one day's last step and the next day's first --
+        a jump of random sign and about 40 bps -- which sits at exactly the
+        close-to-open boundary the estimator reads its bounce off. The fixture
+        imposed 18 bps and the estimator, correctly, reported 29. A bridge is
+        pinned at both ends and has no such jump.
+        """
+        closes = self._series(symbol)
+        rng = np.random.default_rng(_seed(symbol, self.seed + 977))
+        spread = 2.0 * self.fixture_half_spread_bps(symbol) / 10_000.0
+        steps = 40
+
+        target = np.log(closes.to_numpy(dtype=float))
+        previous = np.concatenate([[target[0]], target[:-1]])
+        fraction = np.linspace(0.0, 1.0, steps + 1)[None, 1:]
+        # A bridge: a walk minus its own endpoint, scaled back to zero at the
+        # ends, so the intraday wander adds range without moving either close.
+        walk = rng.normal(0.0, 0.004 / np.sqrt(steps),
+                          (len(target), steps + 1)).cumsum(axis=1)
+        bridge = (walk - walk[:, -1:] * np.linspace(0.0, 1.0, steps + 1))[:, 1:]
+        path = np.exp(previous[:, None]
+                      + (target - previous)[:, None] * fraction + bridge)
+        side = rng.choice((-1.0, 1.0), size=(len(target), steps))
+        prints = path * (1.0 + side * spread / 2.0)
+        # Onto a cent grid, as a European venue quotes, so that
+        # `core.spread.infer_tick_size` has a grid to find.
+        prints = np.round(prints / 0.01) * 0.01
+
+        # Volume, inversely related to the imposed spread the way liquidity
+        # and spread relate in a real market, so the survey's ranking check
+        # has something true to find. Noisy enough that finding it is not
+        # automatic.
+        turnover = 4.0e7 / self.fixture_half_spread_bps(symbol)
+        volume = turnover / prints[:, -1] * np.exp(
+            rng.normal(0.0, 0.35, len(target)))
+
+        frame = pd.DataFrame(
+            {"open": prints[:, 0], "high": prints.max(axis=1),
+             "low": prints.min(axis=1), "close": prints[:, -1],
+             "volume": np.round(volume)},
+            index=closes.index)
+        if start is not None:
+            frame = frame[frame.index >= pd.Timestamp(start)]
+        if frame.empty:
+            raise ProviderError(self.name, f"no bars returned for {symbol}")
+        return frame
+
     def quote(self, symbol: str) -> Quote:
         series = self._series(symbol)
         _, currency = self._exchange(symbol)

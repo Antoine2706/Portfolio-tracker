@@ -73,6 +73,28 @@ CREATE TABLE IF NOT EXISTS history (
     close  REAL NOT NULL,
     PRIMARY KEY (symbol, date)
 );
+CREATE TABLE IF NOT EXISTS bars (
+    symbol TEXT NOT NULL,
+    date   TEXT NOT NULL,
+    open   REAL NOT NULL,
+    high   REAL NOT NULL,
+    low    REAL NOT NULL,
+    close  REAL NOT NULL,
+    volume REAL,
+    PRIMARY KEY (symbol, date)
+);
+CREATE TABLE IF NOT EXISTS bars_meta (
+    symbol     TEXT PRIMARY KEY,
+    fetched_at TEXT NOT NULL,
+    first_date TEXT,
+    last_date  TEXT,
+    rows       INTEGER,
+    -- 1 = the fetch that wrote these rows carried volume, 0 = it did not,
+    -- NULL = the rows predate the column existing. The three are different
+    -- and a caller that cannot tell them apart will either refetch for ever
+    -- or never refetch at all.
+    had_volume INTEGER
+);
 CREATE TABLE IF NOT EXISTS history_meta (
     symbol     TEXT PRIMARY KEY,
     fetched_at TEXT NOT NULL,
@@ -125,6 +147,34 @@ class PriceCache:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
             self._conn.executescript(_SCHEMA)
+            self._add_missing_columns()
+
+    # Columns added to a table after some caches were already written.
+    # `CREATE TABLE IF NOT EXISTS` does nothing to a table that exists, so a
+    # cache written by an earlier version keeps the old shape and every query
+    # naming the new column fails -- which is how this was found, on the very
+    # first run after `volume` was added.
+    #
+    # Safe here, and the reason is worth stating because Part 4 of this
+    # project was a bug caused by exactly this pattern applied where it was
+    # not safe. There, a defaulted column meant "assume the usual value" and
+    # silently overwrote a deliberate blank. Here the added column is NULL,
+    # `get_bars` maps NULL to NaN, and every consumer treats NaN as "this was
+    # never fetched". Nothing is invented; the row simply says less than a
+    # freshly fetched one, which is true.
+    _ADDED_COLUMNS = {"bars": {"volume": "REAL"},
+                      "bars_meta": {"had_volume": "INTEGER"}}
+
+    def _add_missing_columns(self) -> None:
+        for table, columns in self._ADDED_COLUMNS.items():
+            present = {row[1] for row in
+                       self._conn.execute(f"PRAGMA table_info({table})")}
+            if not present:
+                continue
+            for name, kind in columns.items():
+                if name not in present:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {name} {kind}")
 
     # -- plumbing ----------------------------------------------------------
 
@@ -203,6 +253,100 @@ class PriceCache:
                 "(symbol, fetched_at, first_date, last_date, rows) VALUES (?, ?, ?, ?, ?)",
                 (symbol, _stamp(_now()), first, last, count))
 
+    # -- bars --------------------------------------------------------------
+    #
+    # A separate table from `history`, not four more columns on it, and the
+    # reason is the one Part 4 of this project learned the hard way. The two
+    # series are not the same measurement: `history` is adjusted for
+    # distributions because the risk model needs it, `bars` is unadjusted
+    # because the spread estimator needs the venue's own tick grid. Widening
+    # `history` would have made every existing cached row silently claim a
+    # blank open, and a blank is indistinguishable from "this instrument had
+    # no open". A missing row in a missing table says exactly what it means.
+
+    def bars_predate_volume(self, symbol: str) -> bool:
+        """Were these rows written before the volume column existed?
+
+        True means refetching would gain something. False covers both "we
+        have volume" and "this venue reports none", which look identical in
+        the rows and must not, or the caller refetches every run for ever.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT had_volume FROM bars_meta WHERE symbol = ?",
+                (symbol,)).fetchone()
+        return row is not None and row[0] is None
+
+    def get_bars(self, symbol: str) -> tuple[pd.DataFrame, dt.datetime] | None:
+        """Cached unadjusted OHLC and when it was fetched, or None."""
+        with self._lock:
+            meta = self._conn.execute(
+                "SELECT fetched_at FROM bars_meta WHERE symbol = ?",
+                (symbol,)).fetchone()
+            if meta is None:
+                return None
+            rows = self._conn.execute(
+                "SELECT date, open, high, low, close, volume FROM bars "
+                "WHERE symbol = ? ORDER BY date", (symbol,)).fetchall()
+        if not rows:
+            return None
+        index = pd.DatetimeIndex(
+            pd.to_datetime([r[0] for r in rows], format="%Y-%m-%d"))
+        frame = pd.DataFrame(
+            {"open": [r[1] for r in rows], "high": [r[2] for r in rows],
+             "low": [r[3] for r in rows], "close": [r[4] for r in rows],
+             # NULL volume stays NaN. A venue that reports no volume is not a
+             # venue that reported zero, and the ranking check must be able to
+             # tell those apart or it would rank a silent instrument last.
+             "volume": [float("nan") if r[5] is None else r[5] for r in rows]},
+            index=index, dtype=float)
+        return frame, _unstamp(meta[0])
+
+    def put_bars(self, symbol: str, frame: pd.DataFrame) -> None:
+        """Upsert bars; existing dates are overwritten, others are kept.
+
+        A bar is stored only when all four prices are present. A day with a
+        close but no high is not a bar -- it is a close, and `history` already
+        holds those. Storing it with the close copied into the other three
+        would manufacture a zero-range day, which the spread estimator reads
+        as "this instrument did not trade" and drops. Same answer, arrived at
+        by inventing data, which is worse than not having it.
+        """
+        needed = ["open", "high", "low", "close"]
+        missing = [c for c in needed if c not in frame.columns]
+        if missing:
+            raise ValueError(f"bars for {symbol} are missing {missing}")
+        # The four prices must all be there; volume is allowed to be absent,
+        # because a bar with no reported volume is still a bar and dropping it
+        # would throw away the spread over a liquidity figure.
+        clean = frame.dropna(subset=needed)
+        if clean.empty:
+            return
+        volume = (clean["volume"] if "volume" in clean.columns
+                  else pd.Series(float("nan"), index=clean.index))
+        index = pd.DatetimeIndex(clean.index)
+        if index.tz is not None:
+            index = index.tz_localize(None)
+        rows = [(symbol, ts.strftime("%Y-%m-%d"),
+                 float(o), float(h), float(l), float(c),
+                 None if pd.isna(v) else float(v))
+                for ts, o, h, l, c, v in zip(
+                    index, clean["open"], clean["high"], clean["low"],
+                    clean["close"], volume)]
+        with self._transaction() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO bars (symbol, date, open, high, low, "
+                "close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
+            first, last, count = conn.execute(
+                "SELECT MIN(date), MAX(date), COUNT(*) FROM bars "
+                "WHERE symbol = ?", (symbol,)).fetchone()
+            conn.execute(
+                "INSERT OR REPLACE INTO bars_meta "
+                "(symbol, fetched_at, first_date, last_date, rows, had_volume) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (symbol, _stamp(_now()), first, last, count,
+                 int(bool(volume.notna().any()))))
+
     # -- quotes ------------------------------------------------------------
 
     def get_quote(self, symbol: str, max_age: dt.timedelta) -> Quote | None:
@@ -241,10 +385,14 @@ class PriceCache:
         with self._lock:
             symbols = self._conn.execute(
                 "SELECT COUNT(*) FROM (SELECT symbol FROM history_meta "
+                "UNION SELECT symbol FROM bars_meta "
                 "UNION SELECT symbol FROM quotes)").fetchone()[0]
-            rows = self._conn.execute("SELECT COUNT(*) FROM history").fetchone()[0]
+            rows = self._conn.execute(
+                "SELECT (SELECT COUNT(*) FROM history) "
+                "     + (SELECT COUNT(*) FROM bars)").fetchone()[0]
             stamps = [r[0] for r in self._conn.execute(
                 "SELECT fetched_at FROM history_meta UNION ALL "
+                "SELECT fetched_at FROM bars_meta UNION ALL "
                 "SELECT fetched_at FROM quotes")]
             # Logical size rather than the file's: with WAL the main file lags
             # behind until a checkpoint, and reporting that would show a cache
@@ -260,9 +408,9 @@ class PriceCache:
     def clear(self) -> None:
         """Empty every table and give the space back to the filesystem."""
         with self._transaction() as conn:
-            conn.execute("DELETE FROM history")
-            conn.execute("DELETE FROM history_meta")
-            conn.execute("DELETE FROM quotes")
+            for table in ("history", "history_meta", "bars", "bars_meta",
+                          "quotes"):
+                conn.execute(f"DELETE FROM {table}")
         with self._lock:
             self._conn.execute("VACUUM")
 

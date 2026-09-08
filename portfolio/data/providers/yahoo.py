@@ -111,6 +111,46 @@ class YahooProvider(MarketDataProvider):
         series.name = symbol
         return series
 
+    def bars(self, symbol: str, start: dt.date | None = None) -> pd.DataFrame:
+        """Unadjusted OHLC. See `MarketDataProvider.bars` for why unadjusted.
+
+        The same call `history` makes, with `auto_adjust=False` and three more
+        columns kept. Yahoo has been returning them all along; this fetch
+        simply stops throwing them away.
+        """
+        ticker = self._ticker(symbol)
+        try:
+            hist = ticker.history(start=start.isoformat() if start else None,
+                                  period=None if start else "2y",
+                                  interval="1d", auto_adjust=False)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                self.name,
+                f"could not load bars for {symbol}: {_explain(exc)}") from exc
+        if hist is None or hist.empty:
+            raise ProviderError(self.name, f"no bars returned for {symbol}")
+        missing = [c for c in ("Open", "High", "Low", "Close")
+                   if c not in hist.columns]
+        if missing:
+            raise ProviderError(
+                self.name,
+                f"{symbol} came back without {', '.join(missing)}; a spread "
+                f"cannot be estimated from closes alone")
+        wanted = ["Open", "High", "Low", "Close"]
+        # Volume is wanted, not required: it feeds a plausibility check, and
+        # refusing the bars over a missing check would trade the estimate for
+        # the thing that verifies it.
+        if "Volume" in hist.columns:
+            wanted.append("Volume")
+        frame = hist[wanted].astype(float)
+        frame.columns = [c.lower() for c in wanted]
+        if "volume" not in frame.columns:
+            frame["volume"] = float("nan")
+        frame.index = pd.DatetimeIndex([d.date() for d in frame.index])
+        return frame
+
     def quote(self, symbol: str) -> Quote:
         """Latest price, or a clearly-marked last close.
 

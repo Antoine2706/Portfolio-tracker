@@ -9,6 +9,7 @@
     portfolio controls                   # calibrate the backtest harness
     portfolio backtest erc               # equal risk contribution vs buy-and-hold
     portfolio allocate 5000              # where new money should go
+    portfolio spreads                    # each instrument's bid-ask spread
 
 Deliberately thin: argument parsing and process startup only. Every decision
 about data lives in `api.services`.
@@ -17,7 +18,9 @@ about data lives in `api.services`.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import os
+import pathlib
 import sys
 import threading
 import webbrowser
@@ -427,6 +430,65 @@ def _instruments(args: argparse.Namespace) -> int:
     return 0
 
 
+def _spreads(args: argparse.Namespace) -> int:
+    """Estimate the bid-ask spread for every instrument, from its own bars.
+
+    Read-only unless `--write` is given. Looking at what the estimator says
+    and committing it to the instrument records are different actions, and a
+    number that is about to become an input to every cost figure in the tool
+    should have to be looked at first.
+    """
+    from .research import load_book, survey_spreads
+
+    try:
+        book = load_book(mode=args.mode, data_root=args.data_root,
+                         provider=args.provider, lookback=args.history,
+                         account_value=args.account_value)
+    except Exception as exc:                       # noqa: BLE001 - reported, not raised
+        print(f"Could not load the book: {exc}", file=sys.stderr)
+        return 2
+
+    survey = survey_spreads(book, mode=args.mode, data_root=args.data_root,
+                            provider=args.provider,
+                            fallback_bps=args.fallback)
+    print("\n".join(survey.lines()))
+
+    if not survey.ranking.passed:
+        print()
+        print("The ranking check did not pass. Nothing is written on that "
+              "basis: an", file=sys.stderr)
+        print("ordering that contradicts liquidity is more likely to be a "
+              "wiring fault", file=sys.stderr)
+        print("than a market fact, and writing it would bake the fault into "
+              "every", file=sys.stderr)
+        print("cost figure the tool prints.", file=sys.stderr)
+        return 1
+
+    if args.write:
+        from .data.store import DataMode, DataStore
+        from .agents.spreads import ESTIMATED
+        root = pathlib.Path(args.data_root) if args.data_root else None
+        store = DataStore.open(DataMode(args.mode), root=root)
+        instruments = store.load_instruments()
+        written = 0
+        for isin, decision in survey.decisions.items():
+            if decision.source != ESTIMATED or isin not in instruments:
+                continue
+            instruments[isin] = dataclasses.replace(
+                instruments[isin],
+                half_spread_bps=round(decision.half_spread_bps, 2),
+                spread_observed=False,
+                spread_source=decision.source)
+            written += 1
+        store.save_instruments(instruments)
+        print()
+        print(f"Wrote {written} estimated half-spread(s) to "
+              f"{store.directory}. Instruments that")
+        print("did not clear the gates were left alone, keeping the declared "
+              "constant.")
+    return 0
+
+
 def _allocate(args: argparse.Namespace) -> int:
     """Where a purchase of new money should go.
 
@@ -646,6 +708,24 @@ def build_parser() -> argparse.ArgumentParser:
                           help="also answer: how much would reaching this "
                                "dispersion take, buy-only?")
     allocate.set_defaults(func=_allocate)
+
+    spreads = sub.add_parser(
+        "spreads",
+        help="estimate each instrument's bid-ask spread from its own bars")
+    spreads.add_argument("--mode", choices=["seed", "user"], default="user")
+    spreads.add_argument("--provider", choices=["yfinance", "fixture"],
+                         default="yfinance")
+    spreads.add_argument("--data-root", default=None)
+    spreads.add_argument("--history", type=int, default=750,
+                         help="price history to load, in rows")
+    spreads.add_argument("--account-value", type=float, default=None)
+    spreads.add_argument("--fallback", type=float, default=8.0,
+                         help="the declared constant, in bps, charged where "
+                              "an estimate cannot be supported (default 8)")
+    spreads.add_argument("--write", action="store_true",
+                         help="store the estimates that cleared every gate "
+                              "onto the instrument records")
+    spreads.set_defaults(func=_spreads)
     return parser
 
 
