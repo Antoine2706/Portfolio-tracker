@@ -476,24 +476,37 @@ def run_calibration(*, seeds: int = NEGATIVE_CONTROL_SEEDS, periods: int = 1260,
         calib_panel, target=target_turnover, warmup=warmup,
         rebalance_every=rebalance_every, seed=0)
 
-    ts, sharpes = [], []
+    # Both overlap settings, because only one of them was ever calibrated.
+    #
+    # The real backtest declares `overlap = rebalance_every`, this control ran
+    # at the default of 1, and the two went down different code paths. The
+    # declared-overlap path deflated every t-statistic by roughly the square
+    # root of the overlap and nothing noticed, because the only check on the
+    # standard error was here, on the path that did not use it. That is the
+    # fifth time in this project a check has passed without exercising what it
+    # claimed, so the control now covers the setting the tool actually runs.
+    ts, ts_overlapped, sharpes = [], [], []
     for seed in range(seeds):
         panel, _ = synthetic_world(n_assets=n_assets, periods=periods,
                                    sigma=0.011, seed=1000 + seed)
-        record = walk_forward(panel, CoinFlip(lam=lam, seed=seed), warmup=warmup,
+        result = walk_forward(panel, CoinFlip(lam=lam, seed=seed), warmup=warmup,
                               rebalance_every=rebalance_every, cost_model=None,
-                              execution=Execution.NEXT_CLOSE).track()
+                              execution=Execution.NEXT_CLOSE)
+        record = result.track()
         ts.append(record.t_statistic)
+        ts_overlapped.append(result.track(overlap=rebalance_every).t_statistic)
         sharpes.append(record.sharpe)
     ts_arr, sharpe_arr = np.array(ts), np.array(sharpes)
     rejection = float(np.mean(np.abs(ts_arr) > 1.959964))
     se_mean = float(sharpe_arr.std(ddof=1)) / math.sqrt(seeds)
     t_of_mean = float(sharpe_arr.mean()) / se_mean
     spread_of_t = float(ts_arr.std(ddof=1))
+    spread_overlapped = float(np.array(ts_overlapped).std(ddof=1))
     rejection_se = math.sqrt(0.05 * 0.95 / seeds)
     negative_ok = (abs(t_of_mean) < 3.0
                    and abs(rejection - 0.05) < 4 * rejection_se
-                   and 0.75 < spread_of_t < 1.35)
+                   and 0.75 < spread_of_t < 1.35
+                   and 0.70 < spread_overlapped < 1.35)
     outcomes.append(ControlOutcome(
         "negative control - a no-skill policy with matched turnover",
         negative_ok,
@@ -506,11 +519,15 @@ def run_calibration(*, seeds: int = NEGATIVE_CONTROL_SEEDS, periods: int = 1260,
         f"spread of the t-statistics {spread_of_t:.4f}  (must be near 1: a "
         f"standard error\n"
         f"  wrong by a factor k shows up here as 1/k)\n"
+        f"  the same, declaring overlap {rebalance_every}: "
+        f"{spread_overlapped:.4f}  (the setting a real\n"
+        f"  backtest runs at, and the one nothing used to check)\n"
         f"rejected the true null in {rejection:.1%} of runs  "
         f"(nominal 5.0%, standard error {rejection_se:.1%})",
         {"seeds": seeds, "lambda": lam, "turnover": realised_turnover,
          "mean_sharpe": float(sharpe_arr.mean()), "t_of_mean": t_of_mean,
-         "spread_of_t": spread_of_t, "rejection_rate": rejection}))
+         "spread_of_t": spread_of_t, "spread_of_t_overlapped": spread_overlapped,
+         "rejection_rate": rejection}))
 
     # ---- positive: a known injected edge ----------------------------------
     rows, positive_ok = [], True

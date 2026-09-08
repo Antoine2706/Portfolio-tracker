@@ -138,6 +138,61 @@ class TestOverlap:
         assert plain.sharpe == pytest.approx(overlapped.sharpe), (
             "the point estimate is unchanged; only its uncertainty moves")
 
+    def test_it_weakens_the_claim_a_little_and_not_by_a_factor(self):
+        """How much it may weaken it, which is the part that was wrong.
+
+        A t-statistic is close to invariant under how finely you sample an
+        independent series: t ~ SR_annual x sqrt(years) whichever frequency
+        the ratio is measured at. Declaring an overlap should therefore cost
+        a few percent -- through the T-1 and the SR^2 term -- and not a factor.
+
+        It cost a factor of sqrt(overlap), because the standard error was
+        computed from a *daily* Sharpe against a *monthly* observation count.
+        A ratio and a count have to describe the same sampling interval.
+        """
+        r = series(0.0006, 0.01, 1008, seed=6)
+        ratio = abs(track_record(r, overlap=21).t_statistic
+                    / track_record(r).t_statistic)
+        assert 0.8 < ratio < 1.0, (
+            f"declaring a 21-period overlap changed the t-statistic by a "
+            f"factor of {ratio:.3f}; near sqrt(21) = 4.58 means the ratio and "
+            f"the observation count are at different frequencies again")
+
+
+class TestTheErrorBarsAreCalibrated:
+    """Simulation, because a standard error is a claim about a distribution.
+
+    Under a true null the t-statistic must have standard deviation 1. The
+    negative control already checks this at overlap 1 and found the spread to
+    be 1.0009. Nothing checked it at any other overlap, and at 21 it was 0.21
+    -- an error of nearly five times, in the under-claiming direction, which
+    is why it survived: a harness that finds nothing looks careful.
+    """
+
+    @pytest.mark.parametrize("overlap,floor", [(1, 0.93), (5, 0.90), (21, 0.85)])
+    def test_the_t_statistic_has_unit_spread_under_the_null(self, overlap, floor):
+        rng = np.random.default_rng(11)
+        ts = np.array([track_record(pd.Series(rng.normal(0.0, 0.01, 256)),
+                                    overlap=overlap).t_statistic
+                       for _ in range(600)])
+        spread = float(ts.std(ddof=1))
+        assert floor < spread < 1.10, (
+            f"t-statistics under a true null have standard deviation "
+            f"{spread:.3f} at overlap {overlap}; a standard error wrong by a "
+            f"factor shows up here as its reciprocal")
+        assert abs(float(ts.mean())) < 0.15
+
+    def test_the_annual_standard_error_and_the_t_statistic_agree(self):
+        """They are two views of one number, and a reader will divide."""
+        for overlap in (1, 21):
+            tr = track_record(series(0.0006, 0.01, 504, seed=8), overlap=overlap)
+            assert tr.sharpe / tr.annual_standard_error == \
+                pytest.approx(tr.t_statistic, rel=1e-9)
+
+    def test_the_band_reads_as_an_estimate_with_its_uncertainty(self):
+        tr = track_record(series(0.0006, 0.01, 504, seed=8), overlap=21)
+        assert tr.band() == f"{tr.sharpe:.2f} +/- {tr.annual_standard_error:.2f}"
+
 
 class TestTurnover:
     def test_drift_is_what_a_rebalance_undoes(self):

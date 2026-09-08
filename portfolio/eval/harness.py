@@ -66,6 +66,11 @@ class Execution(enum.Enum):
     NEXT_CLOSE = "next_close"
 
 
+# Below this a holding is not really held, and its missing price cannot move
+# the portfolio's return.
+WEIGHT_EPSILON = 1e-9
+
+
 @dataclasses.dataclass(frozen=True)
 class Panel:
     """Aligned price history for the instruments under evaluation.
@@ -129,6 +134,12 @@ class BacktestResult:
     returns: pd.Series                   # net of costs
     gross_returns: pd.Series
     weights: pd.DataFrame                # held at each day's close
+    # True where the day is a clean one-period observation: every holding that
+    # mattered printed a price on this bar and the one before it. False days
+    # are still real money and stay in the compounded return; they are kept
+    # out of every variance, because a holding that could not be marked did
+    # not return 0.00%, and the day after a gap carries two days of move.
+    measured: pd.Series
     turnover: pd.Series                  # non-zero only on execution days
     costs: pd.Series
     decisions: tuple[Decision, ...]
@@ -141,6 +152,15 @@ class BacktestResult:
         return float(self.costs.sum())
 
     @property
+    def estimable(self) -> pd.Series:
+        """The subset of the record that may enter a variance."""
+        return self.returns[self.measured.to_numpy(dtype=bool)]
+
+    @property
+    def excluded_days(self) -> int:
+        return int((~self.measured.to_numpy(dtype=bool)).sum())
+
+    @property
     def mean_turnover(self) -> float:
         """Mean one-way turnover per rebalance, not per day."""
         executed = self.turnover[self.turnover.index.isin(
@@ -150,15 +170,22 @@ class BacktestResult:
     def track(self, *, trials: int = 1, trial_sharpe_sd: float = 0.0,
               overlap: int = 1,
               periods_per_year: int = TRADING_DAYS_PER_YEAR) -> TrackRecord:
-        """Summarise the net record with its uncertainty attached."""
+        """Summarise the net record with its uncertainty attached.
+
+        The estimator sees only the clean one-period observations; the total
+        return and the drawdown see everything that happened. A day a holding
+        could not be marked is real money and a fictional variance datum, and
+        the two facts have to go to different places.
+        """
         rebalances_per_year = (
             len(self.decisions) / (len(self.returns) / periods_per_year)
             if len(self.returns) else 0.0)
         return track_record(
-            self.returns, trials=trials, trial_sharpe_sd=trial_sharpe_sd,
+            self.estimable, trials=trials, trial_sharpe_sd=trial_sharpe_sd,
             periods_per_year=periods_per_year, overlap=overlap,
             costs=self.total_cost, turnover=self.mean_turnover,
-            rebalances_per_year=rebalances_per_year)
+            rebalances_per_year=rebalances_per_year,
+            realised_returns=self.returns)
 
 
 # --------------------------------------------------------------------------
@@ -182,6 +209,15 @@ def _drift(weights: dict[str, float], returns: pd.Series
     named in the third return value. That is the honest treatment of a
     trading halt or a delisting mid-period: the position has not vanished, and
     valuing it at zero would fabricate a total loss.
+
+    A zero is right for the *valuation* and wrong for the *estimator*: the
+    position genuinely could not be marked today, but 0.00% is not an observed
+    daily return. The caller reads the third value to keep such days out of
+    every variance -- see the `measured` mask on `BacktestResult`.
+
+    Only holdings with a non-trivial weight are reported. A zero-weight
+    instrument's missing price cannot affect the portfolio's return, and
+    flagging it would throw away days for no reason.
     """
     if not weights:
         return {}, 0.0, []
@@ -191,7 +227,8 @@ def _drift(weights: dict[str, float], returns: pd.Series
     for isin, w in weights.items():
         r = returns.get(isin, np.nan)
         if r is None or pd.isna(r):
-            missing.append(isin)
+            if abs(w) > WEIGHT_EPSILON:
+                missing.append(isin)
             r = 0.0
         g += w * float(r)
         growth[isin] = w * (1.0 + float(r))
@@ -302,6 +339,27 @@ def walk_forward(panel: Panel, policy: Policy, *,
     closes = panel.closes
     idx = closes.index
     n = len(idx)
+
+    # Two views of the same prices, and the distinction is the whole of the
+    # missing-data policy.
+    #
+    # `carried` forward-fills, and is what a position is VALUED against. Using
+    # the previous row instead means that when an instrument does not trade on
+    # day t, day t+1's return is computed against a NaN and is also lost -- so
+    # a single venue holiday destroys the two-day move rather than deferring
+    # it. That is money vanishing from the track record, and it was doing so
+    # silently.
+    #
+    # `observed` records where a price really printed, and is what decides
+    # whether a day is ESTIMATED from. A return is admitted to a variance only
+    # if both of its endpoint prices were observed on consecutive panel dates:
+    # the gap day itself is not a daily return (the holding could not be
+    # marked), and the day after it is not either (it carries two days of
+    # move). Keeping the money and dropping the observation is the only
+    # combination that is honest about both.
+    carried = closes.ffill()
+    observed = closes.notna()
+    column_at = {str(c): k for k, c in enumerate(closes.columns)}
     if warmup < 2:
         raise ValueError(f"warmup must be at least 2 rows, got {warmup}")
     if warmup >= n:
@@ -343,6 +401,13 @@ def walk_forward(panel: Panel, policy: Policy, *,
     held_rows: list[dict[str, float]] = []
     decisions: list[Decision] = []
     warnings: list[str] = []
+    measured: list[bool] = []
+
+    def is_clean(i: int, used) -> bool:
+        """Did every instrument that mattered today print on both bars?"""
+        return all(bool(observed.iat[i, column_at[k]])
+                   and bool(observed.iat[i - 1, column_at[k]])
+                   for k in used if k in column_at)
 
     # The first decision is taken at the close of `warmup - 1`, so the first
     # day that can earn a return under a policy's weights is `warmup`.
@@ -367,10 +432,11 @@ def walk_forward(panel: Panel, policy: Policy, *,
 
     for i in range(warmup, n):
         date = idx[i]
-        prev_close = closes.iloc[i - 1]
+        prev_close = carried.iloc[i - 1]
         today_close = closes.iloc[i]
         cost = 0.0
         turn = 0.0
+        used = {k for k, v in weights.items() if abs(v) > WEIGHT_EPSILON}
 
         if execution is Execution.NEXT_OPEN and pending is not None:
             today_open = panel.opens.iloc[i]
@@ -389,15 +455,18 @@ def walk_forward(panel: Panel, policy: Policy, *,
                 turnover=turn, cost=cost,
                 reason=pending.reason, confidence=pending.confidence))
             pending = None
+            used |= {k for k, v in target.items() if abs(v) > WEIGHT_EPSILON}
             for isin in set(missing) | set(missing2):
                 warnings.append(f"{isin} had no price on {date:%Y-%m-%d} "
-                                f"while held; carried at a zero return")
+                                f"while held; valued at its last print and "
+                                f"the day excluded from every variance")
         else:
             r_day = today_close / prev_close - 1.0
             weights, gross_r, missing = _drift(weights, r_day)
             for isin in missing:
                 warnings.append(f"{isin} had no price on {date:%Y-%m-%d} "
-                                f"while held; carried at a zero return")
+                                f"while held; valued at its last print and "
+                                f"the day excluded from every variance")
             if pending is not None:
                 # Next-close execution: the day has already accrued to the old
                 # weights, and the trade happens at tonight's close.
@@ -419,6 +488,7 @@ def walk_forward(panel: Panel, policy: Policy, *,
         turns.append(float(turn))
         costs.append(float(cost))
         held_rows.append(dict(weights))
+        measured.append(is_clean(i, used))
 
         if i in decision_days:
             decide(i)
@@ -430,6 +500,7 @@ def walk_forward(panel: Panel, policy: Policy, *,
         returns=pd.Series(net, index=index, name="net"),
         gross_returns=pd.Series(gross, index=index, name="gross"),
         weights=frame,
+        measured=pd.Series(measured, index=index, name="measured"),
         turnover=pd.Series(turns, index=index, name="turnover"),
         costs=pd.Series(costs, index=index, name="cost"),
         decisions=tuple(decisions),

@@ -110,18 +110,40 @@ class MarketView:
 
     def returns(self, lookback: int | None = None,
                 instruments: "tuple[str, ...] | list[str] | None" = None) -> pd.DataFrame:
-        """Simple daily returns, aligned on dates where every column is present.
+        """Simple daily returns over dates where every column really printed.
 
         `lookback` is the number of *returns* wanted, so it asks for one more
         row of prices. Getting that off by one is how a window silently
         becomes 251 days long, so it is done here once rather than at each
         call site.
+
+        A return is admitted only when both of its endpoint prices were
+        observed, on consecutive panel dates. Dropping the missing row alone
+        is not enough, and that is what this used to do: the next row's
+        `pct_change` then reached back over the gap and entered the sample as
+        a one-day move when it was two days of one.
+
+        A two-day return carries twice the variance of a one-day one, so in
+        expectation each such row inflates the estimate by roughly 1/n -- but
+        on any single sample it can land either way, since the two days may
+        offset as easily as reinforce. That is the case for excluding it
+        rather than correcting it: the number is not biased in a direction
+        anyone could reason about, it simply is not the quantity being
+        estimated.
+
+        Complete-case rather than pairwise: a covariance matrix assembled from
+        pairs with different sample sets can fail to be positive semi-definite,
+        and an optimiser handed such a matrix returns a confident answer to a
+        problem that has none. The cost is that one instrument's holiday
+        removes that date for every pair, which is a few rows out of 252.
         """
         rows = None if lookback is None else lookback + 1
-        prices = self.closes(rows, instruments).dropna(how="any")
+        prices = self.closes(rows, instruments)
         if len(prices) < 2:
             return prices.iloc[0:0]
-        return prices.pct_change().iloc[1:]
+        printed = prices.notna().all(axis=1)
+        admitted = (printed & printed.shift(1, fill_value=False)).to_numpy()
+        return prices.pct_change()[admitted]
 
     def covariance(self, lookback: int,
                    instruments: "tuple[str, ...] | list[str] | None" = None) -> pd.DataFrame:

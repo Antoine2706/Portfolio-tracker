@@ -112,10 +112,41 @@ proposing the weight it had a moment ago implies a trade.
 **Nothing is reported that the sample cannot support.** `eval/metrics.py`
 carries the standard error, the probabilistic and deflated Sharpe ratios and
 the minimum track record length, all with the third and fourth moments rather
-than a normality assumption. Where the window is too short, the verdict says
-so and gives the window that would suffice. The deflation takes the number of
-attempts from `research/registry.jsonl`, which is append-only for the same
-reason the ledger is.
+than a normality assumption. Every Sharpe is printed with its standard error
+beside it, because a ratio on its own invites a ranking. Where the window is
+too short, the verdict says so and gives the window that would suffice. The
+deflation takes the number of attempts from `research/registry.jsonl`, which
+is append-only for the same reason the ledger is.
+
+A ratio and an observation count must describe the same sampling interval.
+`effective_observations` changes the count when decisions overlap, so
+`rescale_sharpe` restates the ratio at that frequency before either is used;
+without it the standard error was computed from a daily Sharpe against a
+monthly count and every t-statistic came out roughly sqrt(overlap) too small.
+The negative control now measures the t-spread at both overlap settings,
+because it previously ran only at 1 while the real backtest ran at 21.
+
+**A day an instrument did not trade is not a 0.00% return.** Positions are
+*valued* against the last price that printed; estimates admit a return only
+when both of its endpoint prices were observed on consecutive panel dates.
+That keeps the money -- the missed move lands on the next print, so the
+compounded return is exactly what a buy-and-hold investor experienced -- and
+throws away the observation, since neither the gap day nor the day after it
+is a one-day move. `BacktestResult.measured` carries the mask and the report
+prints the excluded count beside the observation count.
+
+**The alarm fires on the policy, not on the window.** An annualised Sharpe
+above 1.5 is the calibration rule, but a level is a property of the window,
+and the benchmark shares the window: on a good year both legs clear it and
+the alarm means nothing about either. The threshold is therefore also applied
+to the **active return** -- policy minus benchmark, day by day -- whose Sharpe
+is the information ratio and which doing nothing scores exactly zero on.
+`Comparison.verdict()` reports the benchmark's own figure alongside, and says
+plainly when a shared high level points at the window or the data feed rather
+than at a leak. The paired series is also the comparison with power: two legs
+holding the same book have return series correlated to about 0.99, so almost
+all of each marginal standard error is common and cancels in the difference.
+Below |t| = 2 the two are reported as indistinguishable rather than ranked.
 
 ## Why not Streamlit any more
 

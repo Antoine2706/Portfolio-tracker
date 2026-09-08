@@ -63,13 +63,14 @@ from ..core.risk import drawdown
 from ..core.var import norm_cdf, norm_ppf, sample_skew_kurtosis
 
 __all__ = [
-    "EULER_MASCHERONI", "SUSPICIOUS_ANNUAL_SHARPE", "TrackRecord",
+    "EULER_MASCHERONI", "SUSPICIOUS_ANNUAL_SHARPE", "SUSPICIOUS_ACTIVE_SHARPE",
+    "TrackRecord",
     "sharpe_variance_factor", "sharpe_standard_error", "sharpe_t_statistic",
     "probabilistic_sharpe_ratio", "expected_maximum_sharpe",
     "deflated_sharpe_ratio", "deflation_threshold",
     "minimum_track_record_length", "years_to_detect",
-    "annualise_sharpe", "deannualise_sharpe", "turnover_series",
-    "effective_observations", "track_record",
+    "annualise_sharpe", "deannualise_sharpe", "rescale_sharpe",
+    "turnover_series", "effective_observations", "track_record",
 ]
 
 # Appears in the expected maximum of N independent normals. Not a fitted
@@ -83,6 +84,17 @@ EULER_MASCHERONI = 0.5772156649015328606
 # leak, a missing cost model, or a survivorship-filtered universe. The harness
 # flags it rather than celebrating it.
 SUSPICIOUS_ANNUAL_SHARPE = 1.5
+
+# The same rule applied to the quantity that is actually about the policy.
+#
+# A level above 1.5 says something about the window, and the benchmark shares
+# the window, so on a rising book both legs clear it and the alarm fires on
+# neither's account. The informative quantity is the ACTIVE series -- policy
+# minus benchmark, day by day -- whose Sharpe is the information ratio. A
+# retail rebalancing rule with an out-of-sample information ratio above 1 is
+# implausible for the same reason, and unlike the level it cannot be produced
+# by a good year: doing nothing scores exactly zero on it by construction.
+SUSPICIOUS_ACTIVE_SHARPE = 1.0
 
 
 # --------------------------------------------------------------------------
@@ -170,6 +182,36 @@ def sharpe_standard_error(sharpe: float, observations: int,
     return float(math.sqrt(
         sharpe_variance_factor(sharpe, skewness, excess_kurtosis)
         / (observations - 1)))
+
+
+def rescale_sharpe(sharpe: float, observations: int, effective: int) -> float:
+    """A per-period Sharpe restated at the effective observation frequency.
+
+    Needed because a Sharpe ratio and an observation count are only comparable
+    at the same frequency, and `effective_observations` changes the count
+    without changing the ratio. A daily Sharpe used with a monthly-equivalent
+    count is not a conservative approximation, it is a different quantity:
+
+        SR(h periods) = SR(1 period) x sqrt(h)
+
+    so coarsening 256 daily observations into 12 effective ones means each of
+    those 12 carries sqrt(256/12) times the daily ratio.
+
+    >>> round(rescale_sharpe(0.10064, 256, 12), 6)
+    0.464836
+    >>> rescale_sharpe(0.10064, 256, 256)
+    0.10064
+
+    This existed implicitly and wrongly: `track_record` fed a daily Sharpe to
+    a standard error computed on the effective count, which deflated every
+    t-statistic by roughly the square root of the overlap. Under a true null
+    the t-statistics then had standard deviation 0.21 instead of 1 -- an error
+    in the under-claiming direction, which is why it survived: a harness that
+    finds nothing is not obviously broken.
+    """
+    if observations < 1 or effective < 1:
+        raise ValueError("observation counts must be positive")
+    return float(sharpe * math.sqrt(observations / effective))
 
 
 def sharpe_t_statistic(sharpe: float, observations: int, skewness: float = 0.0,
@@ -459,14 +501,16 @@ class TrackRecord:
     the ratio on its own is the number this class exists to stop anyone
     quoting unqualified.
     """
-    observations: int
+    observations: int                    # admitted to the estimator
+    excluded_observations: int           # real money, but not clean one-day returns
     independent_observations: int
     periods_per_year: int
-    total_return: float
+    total_return: float                  # over everything realised
     mean_per_period: float
     volatility: float                    # annualised
     sharpe: float | None                 # annualised
     sharpe_per_period: float | None
+    sharpe_effective: float | None       # at the effective observation frequency
     skewness: float
     excess_kurtosis: float
     standard_error: float | None         # of the per-period Sharpe
@@ -488,11 +532,45 @@ class TrackRecord:
     deflation_fallback: bool = False
 
     @property
+    def realised_observations(self) -> int:
+        """Every period actually lived through, admitted to the estimator or not."""
+        return self.observations + self.excluded_observations
+
+    @property
+    def years(self) -> float:
+        return float(self.realised_observations / self.periods_per_year)
+
+    @property
+    def annual_standard_error(self) -> float | None:
+        """Standard error of the ANNUALISED Sharpe, in the same units as it.
+
+        The number to print beside a Sharpe ratio, because a ratio without one
+        invites a ranking the sample cannot support. Derived from the
+        per-observation error at the effective frequency:
+
+            SR_annual = SR_eff x sqrt(independent / years)
+
+        so the error scales the same way, and SR_annual / SE_annual is exactly
+        the reported t-statistic.
+        """
+        if self.standard_error is None or self.years <= 0:
+            return None
+        return float(self.standard_error
+                     * math.sqrt(self.independent_observations / self.years))
+
+    @property
     def supported(self) -> bool:
         """True when the sample is long enough to support the claim."""
         if self.minimum_track_record is None:
             return False
         return self.independent_observations >= self.minimum_track_record
+
+    def band(self) -> str:
+        """`1.60 +/- 1.09` -- the estimate and what the sample can pin it to."""
+        if self.sharpe is None:
+            return "n/a"
+        se = self.annual_standard_error
+        return f"{self.sharpe:.2f}" if se is None else f"{self.sharpe:.2f} +/- {se:.2f}"
 
     def verdict(self) -> str:
         """A sentence that refuses to overstate what the sample can carry."""
@@ -507,16 +585,15 @@ class TrackRecord:
         if not self.supported:
             need = self.minimum_track_record
             if need is None:
-                return (f"Annualised Sharpe {self.sharpe:.2f} is at or below "
-                        f"zero, so there is nothing to establish.")
-            years = need / self.periods_per_year
-            return (f"Annualised Sharpe {self.sharpe:.2f}, but "
-                    f"{self.independent_observations} independent observations "
-                    f"cannot establish it: {need:.0f} would be needed "
-                    f"({years:.1f} years). Reported as undetermined, not as a "
-                    f"result.")
-        return (f"Annualised Sharpe {self.sharpe:.2f} over "
-                f"{self.independent_observations} independent observations, "
+                return (f"Annualised Sharpe {self.band()} is at or below zero, "
+                        f"so there is nothing to establish.")
+            years = need / self.independent_observations * self.years
+            return (f"Annualised Sharpe {self.band()}, and {self.years:.1f} "
+                    f"years of data cannot establish it: about {years:.1f} "
+                    f"years would be needed at this ratio. Reported as "
+                    f"undetermined, not as a result.")
+        return (f"Annualised Sharpe {self.band()} over {self.years:.1f} years "
+                f"({self.independent_observations} independent observations), "
                 f"t = {self.t_statistic:.2f}, deflated Sharpe "
                 f"{self.deflated_sharpe:.2f} against {self.trials} "
                 f"pre-registered trials.")
@@ -528,12 +605,20 @@ def track_record(returns: pd.Series, *, trials: int = 1,
                  overlap: int = 1, costs: float | None = None,
                  turnover: float | None = None,
                  rebalances_per_year: float | None = None,
+                 realised_returns: "pd.Series | None" = None,
                  confidence: float = 0.95) -> TrackRecord:
     """Summarise an out-of-sample return series, uncertainty included.
 
     `returns` are per-period simple returns, already net of costs. `costs` is
     the total cost paid over the series as a fraction of average capital, used
     only to report the drag; it is not subtracted again here.
+
+    `realised_returns` is the full series actually experienced, when `returns`
+    is a subset of it. The split exists because a day on which a held
+    instrument did not trade is real money -- it belongs in the total return
+    and the drawdown -- but is not a clean one-day observation, so it must not
+    enter a variance. Passing the same series twice, or omitting it, keeps the
+    old behaviour.
 
     `overlap` is the number of periods each decision's estimation window
     shares with the next, and feeds `effective_observations`. Leave it at 1
@@ -559,12 +644,15 @@ def track_record(returns: pd.Series, *, trials: int = 1,
     arr = r.to_numpy()
 
     if n < 2:
+        full = r if realised_returns is None else realised_returns.dropna().astype(float)
         return TrackRecord(
-            observations=n, independent_observations=n,
+            observations=n, excluded_observations=int(len(full) - n),
+            independent_observations=n,
             periods_per_year=periods_per_year,
-            total_return=float(np.prod(1.0 + arr) - 1.0) if n else 0.0,
+            total_return=float(np.prod(1.0 + full.to_numpy()) - 1.0) if len(full) else 0.0,
             mean_per_period=float(arr.mean()) if n else 0.0,
             volatility=0.0, sharpe=None, sharpe_per_period=None,
+            sharpe_effective=None,
             skewness=0.0, excess_kurtosis=0.0, standard_error=None,
             t_statistic=None, probabilistic_sharpe=None, trials=trials,
             expected_max_sharpe=None, deflated_sharpe=None,
@@ -580,23 +668,32 @@ def track_record(returns: pd.Series, *, trials: int = 1,
     sr_period = float(mean / sd) if sd > 0 else None
     sr_annual = annualise_sharpe(sr_period, periods_per_year) if sr_period is not None else None
 
+    # Every statistic below is computed at the EFFECTIVE frequency: a Sharpe
+    # restated for `independent` observations, used with that same count. The
+    # ratio and the count have to describe the same sampling interval or the
+    # answer is neither the daily one nor the monthly one. Skew and kurtosis
+    # are the daily figures, which shrink under aggregation -- so the error
+    # bars come out slightly wide, which is the right direction.
     se = t = psr = dsr = mintrl = threshold = None
+    sr_effective = None
     deflation_fallback = False
     if sr_period is not None and independent >= 2:
-        se = sharpe_standard_error(sr_period, independent, skew, exk)
-        t = sr_period / se
-        psr = probabilistic_sharpe_ratio(sr_period, independent, skew, exk)
+        sr_effective = rescale_sharpe(sr_period, n, independent)
+        se = sharpe_standard_error(sr_effective, independent, skew, exk)
+        t = sr_effective / se
+        psr = probabilistic_sharpe_ratio(sr_effective, independent, skew, exk)
         threshold, deflation_fallback = deflation_threshold(
             independent, trials, trial_sharpe_sd)
-        dsr = probabilistic_sharpe_ratio(sr_period, independent, skew, exk,
+        dsr = probabilistic_sharpe_ratio(sr_effective, independent, skew, exk,
                                          benchmark=threshold)
-        mintrl = minimum_track_record_length(sr_period, skew, exk,
+        mintrl = minimum_track_record_length(sr_effective, skew, exk,
                                              benchmark=threshold,
                                              confidence=confidence)
 
-    values = (1.0 + r).cumprod()
+    realised = r if realised_returns is None else realised_returns.dropna().astype(float)
+    values = (1.0 + realised).cumprod()
     dd = drawdown(values)
-    years = n / periods_per_year
+    years = len(realised) / periods_per_year
     annual_turnover = None
     if turnover is not None:
         per_year = (rebalances_per_year if rebalances_per_year is not None
@@ -606,13 +703,15 @@ def track_record(returns: pd.Series, *, trials: int = 1,
 
     return TrackRecord(
         observations=n,
+        excluded_observations=int(len(realised) - n),
         independent_observations=independent,
         periods_per_year=periods_per_year,
-        total_return=float(np.prod(1.0 + arr) - 1.0),
+        total_return=float(np.prod(1.0 + realised.to_numpy()) - 1.0),
         mean_per_period=mean,
         volatility=float(sd * math.sqrt(periods_per_year)),
         sharpe=sr_annual,
         sharpe_per_period=sr_period,
+        sharpe_effective=sr_effective,
         skewness=float(skew),
         excess_kurtosis=float(exk),
         standard_error=se,

@@ -89,7 +89,7 @@ anything, so the harness is calibrated before any strategy is run against it:
 
 | Control | What it proves |
 |---|---|
-| **Negative** | A no-skill policy with matched turnover, over 200 seeds. The harness must show no edge, reject a true null at close to 5%, and produce t-statistics with standard deviation 1 — a standard error wrong by a factor shows up here as its reciprocal. |
+| **Negative** | A no-skill policy with matched turnover, over 200 seeds. The harness must show no edge, reject a true null at close to 5%, and produce t-statistics with standard deviation 1 — a standard error wrong by a factor shows up here as its reciprocal. Measured at both overlap settings, because it once ran only at the one the real backtest does not use. |
 | **Positive** | A policy given a known probability of foreseeing the next bar, in a world where its true Sharpe is available in closed form. The measured figure must match the injected one. Without this, "we found no edge" and "we could not have found an edge" are the same sentence. |
 | **Canary** | A policy that decides today using tomorrow's close. It must produce an absurd Sharpe. If it does not, the data feed leaks. |
 | **Leak detector** | Rewrites every price after a date and re-runs. Everything decided before it must be bit-identical. It also refuses to run when wired so that it could not fail. |
@@ -147,13 +147,30 @@ to price it is absolute, but refusing to produce any result at all was not the
 same thing. Equal risk contribution then solves over the restricted simplex
 and reports what the constraint cost.
 
-Every statistic is reported with its uncertainty. A Sharpe ratio the sample
-cannot establish is reported as undetermined, with the track record length
-that *would* establish it — a true annual Sharpe of 0.5 needs sixteen years
-of daily data to reach t = 2, and the tool says so rather than printing a
+Every statistic is reported with its uncertainty, and every Sharpe ratio is
+printed with its standard error beside it. A ratio the sample cannot
+establish is reported as undetermined, with the track record length that
+*would* establish it — a true annual Sharpe of 0.5 needs sixteen years of
+daily data to reach t = 2, and the tool says so rather than printing a
 number. Attempts are pre-registered in `research/registry.jsonl`, because the
 deflated Sharpe ratio takes the number of attempts as an argument and a count
 that omits the failures is not a count.
+
+The comparison against buy-and-hold is **paired**: the two legs hold the same
+book on the same days, so their returns correlate to about 0.99 and almost
+all of each Sharpe's error is the same error, cancelling in the difference.
+The tool reports the active return — policy minus benchmark, day by day —
+with its own error bar, and below t = 2 it says the two are
+*indistinguishable* rather than ranking them. The 1.5 alarm is applied to
+that active ratio as well as to the level, because a level above 1.5 is a
+property of the window and the benchmark shares the window; a leak inside a
+policy cannot lift a benchmark that never trades.
+
+A day on which a held instrument did not trade is never a 0.00% return.
+Positions are valued at the last price that printed, so the missed move lands
+on the next one and the compounded return is exactly right; the day itself is
+excluded from every variance, and the count of such days is printed beside
+the observation count.
 
 Paper trading only. Automatic execution on a real account is portfolio
 management under MiFID II; `portfolio/tests/test_paper_only.py` fails if a
