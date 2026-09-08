@@ -111,6 +111,30 @@ def _controls(args: argparse.Namespace) -> int:
     """
     from .eval.controls import NEGATIVE_CONTROL_SEEDS, run_calibration
 
+    if args.spread:
+        # A separate family: these calibrate the spread estimator against
+        # simulated markets, not the backtest harness against simulated
+        # returns. Run on their own so the estimator can be re-validated
+        # without paying for the harness controls, and vice versa.
+        from .eval.spread_controls import run_spread_controls
+        reports = run_spread_controls(quick=args.quick)
+        print("Spread estimator calibration")
+        print("=" * 60)
+        print()
+        for report in reports:
+            print("\n".join(report.lines()))
+            print()
+        print("-" * 60)
+        if all(r.passed for r in reports):
+            print("The estimator recovers spreads it was not told, declines")
+            print("the ones it cannot resolve, and its error bar predicts its")
+            print("own dispersion. Estimates from it may enter the cost model.")
+            return 0
+        print("AT LEAST ONE CONTROL FAILED. No spread estimate means anything")
+        print("until the failure above is understood; the cost model should")
+        print("keep its declared constant instead.")
+        return 1
+
     if args.quick:
         report = run_calibration(seeds=args.seeds or 40, periods=700,
                                  warmup=126, positive_seeds=6)
@@ -564,6 +588,9 @@ def build_parser() -> argparse.ArgumentParser:
                           help="a smaller, faster version for a sanity check")
     controls.add_argument("--register", action="store_true",
                           help="append the controls to the pre-registration log")
+    controls.add_argument("--spread", action="store_true",
+                          help="calibrate the bid-ask spread estimator instead "
+                               "of the backtest harness")
     controls.set_defaults(func=_controls)
 
     backtest = sub.add_parser(
