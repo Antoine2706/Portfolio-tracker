@@ -795,6 +795,39 @@ class Refusal:
 
 
 @dataclasses.dataclass(frozen=True)
+class Diluted:
+    """A holding the purchase pushes further from where it should be.
+
+    Every euro that goes somewhere else makes a holding that cannot receive
+    money a smaller share of a larger book. That is a real consequence of the
+    recommendation and it points the wrong way, so it is stated rather than
+    left to be inferred from two weights on different lines.
+
+    `target` is the weight unconstrained equal risk contribution wants, which
+    is the standard the rest of the report is measured against. Printing the
+    move without it would say the holding got smaller without saying whether
+    smaller was wrong.
+    """
+    isin: str
+    name: str
+    weight_before: float
+    weight_after: float
+    target: float
+    reason: str
+
+    @property
+    def drift(self) -> float:
+        """How much further from the target the purchase leaves it.
+
+        Positive means the gap widened. Negative would mean the dilution
+        happened to help, which is possible when the holding is above its
+        target to begin with.
+        """
+        return abs(self.weight_after - self.target) - abs(
+            self.weight_before - self.target)
+
+
+@dataclasses.dataclass(frozen=True)
 class Destination:
     """What happens if the whole purchase goes to one holding.
 
@@ -949,6 +982,7 @@ class BuyOnlyAllocation:
     purchases: tuple[Purchase, ...]
     refused: tuple[Refusal, ...]
     destinations: tuple[Destination, ...]
+    diluted: tuple[Diluted, ...]
     dispersion_now: float
     dispersion_after: float              # on the EXECUTABLE, rounded order
     spread_now: float                    # the range, descriptive only
@@ -1096,6 +1130,21 @@ class BuyOnlyAllocation:
                 cost = "n/a" if d.cost is None else f"{d.cost:,.2f}"
                 out.append(f"  {names[d.isin][:27]:28}{d.dispersion:>11.4f}"
                            f"{cost:>9}{per:>11}")
+        if self.diluted:
+            out += ["", "What this purchase does to what it cannot buy",
+                    "-" * 64,
+                    f"  {'holding':28}{'weight now':>12}{'after':>10}"
+                    f"{'equal risk':>12}{'drift':>9}"]
+            for d in self.diluted:
+                out.append(f"  {d.name[:27]:28}{d.weight_before:>12.1%}"
+                           f"{d.weight_after:>10.1%}{d.target:>12.1%}"
+                           f"{d.drift:>+9.1%}")
+            out.append(
+                "  Every euro that goes somewhere else makes these a smaller "
+                "share of a larger book. A positive drift means the purchase "
+                "leaves them further from where equal risk contribution wants "
+                "them, which is a cost of the recommendation and not a "
+                "rounding artefact.")
         if self.refused:
             out += ["", "Refused", "-" * 64]
             for r in self.refused:
@@ -1216,10 +1265,31 @@ def allocate_buy_only(*, values: "dict[str, float]", prices: "dict[str, float]",
     gap = (max(d.dispersion for d in destinations)
            - min(d.dispersion for d in destinations)) if destinations else 0.0
 
+    # What the purchase does to the holdings it cannot enter. Every euro that
+    # goes elsewhere makes them a smaller share of a larger book, which is a
+    # consequence of the recommendation pointing the wrong way, so it is
+    # printed rather than left to be inferred from two weights.
+    diluted = []
+    if total_value > 0 and after.sum() > 0:
+        try:
+            wanted = equal_risk_weights(cov)
+        except (RuntimeError, ValueError):
+            wanted = None
+        excuses = {r.isin: r.reason for r in refusals}
+        for i, k in enumerate(keys):
+            if allowed[i] or held[i] <= 0:
+                continue
+            diluted.append(Diluted(
+                isin=k, name=costs.facts(k).name or k,
+                weight_before=float(held[i] / total_value),
+                weight_after=float(after[i] / after.sum()),
+                target=(float(wanted[k]) if wanted is not None else float("nan")),
+                reason=excuses.get(k, "new money may not go into it")))
+
     return BuyOnlyAllocation(
         cash=float(cash), invested=invested, leftover=float(cash - invested),
         purchases=tuple(purchases), refused=tuple(refusals),
-        destinations=tuple(destinations),
+        destinations=tuple(destinations), diluted=tuple(diluted),
         dispersion_now=dispersion_now,
         dispersion_after=dispersion_after,
         spread_now=spread_now, spread_after=spread_after,

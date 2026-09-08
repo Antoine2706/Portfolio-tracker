@@ -96,6 +96,10 @@ def allocate(req: S.AllocateRequest,
         refused=[S.AllocationRefusal(isin=r.isin, name=label(r.isin),
                                      reason=r.reason)
                  for r in result.refused],
+        diluted=[S.AllocationDilution(
+            isin=d.isin, name=label(d.isin), weight_before=d.weight_before,
+            weight_after=d.weight_after, target=d.target, drift=d.drift,
+            reason=d.reason) for d in result.diluted],
         dispersion_now=result.dispersion_now,
         dispersion_after=result.dispersion_after,
         spread_now=result.spread_now, spread_after=result.spread_after,

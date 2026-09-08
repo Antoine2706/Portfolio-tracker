@@ -20,6 +20,14 @@ Three consequences shape the code, not just the documentation:
     compliance function that cannot be outsourced, so it is not obtainable by
     one person building this in the evenings.
 
+The account this is built against is **Execution Only** -- confirmed on the
+MeDirect statement of 30 June 2026. That is the classification in which the
+bank gives no advice and assesses no suitability, and the holder makes every
+decision themselves. It is the classification this tool is consistent with
+and the one it must stay consistent with: a tool that produces a list for its
+holder to type into their own broker sits inside Execution Only; the same
+tool with an endpoint attached does not, whoever owns the account.
+
 Trading one's own money automatically needs no authorisation. Building
 something another person could point at their own account does. The line
 between those two is a single endpoint constant, which is exactly the kind of

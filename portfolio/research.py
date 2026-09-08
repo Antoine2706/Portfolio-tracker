@@ -55,7 +55,8 @@ from .eval.harness import Execution, Panel, buy_and_hold, walk_forward
 from .eval.report import Comparison, compare
 
 __all__ = ["Book", "load_book", "run_equal_risk_contribution",
-           "allocate_new_money", "replay_the_ledger"]
+           "allocate_new_money", "replay_the_ledger", "names_the_window",
+           "dominant_holding"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -262,22 +263,35 @@ def run_equal_risk_contribution(book: Book, *, lookback: int = 252,
         window = simple_returns(book.panel.closes).dropna().iloc[-lookback:]
         cov = covariance_matrix(window)
         among = [c for c in book.panel.closes.columns if c in book.tradeable]
-        final = result.weights.iloc[-1].to_dict()
+        # Every column, not just the held ones. `risk_decomposition` requires a
+        # weight for each name in the covariance matrix, and a panel routinely
+        # carries instruments with no position -- a watchlist entry, or one
+        # sold since. Their weight is zero, which is a fact rather than a gap,
+        # and omitting it raised `no weight supplied for [...]` and took the
+        # whole backtest down on any book with a watchlist.
+        columns = [str(c) for c in cov.columns]
+        start = {k: float(book.weights.get(k, 0.0)) for k in columns}
+        ending = result.weights.iloc[-1].to_dict()
+        final = {k: float(ending.get(k, 0.0)) for k in columns}
         # Both numbers, and the same two names the allocator uses, so
         # "dispersion" means one thing in this project. The coefficient of
         # variation uses every holding; the range is decided by two of them
         # and is here because it says whether one holding is the problem.
         notes.append(
             f"risk-share dispersion across the {len(among)} tradeable "
-            f"holdings: {risk_dispersion(book.weights, cov, among=among):.2f} "
+            f"holdings: {risk_dispersion(start, cov, among=among):.2f} "
             f"for the book as it stands, "
             f"{risk_dispersion(final, cov, among=among):.2f} after the policy "
             f"(coefficient of variation, zero when the contributions are "
             f"equal). The range over the same mean goes "
-            f"{risk_contribution_spread(book.weights, cov, among=among):.2f} "
+            f"{risk_contribution_spread(start, cov, among=among):.2f} "
             f"to {risk_contribution_spread(final, cov, among=among):.2f}. "
             f"Lower is more equal; this is what the policy claims to do, "
             f"measured separately from whether doing it paid.")
+
+    dominant = dominant_holding(book, warmup=warmup)
+    if dominant is not None:
+        notes.append(dominant)
 
     if refereed.adjustments:
         notes.append(f"{len(refereed.adjustments)} proposed trades were skipped "
@@ -288,6 +302,66 @@ def run_equal_risk_contribution(book: Book, *, lookback: int = 252,
     return compare(result, benchmark, cost_model=book.costs, trials=trials,
                    trial_sharpe_sd=trial_sharpe_sd, overlap=rebalance_every,
                    weights=book.weights, constraint_notes=tuple(notes))
+
+
+def dominant_holding(book: Book, *, warmup: int = 0,
+                     multiple: float = 3.0) -> "str | None":
+    """`names_the_window` on this book's panel. See it for the reasoning."""
+    closes = book.panel.closes.iloc[warmup:] if warmup else book.panel.closes
+    names = {i: inst.display_name for i, inst in book.instruments.items()}
+    return names_the_window(closes, names, multiple=multiple)
+
+
+def names_the_window(closes: pd.DataFrame, names: "dict[str, str]", *,
+                     multiple: float = 3.0) -> "str | None":
+    """Name the holding that made the window, when one did.
+
+    A backtest over a window in which one holding nearly doubled is not a
+    backtest of a policy; it is a measurement of what that policy did about
+    that holding. Equal risk contribution trims the most volatile holding, so
+    a window whose return came from the most volatile holding is one it was
+    always going to lose, and the reader is entitled to know that before
+    reading the verdict rather than after.
+
+    Computed rather than asserted: the holding is named only when its total
+    return over the measured window exceeds `multiple` times the RUNNER-UP's,
+    so on a book where nothing dominated nothing is claimed.
+
+    Against the runner-up rather than against the median of the others, which
+    was the first rule and was wrong in a way a test caught. On a book where
+    two holdings returned 80% and 75% and the other two returned 5%, the
+    median of the others is 5%, so the leader cleared three times it easily
+    and the report named one of a pair as though it alone made the window. If
+    two ran, no single one explains the result and naming either is choosing a
+    story. The runner-up is floored at the median absolute return of the rest,
+    so a leader that ran while everything else fell still counts.
+
+    None when no holding stands out, which is the case a note would only
+    clutter.
+    """
+    if closes.shape[0] < 2 or closes.shape[1] < 3:
+        return None
+    first = closes.ffill().bfill().iloc[0]
+    last = closes.ffill().iloc[-1]
+    total = ((last / first) - 1.0).dropna()
+    if total.empty:
+        return None
+    leader = total.idxmax()
+    others = total.drop(index=leader)
+    if others.empty:
+        return None
+    best = float(total[leader])
+    runner_up = max(float(others.max()), float(others.abs().median()))
+    if best <= 0 or runner_up <= 0 or best < multiple * runner_up:
+        return None
+    return (
+        f"one holding made this window: {names.get(leader, leader)} "
+        f"({leader}) returned {best:+.1%} while the rest of the book ran "
+        f"between {others.min():+.1%} and {others.max():+.1%}. That is what "
+        f"the benchmark's Sharpe ratio is mostly measuring, and it is most of "
+        f"why a policy that trims the most volatile holding lost: the most "
+        f"volatile holding was the one that ran. Read the verdict against "
+        f"that rather than as a property of the policy.")
 
 
 def replay_the_ledger(book: Book, *, mode: str = "user",

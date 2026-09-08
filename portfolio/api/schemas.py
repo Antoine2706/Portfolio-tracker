@@ -714,6 +714,23 @@ class AllocationRefusal(BaseModel):
     reason: str
 
 
+class AllocationDilution(BaseModel):
+    """A holding the purchase pushes further from its equal-risk weight.
+
+    New money that cannot enter a holding still makes it a smaller share of a
+    larger book. `drift` is positive when the purchase widens the gap to
+    `target`, which is a cost of the recommendation and belongs on the screen
+    rather than in the reader's head.
+    """
+    isin: str
+    name: str
+    weight_before: float
+    weight_after: float
+    target: float
+    drift: float
+    reason: str
+
+
 class AllocationOut(BaseModel):
     cash: float
     invested: float
@@ -722,6 +739,7 @@ class AllocationOut(BaseModel):
     purchases: list[AllocationPurchase]
     destinations: list[AllocationDestination]
     refused: list[AllocationRefusal]
+    diluted: list[AllocationDilution]
     # Three floors, not one: where the book is, the best reachable with this
     # much money, and the best reachable if selling were allowed.
     # `dispersion_*` is the coefficient of variation of the risk shares --
