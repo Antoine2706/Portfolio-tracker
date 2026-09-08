@@ -107,6 +107,33 @@ samples. Moved onto ``s^2``, where the sampling distribution is symmetric and
 the sign survives, the same nominal rule claims 2%. `resolution_control`
 prints both columns.
 
+**The estimator runs 1 to 3% high on wide spreads, and it is a finite-trade
+effect rather than a defect.** The positive control's bias column is monotone
+in the spread -- -0.6, +0.9, +1.0, +1.2, +2.1% at 5, 10, 20, 50 and 100 bps --
+and at 60 runs a rung that +2.1% is about seven standard errors, so it is real
+and not sampling noise. Holding the spread fixed and varying the number of
+trades per bar separates the cause:
+
+    imposed        10       30       60      200      600   trades/bar
+     20 bps     -1.7%    -0.3%    +1.9%    +0.6%    -0.9%
+     50 bps     +2.3%    +2.1%    +2.2%    +1.0%    -0.0%
+    100 bps     +4.6%    +3.0%    +2.4%    +1.3%    +0.4%
+
+It shrinks to nothing as trading becomes continuous, which is the paper's
+asymptotic claim holding. What it is: ``(h+l)/2`` is a slightly biased read on
+the efficient mid-range when the high and the low are drawn from few prints,
+and the size of that error scales with the spread. Distinct from -- and much
+smaller than -- the *downward* infrequent-trading bias that ``p_o`` and
+``p_c`` exist to remove, which is 21% on three-trade bars.
+
+This is not the simulator's artefact to fix: real instruments trade discretely
+too, so a generator that did not show it would be the wrong generator. The
+direction is the harmless one for a cost model, which overstates cost slightly
+rather than understating it, and it is under half the estimator's own standard
+error at every rung. Recorded rather than corrected, because a correction
+fitted to this simulation's trade counts would not transfer to an instrument
+with different ones.
+
 **The error bar is about 7% optimistic.** Across 10 to 100 bps the reported
 standard error is 0.87 to 1.07 times the dispersion it predicts, median 0.93.
 The cause is a plug-in estimator's usual one: the combination weight, the two

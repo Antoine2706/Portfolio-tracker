@@ -333,3 +333,41 @@ class TestTheTickIsMeasuredNotLookedUp:
         such an instrument the tick, not the sample, is the binding limit."""
         tick = TickSize(size=0.01, agreement=1.0, prices=1000)
         assert tick.floor_bps(4.0) == pytest.approx(12.5)
+
+
+class TestTheFiniteTradeBias:
+    """The estimator runs slightly high on wide spreads at realistic trade
+    counts, and the effect goes away as trading becomes continuous.
+
+    Measured rather than assumed, and pinned here because it is the one
+    systematic error the controls found that is *not* corrected. If a change
+    ever makes it larger, or makes it stop shrinking with the trade count,
+    that is a different effect wearing the same name and the module docstring
+    would be describing something that no longer happens.
+    """
+
+    def _bias(self, half_bps: float, ticks: int, runs: int = 40) -> float:
+        got = [edge(*bars(half_bps, n=500, ticks=ticks, seed=800_000 + i),
+                    minimum_bars=0).half_spread_bps for i in range(runs)]
+        return (float(np.mean(got)) - half_bps) / half_bps
+
+    def test_it_shrinks_as_trading_becomes_continuous(self):
+        """The claim that separates a finite-trade effect from a defect."""
+        few = self._bias(100.0, ticks=10)
+        many = self._bias(100.0, ticks=600)
+        assert few > 0.02, f"expected a visible bias on thin bars, got {few:+.1%}"
+        assert many < 0.5 * few, (
+            f"bias at 600 trades/bar is {many:+.1%} against {few:+.1%} at 10; "
+            f"it is meant to shrink towards zero, and if it does not this is "
+            f"not the effect the module docstring describes")
+
+    def test_it_is_small_next_to_the_correction_it_is_not(self):
+        """The infrequent-trading bias `p_o` and `p_c` remove is 21% on
+        three-trade bars. This one is a few percent. Confusing the two would
+        make the correction look unnecessary."""
+        assert abs(self._bias(100.0, ticks=10)) < 0.10
+
+    def test_it_errs_in_the_harmless_direction(self):
+        """A cost model that overstates cost declines trades it could have
+        afforded. One that understates it takes trades it could not."""
+        assert self._bias(100.0, ticks=30) > 0
