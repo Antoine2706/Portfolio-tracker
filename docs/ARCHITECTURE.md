@@ -138,15 +138,45 @@ prints the excluded count beside the observation count.
 **The alarm fires on the policy, not on the window.** An annualised Sharpe
 above 1.5 is the calibration rule, but a level is a property of the window,
 and the benchmark shares the window: on a good year both legs clear it and
-the alarm means nothing about either. The threshold is therefore also applied
-to the **active return** -- policy minus benchmark, day by day -- whose Sharpe
-is the information ratio and which doing nothing scores exactly zero on.
-`Comparison.verdict()` reports the benchmark's own figure alongside, and says
-plainly when a shared high level points at the window or the data feed rather
-than at a leak. The paired series is also the comparison with power: two legs
-holding the same book have return series correlated to about 0.99, so almost
-all of each marginal standard error is common and cancels in the difference.
-Below |t| = 2 the two are reported as indistinguishable rather than ranked.
+the alarm means nothing about either. `Comparison.verdict()` reports the
+benchmark's own figure alongside and says plainly when a shared high level
+points at the window or at the data feeding both legs rather than at a leak.
+
+**And it fires on the risk-adjusted gap, not on the raw active return.** The
+first attempt at the above put the threshold and the |t| = 2 verdict on the
+active return -- policy minus benchmark, day by day. For a de-risking policy
+that is a tautology: equal risk contribution holds less of the volatile
+assets, so in a rising window it underperforms by construction, and the
+identical policy in a falling window comes out significantly *better*. The
+sign belongs to the window. `test_risk_adjusted.py` demonstrates it with a
+policy that holds a fixed fraction of the benchmark's book and nothing else:
+t = -2.6 in one window, +2.7 in the other, zero skill in both.
+
+The quantity that generalises is the comparison at matched risk. With the
+risk-free rate at zero an annualised arithmetic return is Sharpe times
+volatility, so the raw gap splits exactly:
+
+```
+R_p - R_b = (SR_p - SR_b) x sigma_b   +   SR_p x (sigma_p - sigma_b)
+            \_____ selection _____/       \______ mandate ______/
+```
+
+Both terms are printed. *Selection* is what the strategy cost once levered to
+the benchmark's risk -- the part a different window could have reversed --
+and it is what the verdict tests. *Mandate* is what carrying different risk
+contributed by construction, and it is what the policy was asked to produce.
+The report states that matching risk means levering by sigma_b / sigma_p,
+which a cash account cannot do: the raw gap is what the account lost and the
+selection term is what the strategy cost, and neither replaces the other.
+
+The difference of the two Sharpe ratios is tested with Jobson-Korkie plus
+Memmel's correction (`sharpe_difference_standard_error`), at a correlation
+that is **measured and printed**, never assumed -- every figure depends on it.
+Two legs holding the same book correlate at about 0.99, the `2(1 - rho)` term
+collapses, and the paired error comes out a fraction of either marginal one:
+that is what makes the test possible at all. Normality is assumed there and
+declared, since the robust version needs a HAC estimator; the formula is
+checked against 20,000 Monte Carlo draws per correlation in the suite.
 
 ## Why not Streamlit any more
 

@@ -31,13 +31,15 @@ cost model's own assumptions underneath, every time.
 from __future__ import annotations
 
 import dataclasses
+import math
 
 import numpy as np
 
 from ..core.returns import TRADING_DAYS_PER_YEAR
 from .harness import BacktestResult
 from .metrics import (SUSPICIOUS_ACTIVE_SHARPE, SUSPICIOUS_ANNUAL_SHARPE,
-                      TrackRecord, track_record)
+                      TrackRecord, sharpe_difference_standard_error,
+                      track_record)
 
 __all__ = ["Breakeven", "Comparison", "compare"]
 
@@ -94,6 +96,116 @@ class Breakeven:
 
 
 @dataclasses.dataclass(frozen=True)
+class RiskAdjusted:
+    """The comparison at matched risk, and the split of the raw one.
+
+    Why the raw active return is the wrong thing to test
+    ----------------------------------------------------
+    Equal risk contribution's whole function is to hold less of the volatile
+    assets. Run it in a rising year and it underperforms *by construction*:
+    a book carrying 14% less risk gives up 14% of the benchmark's return
+    before any question of selection arises. A t-statistic on the raw active
+    return then reports, with confidence, that a de-risking policy de-risked.
+    Run the identical policy through a falling year and the identical test
+    calls it significantly better. The sign belongs to the window, not to the
+    strategy, so the number does not carry out of sample.
+
+    That is this project's recurring defect wearing new clothes: a confidently
+    correct figure measuring something other than what it claims.
+
+    The identity
+    ------------
+    With the risk-free rate at zero, an annualised arithmetic return is Sharpe
+    times volatility, so the raw gap splits exactly:
+
+        R_p - R_b = (SR_p - SR_b) x sigma_b   +   SR_p x (sigma_p - sigma_b)
+                    \\_____ selection _____/       \\______ mandate ______/
+
+    *Selection* is what the policy cost after being levered to the benchmark's
+    risk: the part a different window could have reversed. *Mandate* is what
+    running at lower risk cost at the policy's own risk-adjusted rate: the
+    part the policy was asked to produce.
+
+    Both numbers are true and they are true about different decisions. The raw
+    gap is what the account actually lost; the selection term is what the
+    strategy cost. Neither is the answer on its own, so both are printed.
+
+    What matched risk assumes
+    -------------------------
+    Scaling the policy to the benchmark's volatility means levering it by
+    sigma_b / sigma_p. That is exact at a zero risk-free rate, and it is not
+    available in a cash account at a retail broker. The comparison is
+    therefore about the strategy, not about an executable alternative, and the
+    report says so in those words.
+    """
+    sharpe_policy: float                 # annualised
+    sharpe_benchmark: float
+    volatility_policy: float             # annualised
+    volatility_benchmark: float
+    correlation: float                   # measured, never assumed
+    observations: int                    # effective, at the frequency used
+    difference: float                    # SR_p - SR_b, annualised
+    standard_error: float                # of that difference, annualised
+    raw_gap: float                       # annualised arithmetic, policy - benchmark
+    selection: float                     # per year
+    mandate: float                       # per year
+
+    @property
+    def t_statistic(self) -> float | None:
+        if self.standard_error <= 0:
+            return None
+        return float(self.difference / self.standard_error)
+
+    @property
+    def decisive(self) -> bool:
+        t = self.t_statistic
+        return t is not None and abs(t) >= DECISIVE_T
+
+    def lines(self) -> list[str]:
+        out = [
+            f"At matched risk: the policy's Sharpe is {self.difference:+.4f} "
+            f"against buy-and-hold, standard error {self.standard_error:.4f} "
+            f"at a measured correlation of {self.correlation:.4f} over "
+            f"{self.observations} effective observations.",
+        ]
+        t = self.t_statistic
+        if t is None:
+            out.append("The two legs are indistinguishable to the last "
+                       "decimal, so there is no difference to test.")
+        elif abs(t) < DECISIVE_T:
+            out.append(
+                f"t = {t:+.2f}, inside {DECISIVE_T:.0f}: return per unit of "
+                f"risk is INDISTINGUISHABLE between the two. This is the "
+                f"comparison that carries out of sample, and on this sample it "
+                f"does not resolve.")
+        else:
+            out.append(
+                f"t = {t:+.2f}: return per unit of risk really does differ, by "
+                f"more than this sample can attribute to chance.")
+        # Sign-neutral wording on the mandate term. It is a cost only while
+        # the benchmark is rising: with a negative Sharpe, carrying less risk
+        # is what saved money, and calling that a cost would be exactly the
+        # window-dependent reading this whole section exists to prevent.
+        direction = ("less" if self.volatility_policy < self.volatility_benchmark
+                     else "more")
+        out.append(
+            f"Splitting the {self.raw_gap:+.2%} a year raw gap (annualised "
+            f"arithmetic, so it will not match the compounded figures in the "
+            f"table exactly): {self.selection:+.2%} is selection, what the "
+            f"strategy did once levered to the benchmark's risk, and "
+            f"{self.mandate:+.2%} is mandate, what carrying {direction} risk "
+            f"contributed by construction ({self.volatility_policy:.2%} "
+            f"against {self.volatility_benchmark:.2%} annualised).")
+        out.append(
+            "Matched risk means levering the policy by "
+            f"{self.volatility_benchmark / self.volatility_policy:.2f}x, which "
+            f"a cash account cannot do. So the raw gap is what the account "
+            f"lost and the selection term is what the strategy cost; they "
+            f"answer different questions and neither replaces the other.")
+        return out
+
+
+@dataclasses.dataclass(frozen=True)
 class Comparison:
     """A policy against buy-and-hold, gross and net, with its costs named."""
     policy_name: str
@@ -109,52 +221,43 @@ class Comparison:
     constraint_notes: tuple[str, ...] = ()
     cost_provenance: tuple[str, ...] = ()
     # The policy's return minus the benchmark's, day by day. Its Sharpe is the
-    # information ratio, and it is the quantity the whole comparison turns on.
+    # information ratio: the realised cost of the mandate in THIS window, and
+    # window-dependent by construction. Reported, never tested against.
     active: TrackRecord | None = None
+    # The same two legs compared at matched risk, which is the part that
+    # generalises. This is what the verdict tests.
+    risk_adjusted: RiskAdjusted | None = None
 
     # -- the comparison ----------------------------------------------------
 
     def paired_lines(self) -> list[str]:
-        """Why the two marginal Sharpe ratios are not the test.
+        """Two statistics on the same two series, labelled by their question.
 
-        Both legs hold the same book on the same days, so the great majority
-        of each one's estimation error is the same error, and it cancels in
-        the difference. Comparing the marginal ratios against their own
-        standard errors therefore asks a much harder question than the one
-        being posed, and answers "cannot tell" long after the paired series
-        could have answered it.
+        They can disagree, and when they do the disagreement is the finding.
+        The raw information ratio answers "did I end the window with less
+        money than doing nothing". The Sharpe difference answers "did I get
+        less return per unit of risk". For a policy whose job is to hold less
+        risk, the first is largely a restatement of the window's direction and
+        the second is the one that carries out of sample -- so the verdict is
+        applied to the second, and the first is labelled as what it is.
         """
         if self.active is None or self.active.sharpe is None:
             return ["No paired comparison: the two records do not share "
                     "enough dates to difference."]
-        gap = ((self.net.sharpe - self.benchmark.sharpe)
-               if (self.net.sharpe is not None
-                   and self.benchmark.sharpe is not None) else None)
-        out = [f"Active return, policy net minus buy-and-hold day by day: "
-               f"information ratio {self.active.band()}, "
-               f"t = {self.active.t_statistic:+.2f} over "
-               f"{self.active.observations} observations."]
-        if gap is not None:
-            out.append(
-                f"The gap between the two annualised Sharpe ratios is "
-                f"{gap:+.2f}. Do not test that against either ratio's own "
-                f"standard error: both legs hold the same book on the same "
-                f"days, so most of that error is common to them and cancels. "
-                f"The paired series above is the test with power.")
-        t = self.active.t_statistic
-        if t is None:
+        out = [
+            f"Raw active return, policy net minus buy-and-hold day by day: "
+            f"information ratio {self.active.band()}. This is the realised "
+            f"cost of the mandate in THIS window and its sign is the window's "
+            f"direction: a policy holding less risk underperforms a rising "
+            f"benchmark by construction and would outperform a falling one. "
+            f"Not tested, because a significant result here would be a "
+            f"tautology.",
+        ]
+        if self.risk_adjusted is None:
+            out.append("No risk-adjusted comparison: one of the legs has no "
+                       "volatility to match to.")
             return out
-        if abs(t) < DECISIVE_T:
-            out.append(
-                f"|t| = {abs(t):.2f} is below {DECISIVE_T:.0f}, so on this "
-                f"sample the policy and doing nothing are INDISTINGUISHABLE. "
-                f"The ordering in the table above is not a ranking, and "
-                f"reporting it as one would be reading noise.")
-        else:
-            better = "beats" if t > 0 else "loses to"
-            out.append(
-                f"|t| = {abs(t):.2f}: the policy {better} doing nothing by "
-                f"more than this sample can attribute to chance.")
+        out += self.risk_adjusted.lines()
         return out
 
     def verdict(self) -> str:
@@ -165,17 +268,24 @@ class Comparison:
         policy cannot lift a benchmark that never trades. What a shared high
         level does mean is that the cause is shared: the window, or the price
         data feeding both legs. Neither is evidence about the policy.
+
+        The implausibility alarm is on the RISK-ADJUSTED gap rather than on
+        the raw information ratio, for the same reason the verdict is: a
+        de-risking policy in a falling market produces a large positive raw
+        information ratio out of arithmetic alone, and the alarm would have
+        fired on it.
         """
         if self.net.sharpe is None or self.benchmark.sharpe is None:
             return self.net.verdict()
         mine, theirs = self.net.sharpe, self.benchmark.sharpe
-        if (self.active is not None and self.active.sharpe is not None
-                and self.active.sharpe > SUSPICIOUS_ACTIVE_SHARPE):
-            return (f"Information ratio {self.active.sharpe:.2f} is above the "
-                    f"{SUSPICIOUS_ACTIVE_SHARPE} threshold for an active "
-                    f"return, which doing nothing cannot produce and a good "
-                    f"window cannot explain. Find the leak before reporting "
-                    f"this as a result.")
+        if (self.risk_adjusted is not None
+                and self.risk_adjusted.difference > SUSPICIOUS_ACTIVE_SHARPE):
+            return (f"At matched risk the policy beats buy-and-hold by "
+                    f"{self.risk_adjusted.difference:.2f} of annualised "
+                    f"Sharpe, above the {SUSPICIOUS_ACTIVE_SHARPE} threshold. "
+                    f"Doing nothing cannot produce that, a good window cannot "
+                    f"explain it, and neither can holding more or less risk. "
+                    f"Find the leak before reporting this as a result.")
         if mine > SUSPICIOUS_ANNUAL_SHARPE and theirs > SUSPICIOUS_ANNUAL_SHARPE:
             return (f"Annualised Sharpe {self.net.band()} is above the "
                     f"{SUSPICIOUS_ANNUAL_SHARPE} threshold, and so is "
@@ -190,7 +300,25 @@ class Comparison:
                     f"is at {theirs:.2f}. A gap that size, on a benchmark that "
                     f"does no trading, is what a look-ahead leak looks like. "
                     f"Find it before reporting this as a result.")
-        return self.net.verdict()
+        # The one-line summary a reader is entitled to: what the policy did to
+        # risk, and whether the return per unit of it moved at all. Stating
+        # only the first would flatter the policy; only the second would hide
+        # the thing it was actually asked to do.
+        own = self.net.verdict()
+        ra = self.risk_adjusted
+        if ra is None:
+            return own
+        change = ra.volatility_policy / ra.volatility_benchmark - 1.0
+        moved = ("lower" if change < 0 else "higher")
+        if ra.decisive:
+            tail = (f"return per unit of risk differs by "
+                    f"{ra.difference:+.2f} of Sharpe, t = {ra.t_statistic:+.2f}")
+        else:
+            tail = ("return per unit of risk is indistinguishable from doing "
+                    "nothing on this sample")
+        return (f"{own} Against the benchmark: volatility {abs(change):.0%} "
+                f"{moved} ({ra.volatility_policy:.2%} against "
+                f"{ra.volatility_benchmark:.2%}), and {tail}.")
 
     def lines(self) -> list[str]:
         out = [f"{self.policy_name} against buy-and-hold", "=" * 64, ""]
@@ -307,6 +435,9 @@ def compare(policy: BacktestResult, benchmark: BacktestResult, *,
     bench = benchmark.track(overlap=overlap, periods_per_year=periods_per_year)
     active = _active_record(policy, benchmark, overlap=overlap,
                             periods_per_year=periods_per_year)
+    rho = _correlation(policy, benchmark)
+    risk_adjusted = (None if rho is None
+                     else _risk_adjusted(net, bench, rho))
 
     edge = (_annualised(policy.gross_returns, periods_per_year)
             - _annualised(benchmark.gross_returns, periods_per_year))
@@ -335,7 +466,61 @@ def compare(policy: BacktestResult, benchmark: BacktestResult, *,
         rebalances=len(policy.decisions),
         warnings=policy.warnings, cost_assumptions=assumptions,
         constraint_notes=constraint_notes, cost_provenance=provenance,
-        active=active)
+        active=active, risk_adjusted=risk_adjusted)
+
+
+def _correlation(policy: BacktestResult, benchmark: BacktestResult) -> float | None:
+    """Measured, never assumed: every number in the paired test depends on it.
+
+    Computed on the dates both records measured, so a day excluded from one
+    leg's variance is excluded from the correlation too.
+    """
+    dates = policy.returns.index.intersection(benchmark.returns.index)
+    if len(dates) < 3:
+        return None
+    clean = (policy.measured.loc[dates].to_numpy(dtype=bool)
+             & benchmark.measured.loc[dates].to_numpy(dtype=bool))
+    a = policy.returns.loc[dates].to_numpy()[clean]
+    b = benchmark.returns.loc[dates].to_numpy()[clean]
+    if len(a) < 3 or a.std(ddof=1) <= 0 or b.std(ddof=1) <= 0:
+        return None
+    return float(np.corrcoef(a, b)[0, 1])
+
+
+def _risk_adjusted(policy: TrackRecord, benchmark: TrackRecord,
+                   correlation: float) -> "RiskAdjusted | None":
+    """The matched-risk comparison, and the split of the raw gap.
+
+    Uses the two records' own effective observation counts, taking the smaller
+    when they differ, so the paired standard error is never computed on more
+    evidence than the shorter leg carries.
+    """
+    if (policy.sharpe is None or benchmark.sharpe is None
+            or policy.volatility <= 0 or benchmark.volatility <= 0):
+        return None
+    n = min(policy.independent_observations, benchmark.independent_observations)
+    if n < 2 or policy.years <= 0:
+        return None
+    # The formula wants both ratios and the count at ONE sampling interval.
+    # `k` converts between the effective frequency and annual: an annualised
+    # Sharpe is the per-observation one times sqrt(observations per year).
+    # Feeding it annualised ratios with T in years is the natural mistake and
+    # gives an answer about twice too large, because an asymptotic variance at
+    # T = 1 is not an approximation of anything.
+    k = math.sqrt(n / policy.years)
+    se = sharpe_difference_standard_error(policy.sharpe / k,
+                                          benchmark.sharpe / k, correlation, n)
+    return RiskAdjusted(
+        sharpe_policy=policy.sharpe, sharpe_benchmark=benchmark.sharpe,
+        volatility_policy=policy.volatility,
+        volatility_benchmark=benchmark.volatility,
+        correlation=correlation, observations=n,
+        difference=policy.sharpe - benchmark.sharpe,
+        standard_error=se * k,
+        raw_gap=(policy.sharpe * policy.volatility
+                 - benchmark.sharpe * benchmark.volatility),
+        selection=(policy.sharpe - benchmark.sharpe) * benchmark.volatility,
+        mandate=policy.sharpe * (policy.volatility - benchmark.volatility))
 
 
 def _active_record(policy: BacktestResult, benchmark: BacktestResult, *,

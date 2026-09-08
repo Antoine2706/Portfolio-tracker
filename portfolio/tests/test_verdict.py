@@ -150,13 +150,14 @@ class TestAHighLevelTheBenchmarkDoesNotShare:
         verdict = leaking.verdict()
         assert "Find the leak" in verdict or "Find it before" in verdict
 
-    def test_the_information_ratio_is_what_catches_it(self, leaking):
-        """And it is the sharper alarm: an active Sharpe this size cannot be
+    def test_the_risk_adjusted_gap_is_what_catches_it(self, leaking):
+        """And it is the sharper alarm: a matched-risk gap this size cannot be
         produced by a favourable window, because doing nothing scores zero on
-        it by construction."""
-        assert leaking.active.sharpe > SUSPICIOUS_ACTIVE_SHARPE
-        assert "Information ratio" in leaking.verdict()
-        assert "a good window cannot explain" in leaking.verdict()
+        it -- nor by holding more or less risk, which is why the alarm is here
+        rather than on the raw information ratio. See test_risk_adjusted.py."""
+        assert leaking.risk_adjusted.difference > SUSPICIOUS_ACTIVE_SHARPE
+        assert "At matched risk" in leaking.verdict()
+        assert "a good window cannot explain it" in leaking.verdict()
 
 
 class TestThePairedComparison:
@@ -179,17 +180,20 @@ class TestThePairedComparison:
             "error, so the paired test is not doing what it claims")
 
     def test_it_refuses_to_rank_what_it_cannot_distinguish(self, modest):
+        """On the risk-adjusted comparison, which is the one tested. The raw
+        information ratio is reported and deliberately not tested -- see
+        test_risk_adjusted.py for why."""
         text = " ".join(modest.paired_lines())
-        if abs(modest.active.t_statistic) < 2.0:
-            assert "INDISTINGUISHABLE" in text
-            assert "not a ranking" in text
+        if abs(modest.risk_adjusted.t_statistic) < 2.0:
+            assert "return per unit of risk is INDISTINGUISHABLE" in text
         else:                                     # pragma: no cover - fixture drift
             assert "more than this sample can attribute to chance" in text
 
-    def test_it_warns_against_the_wrong_yardstick(self, modest):
+    def test_it_names_the_two_questions_separately(self, modest):
         text = " ".join(modest.paired_lines())
-        assert "Do not test that against either ratio's own standard error" in text
-        assert "cancels" in text
+        assert "realised cost of the mandate in THIS window" in text
+        assert "At matched risk" in text
+        assert "they answer different questions" in text
 
     def test_a_real_difference_is_called_one(self):
         """The rule must be able to say yes, or it is not a test."""

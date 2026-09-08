@@ -156,15 +156,29 @@ number. Attempts are pre-registered in `research/registry.jsonl`, because the
 deflated Sharpe ratio takes the number of attempts as an argument and a count
 that omits the failures is not a count.
 
-The comparison against buy-and-hold is **paired**: the two legs hold the same
-book on the same days, so their returns correlate to about 0.99 and almost
-all of each Sharpe's error is the same error, cancelling in the difference.
-The tool reports the active return — policy minus benchmark, day by day —
-with its own error bar, and below t = 2 it says the two are
-*indistinguishable* rather than ranking them. The 1.5 alarm is applied to
-that active ratio as well as to the level, because a level above 1.5 is a
-property of the window and the benchmark shares the window; a leak inside a
-policy cannot lift a benchmark that never trades.
+The comparison against buy-and-hold is **paired and risk-adjusted**, and it
+reports two statistics because they answer different questions.
+
+The raw active return — policy minus benchmark, day by day — is the realised
+cost of the mandate *in that window*, and it is reported rather than tested:
+a policy that holds less risk underperforms a rising benchmark by
+construction, so a significant result there is a tautology. The same policy
+in a falling window comes out significantly better. The tool demonstrates
+this on itself.
+
+The comparison that carries out of sample is at matched risk: the difference
+of the two Sharpe ratios, tested with Jobson-Korkie plus Memmel's correction
+at a correlation that is measured and printed. Two legs holding one book
+correlate at about 0.99, so almost all of each marginal error is the same
+error and cancels — which is what makes the test possible. Below t = 2 the
+tool says *indistinguishable* rather than ranking them. It also splits the
+raw gap into the part explained by the volatility ratio and the residual, and
+states that matching risk means leverage a cash account cannot apply: the raw
+gap is what the account lost, the residual is what the strategy cost.
+
+The 1.5 alarm is applied to the matched-risk gap as well as to the level. A
+level above 1.5 is a property of the window and the benchmark shares it; a
+leak inside a policy cannot lift a benchmark that never trades.
 
 A day on which a held instrument did not trade is never a 0.00% return.
 Positions are valued at the last price that printed, so the missed move lands
