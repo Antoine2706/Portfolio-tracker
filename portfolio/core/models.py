@@ -255,6 +255,18 @@ class Instrument:
     dotted paths into `provider_symbols` such as "provider_symbols.eodhd".
     Re-resolution must not overwrite those: an automatic resolver that silently
     reverts a correction is worse than one that never runs.
+
+    `tradeable` is False for a holding whose weight no automated policy may
+    change. The motivating case is a position held at a different broker from
+    the rest of the book: moving weight between two institutions means selling
+    at one, waiting for settlement, transferring cash and buying at the other
+    -- roughly a week, out of position throughout, and two sets of costs. A
+    rebalancing policy assumes weight can move between holdings, and across
+    brokers it cannot. The position still belongs in the risk model, because
+    it is genuinely part of the portfolio and affects every covariance,
+    correlation and risk contribution; what it cannot do is be traded against
+    the others. Making that a field rather than a filter applied afterwards is
+    deliberate -- a filter gets forgotten the first time a policy is added.
     """
     isin: str
     name: str
@@ -262,6 +274,28 @@ class Instrument:
     base_currency: str = BASE_CURRENCY
     issuer: str = ""
     short_name: str = ""                     # blank means "derive from name"
+
+    # -- where it is held, and what trading it costs ------------------------
+    # These are facts about this specific holding at this specific broker,
+    # not global settings, because they differ per holding in ways that
+    # change decisions. The transaction tax band depends on whether the
+    # instrument is a fund or a debt security and where it is registered; the
+    # commission depends entirely on which broker holds it; the spread is a
+    # property of the instrument's liquidity. A single global number would be
+    # wrong for every holding at once.
+    #
+    # `None` means NOT RECORDED, and the cost model refuses to price a trade
+    # rather than substituting a plausible default. That refusal is the point:
+    # this project's convention is to fail loudly rather than compute
+    # something that looks like a measurement.
+    broker: str = ""                         # "" = not recorded
+    tradeable: bool = True                   # False = weight is exogenous
+    tob_rate: float | None = None            # transaction tax, each way
+    tob_observed: bool = False               # read off a contract note?
+    half_spread_bps: float | None = None     # paid inside the execution price
+    spread_observed: bool = False            # from quotes, or estimated?
+    buy_tax_rate: float = 0.0                # one-sided taxes, e.g. the French FTT
+
     primary_symbol: str = ""
     exchange: str = ""                       # MIC of the primary listing
     quote_currency: str = ""                 # currency of the primary listing

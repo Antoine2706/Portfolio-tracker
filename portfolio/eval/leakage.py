@@ -119,16 +119,24 @@ def perturb_after(panel: Panel, split: int, seed: int = 20260908) -> Panel:
 
 
 def _decision_key(d) -> tuple:
-    """Everything a decision recorded, so any of it moving counts as a leak.
+    """Everything the POLICY produced, so any of it moving counts as a leak.
 
-    The weights are the obvious part. The *reason* and confidence are included
-    because they are outputs of the policy too, and they are often the more
-    sensitive signal: a policy that peeks one bar ahead over four assets picks
-    the same asset a quarter of the time by chance even when the future has
-    been rewritten, but a reason string quoting the number it saw changes
-    every time. Detection should not depend on a coin flip.
+    `proposed`, not `weights_after`. The executed target is allowed to depend
+    on the execution bar -- a frozen holding's weight is read from the drifted
+    book on the day the order is placed, which is after the decision -- so
+    comparing it would report a leak for a policy that never looked forward.
+    That false positive is not hypothetical: it appeared the first time a
+    frozen holding was run through this, and the fix was to record what the
+    policy said separately from what the harness did with it.
+
+    The *reason* and confidence are included because they are outputs of the
+    policy too, and they are often the more sensitive signal: a policy that
+    peeks one bar ahead over four assets picks the same asset a quarter of the
+    time by chance even when the future has been rewritten, but a reason
+    string quoting the number it saw changes every time. Detection should not
+    depend on a coin flip.
     """
-    return (tuple(sorted((k, round(float(v), 12)) for k, v in d.weights_after.items())),
+    return (tuple(sorted((k, round(float(v), 12)) for k, v in d.proposed.items())),
             d.reason, round(float(d.confidence), 12))
 
 
@@ -170,8 +178,27 @@ def check_lookahead(run, panel: Panel, splits=None, seed: int = 20260908) -> Lea
     if not wanted:
         raise ValueError("at least one split is needed")
     original: BacktestResult = run(panel)
+
+    # A split before the first decision has nothing for the perturbation to
+    # affect. The default fractions cannot know the warmup, so the usable
+    # ones are selected here rather than making every caller do the
+    # arithmetic -- and it is only an error if none of them are usable.
+    positions = {d: i for i, d in enumerate(panel.closes.index)}
+    first_decision = min((positions[d.decided_on] for d in original.decisions),
+                         default=None)
+    if first_decision is None:
+        raise ValueError(
+            "the backtest took no decisions at all, so there is nothing to "
+            "check for look-ahead")
+    usable = [int(w) for w in wanted if int(w) >= first_decision]
+    if not usable:
+        raise ValueError(
+            f"no decision was taken at or before row {max(wanted)}; the first "
+            f"is at row {first_decision}. Choose a split after the warmup "
+            f"period.")
+
     last: LeakReport | None = None
-    for want in wanted:
+    for want in usable:
         report = _check_one(run, panel, original, int(want), seed)
         if report.leaked:
             return report

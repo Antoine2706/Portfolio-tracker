@@ -20,6 +20,7 @@ exists because of it.
 from __future__ import annotations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from portfolio.eval.controls import CoinFlip, Oracle, synthetic_world
@@ -136,3 +137,72 @@ class TestTheDetectorCannotPassVacuously:
     def test_no_decision_before_the_split_is_refused(self, panel):
         with pytest.raises(ValueError, match="no decision was taken"):
             check_lookahead(run_clean, panel, 10)
+
+
+class TestAFrozenHoldingIsNotALeak:
+    """The false positive that appeared the first time a frozen holding ran.
+
+    A decision taken on the split executes on the next bar, and a frozen
+    holding's weight is read from the drifted book at that moment -- so the
+    *executed* target legitimately depends on post-split prices while the
+    *proposal* does not. Comparing the executed target reported a leak for a
+    policy that never looked forward. The decision record now keeps the two
+    apart, and this pins that down in both directions.
+    """
+
+    def _book(self, periods=600):
+        rng = np.random.default_rng(4)
+        cols = ["GOLD", "A", "B", "C"]
+        dates = pd.bdate_range("2024-01-01", periods=periods)
+        rets = pd.DataFrame(rng.normal(0.0002, 0.011, (periods, 4)),
+                            index=dates, columns=cols)
+        rets.iloc[0] = 0.0
+        from portfolio.eval.harness import Panel
+        return Panel(closes=100.0 * (1.0 + rets).cumprod())
+
+    def _run(self, p):
+        from portfolio.agents.risk import EqualRiskContribution
+        start = {"GOLD": 0.2, "A": 0.3, "B": 0.3, "C": 0.2}
+        policy = EqualRiskContribution(lookback=126, fixed={"GOLD": 0.2})
+        return walk_forward(p, policy, warmup=127, rebalance_every=21,
+                            cost_model=None, execution=Execution.NEXT_CLOSE,
+                            initial_weights=start, frozen=frozenset({"GOLD"}))
+
+    def test_equal_risk_contribution_with_a_frozen_holding_is_clean(self):
+        report = check_lookahead(self._run, self._book())
+        assert not report.leaked, report.detail
+
+    def test_the_executed_target_really_does_move_with_the_future(self):
+        """Proving the false positive was real, so the fix is load-bearing.
+
+        The split must land on a decision day: only then does that decision
+        execute on the first perturbed bar, which is exactly the situation
+        that produced the false positive.
+        """
+        panel = self._book()
+        original = self._run(panel)
+        positions = {d: i for i, d in enumerate(panel.closes.index)}
+        # the last decision that still leaves room to perturb after it
+        split = max(positions[d.decided_on] for d in original.decisions
+                    if positions[d.decided_on] < len(panel.closes) - 2)
+        altered = self._run(perturb_after(panel, split))
+        cut = panel.closes.index[split]
+        pairs = [(a, b) for a, b in zip(original.decisions, altered.decisions)
+                 if a.decided_on <= cut]
+        assert pairs
+        assert all(a.proposed == b.proposed for a, b in pairs), (
+            "the policy's proposal moved, which would be a genuine leak")
+        assert any(a.weights_after != b.weights_after for a, b in pairs), (
+            "the executed target no longer depends on the execution bar, so "
+            "the distinction this test defends may have been removed")
+
+    def test_the_detector_still_catches_a_leak_on_the_same_shape_of_book(self):
+        panel = self._book()
+        start = {"GOLD": 0.2, "A": 0.3, "B": 0.3, "C": 0.2}
+
+        def leaky(p):
+            return walk_forward(p, Oracle(p.closes, skill=1.0, seed=0),
+                                warmup=127, rebalance_every=21, cost_model=None,
+                                execution=Execution.NEXT_CLOSE,
+                                initial_weights=start)
+        assert check_lookahead(leaky, panel).leaked

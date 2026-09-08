@@ -23,6 +23,11 @@ portfolio/
   eval/      The walk-forward harness, track-record statistics, the
              pre-registration log, the controls that calibrate the harness and
              the look-ahead detector. Pure; imports core and agents.
+  research.py  The composition root for backtests: the only module that
+             touches the data layer, the policies and the harness at once. It
+             exists so eval/ and agents/ can stay offline -- they are handed a
+             panel and a cost model and never learn where either came from.
+             Nothing may import it back; the layering test enforces that.
   broker/    Paper trading only, and does not exist yet -- see the build
              order. A test fails if a live endpoint string appears anywhere.
   tests/     No network (sockets are blocked), no UI framework required for
@@ -64,11 +69,22 @@ must come back bit-identical. It also raises rather than passing when it is
 wired so that it could not fail.
 
 **Costs are an argument, not an option.** `walk_forward` takes a cost model.
-`agents/execution.py` makes every parameter a named field -- commission with
-its minimum, half-spread, slippage, FX, and transaction taxes -- and takes a
-trade side, because some taxes are charged on purchases only. A strategy that
-is profitable gross and unprofitable net is the most common false positive in
-this field, and a harness that cannot produce that finding is not measuring.
+`agents/execution.py` makes every parameter a named field and resolves it per
+broker and per instrument, because at a real account they differ by more than
+an order of magnitude between holdings. It takes a trade side, since some
+taxes are charged on purchases only. Where a rate has not been read off a
+document it either refuses to price the trade or reports itself as an
+estimate; `CostModel.assumptions()` lists everything unobserved and the
+backtest prints it beneath every result. A strategy that is profitable gross
+and unprofitable net is the most common false positive in this field, and a
+harness that cannot produce that finding is not measuring.
+
+**Some weights are exogenous.** A holding at a second broker cannot be traded
+against the rest of the book. It is marked non-tradeable on the instrument
+record, the referee rejects any proposal that moves it, and the harness takes
+its weight from the drifted book at execution rather than from the proposal --
+because a frozen holding drifts between the decision and the order, so even
+proposing the weight it had a moment ago implies a trade.
 
 **Nothing is reported that the sample cannot support.** `eval/metrics.py`
 carries the standard error, the probabilistic and deflated Sharpe ratios and

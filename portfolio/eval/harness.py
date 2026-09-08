@@ -57,7 +57,7 @@ from ..core.returns import TRADING_DAYS_PER_YEAR
 from .metrics import TrackRecord, track_record
 
 __all__ = ["Execution", "Panel", "Decision", "BacktestResult", "walk_forward",
-           "buy_and_hold"]
+           "buy_and_hold", "Hold"]
 
 
 class Execution(enum.Enum):
@@ -108,6 +108,14 @@ class Decision:
     executed_on: pd.Timestamp
     view_ends: pd.Timestamp              # last date the policy could see
     weights_before: dict[str, float]     # drifted, immediately before trading
+    # What the POLICY proposed, and what was actually EXECUTED. They differ
+    # whenever a frozen holding is present: its weight is taken from the
+    # drifted book at execution rather than from the proposal, and the drift
+    # happens on the bar after the decision. Keeping them apart matters for
+    # the leak detector, which must test the policy's output -- a pure
+    # function of data up to the decision -- and not the executed target,
+    # which legitimately depends on the execution bar.
+    proposed: dict[str, float]
     weights_after: dict[str, float]
     turnover: float                      # one-way
     cost: float                          # as a fraction of portfolio value
@@ -195,6 +203,35 @@ def _drift(weights: dict[str, float], returns: pd.Series
     return {k: v / scale for k, v in growth.items()}, float(g), missing
 
 
+def _apply_frozen(target: dict[str, float], drifted: dict[str, float],
+                  frozen) -> dict[str, float]:
+    """Frozen holdings keep the weight they drifted to; the rest share what is left.
+
+    A holding that cannot be traded does not hold a target weight -- it holds
+    whatever the market left it at. Applying a target to it would imply a
+    trade, which is the thing that cannot happen, and the amount would be
+    small enough to look like a rounding error while being a real order.
+
+    So the frozen weights are taken from the drifted book and the tradeable
+    block is rescaled into what remains. That is also what a real rebalance
+    does: you rebalance the sleeve you can trade, among itself.
+    """
+    if not frozen:
+        return target
+    out = dict(target)
+    reserved = 0.0
+    for isin in frozen:
+        out[isin] = float(drifted.get(isin, 0.0))
+        reserved += out[isin]
+    free = {k: v for k, v in out.items() if k not in frozen}
+    total = sum(free.values())
+    budget = max(0.0, 1.0 - reserved)
+    if total > 0:
+        for k in free:
+            out[k] = free[k] * budget / total
+    return out
+
+
 def _turnover(target: dict[str, float], drifted: dict[str, float]) -> float:
     """One-way turnover: half the sum of absolute weight changes, cash included.
 
@@ -219,7 +256,9 @@ def walk_forward(panel: Panel, policy: Policy, *,
                  cost_model=None,
                  execution: Execution = Execution.NEXT_CLOSE,
                  purge: int = 0,
-                 min_observations: int = 60) -> BacktestResult:
+                 min_observations: int = 60,
+                 initial_weights: "dict[str, float] | None" = None,
+                 frozen=frozenset()) -> BacktestResult:
     """Roll a policy through the panel, one decision at a time.
 
     `warmup` is the number of rows reserved before the first decision, so that
@@ -243,6 +282,22 @@ def walk_forward(panel: Panel, policy: Policy, *,
     None means a cost-free run, which is only ever appropriate for calibrating
     the harness itself against a known effect size -- never for judging a
     strategy.
+
+    `initial_weights` is the book as it already stands at the start of the
+    evaluation. Without it the portfolio begins in cash and the first decision
+    has to buy everything, which charges the policy for building a position it
+    was never asked to build and -- worse -- makes any holding the policy is
+    forbidden to trade permanently unbuyable. Both the policy and its
+    benchmark should be given the same starting weights, so that the
+    comparison isolates what the policy does rather than how it got in.
+    Establishing the position is not itself a decision and is not charged.
+
+    `frozen` names holdings that must not be traded at all. Their weight is
+    taken from the drifted book at execution rather than from the proposal,
+    and the tradeable block is rescaled into what is left. Without this a
+    frozen holding still gets traded: its weight drifts between the decision
+    and the execution one bar later, so even proposing the weight it had at
+    decision time implies an order by the time the order is placed.
     """
     closes = panel.closes
     idx = closes.index
@@ -263,7 +318,19 @@ def walk_forward(panel: Panel, policy: Policy, *,
             "closes. Supply opens, or use Execution.NEXT_CLOSE, which delays "
             "execution by a further day rather than inventing a price.")
 
-    weights: dict[str, float] = {}
+    weights: dict[str, float] = {str(k): float(v)
+                                for k, v in (initial_weights or {}).items()}
+    if weights:
+        unknown = set(weights) - {str(c) for c in closes.columns}
+        if unknown:
+            raise ValueError(
+                f"initial weights name instruments not in the panel: "
+                f"{sorted(unknown)}")
+        total = sum(weights.values())
+        if total > 1.0 + 1e-9:
+            raise ValueError(
+                f"initial weights sum to {total:.6g}; this portfolio is "
+                f"long-only and unlevered")
     pending: Proposal | None = None
     pending_from: pd.Timestamp | None = None
     pending_view_end: pd.Timestamp | None = None
@@ -309,7 +376,7 @@ def walk_forward(panel: Panel, policy: Policy, *,
             today_open = panel.opens.iloc[i]
             r_overnight = today_open / prev_close - 1.0
             drifted, g1, missing = _drift(weights, r_overnight)
-            target = dict(pending.weights)
+            target = _apply_frozen(dict(pending.weights), drifted, frozen)
             turn = _turnover(target, drifted)
             cost = cost_model.cost(turn, drifted, target) if cost_model else 0.0
             r_intraday = today_close / today_open - 1.0
@@ -318,7 +385,8 @@ def walk_forward(panel: Panel, policy: Policy, *,
             decisions.append(Decision(
                 decided_on=pending_from, executed_on=date,
                 view_ends=pending_view_end, weights_before=drifted,
-                weights_after=target, turnover=turn, cost=cost,
+                proposed=dict(pending.weights), weights_after=target,
+                turnover=turn, cost=cost,
                 reason=pending.reason, confidence=pending.confidence))
             pending = None
             for isin in set(missing) | set(missing2):
@@ -333,13 +401,14 @@ def walk_forward(panel: Panel, policy: Policy, *,
             if pending is not None:
                 # Next-close execution: the day has already accrued to the old
                 # weights, and the trade happens at tonight's close.
-                target = dict(pending.weights)
+                target = _apply_frozen(dict(pending.weights), weights, frozen)
                 turn = _turnover(target, weights)
                 cost = cost_model.cost(turn, weights, target) if cost_model else 0.0
                 decisions.append(Decision(
                     decided_on=pending_from, executed_on=date,
                     view_ends=pending_view_end, weights_before=dict(weights),
-                    weights_after=target, turnover=turn, cost=cost,
+                    proposed=dict(pending.weights), weights_after=target,
+                    turnover=turn, cost=cost,
                     reason=pending.reason, confidence=pending.confidence))
                 weights = target
                 pending = None
@@ -369,31 +438,39 @@ def walk_forward(panel: Panel, policy: Policy, *,
     )
 
 
+class Hold:
+    """Propose exactly what is already held. Turnover zero, cost zero."""
+    name = "buy-and-hold"
+
+    def observe(self, view: MarketView) -> Proposal:
+        return Proposal(dict(view.held), 1.0,
+                        "hold the book and let the weights drift; the "
+                        "alternative to every policy under test", self.name)
+
+
 def buy_and_hold(panel: Panel, weights: dict[str, float], *, warmup: int,
                  cost_model=None,
                  execution: Execution = Execution.NEXT_CLOSE) -> BacktestResult:
     """The benchmark that matters: the portfolio you already own, left alone.
 
     Beating an index you do not hold is irrelevant -- the real alternative to
-    any policy is doing nothing, which means buying once and never trading
-    again while the weights drift wherever the market takes them. That drift
-    is the point of the comparison: a policy's turnover has to buy something
-    better than free.
+    any policy is doing nothing, which means holding what you have while the
+    weights drift wherever the market takes them. That drift is the point of
+    the comparison: a policy's turnover has to buy something better than free.
+
+    It starts from `weights` and never trades, so it pays nothing at all. The
+    policy it is compared against starts from the same weights, which is what
+    makes the difference between them attributable to the policy's decisions
+    rather than to the cost of getting invested.
+
+    Every holding is passed as frozen, which is precisely what "hold" means:
+    each keeps whatever weight the market drifts it to. Without that, the one
+    decision taken at the start would execute a bar later against weights that
+    had already moved, and buy-and-hold would pay for a rebalance it never
+    made -- small, plausible, and enough to bias the benchmark it is the whole
+    point of this function to state honestly.
     """
-    class _Once:
-        name = "buy-and-hold"
-
-        def __init__(self) -> None:
-            self.done = False
-
-        def observe(self, view: MarketView) -> Proposal:
-            self.done = True
-            return Proposal(dict(weights), 1.0,
-                            "buy once and never trade again; the alternative "
-                            "to every policy under test", self.name)
-
-    # rebalance_every larger than the panel means the one initial decision is
-    # the only one, which is what "never trade again" means mechanically.
-    return walk_forward(panel, _Once(), warmup=warmup,
+    return walk_forward(panel, Hold(), warmup=warmup,
                         rebalance_every=len(panel) + 1, cost_model=cost_model,
-                        execution=execution)
+                        execution=execution, initial_weights=weights,
+                        frozen=frozenset(str(c) for c in panel.closes.columns))

@@ -95,9 +95,27 @@ anything, so the harness is calibrated before any strategy is run against it:
 | **Leak detector** | Rewrites every price after a date and re-runs. Everything decided before it must be bit-identical. It also refuses to run when wired so that it could not fail. |
 
 Costs are mandatory, not optional: `walk_forward` takes a cost model, and the
-one in `agents/execution.py` is side-aware because some taxes are charged on
-purchases only. The benchmark is always buy-and-hold of the portfolio you
-already own, since that is the actual alternative to any policy.
+one in `agents/execution.py` is per broker, per instrument and side-aware,
+because at a real account all three vary. Every input is either read off a
+contract note or marked as an estimate, and the model prints which:
+
+```bash
+portfolio backtest erc      # equal risk contribution against buy-and-hold
+```
+
+reports the policy gross, net and against the benchmark, then the **breakeven
+turnover** — the level at which the gross edge is entirely consumed by the
+trading it takes to capture it. That is the decision criterion, and it
+separates the two ways a policy fails: no edge at all, or an edge too small to
+trade. The benchmark is always buy-and-hold of the portfolio you already own,
+started from the same weights, since that is the actual alternative.
+
+Holdings can be marked non-tradeable. A position at a second broker cannot be
+rebalanced against the rest of the book — that is a cash transfer between
+institutions taking about a week, not a trade — so its weight is exogenous.
+It stays in the risk model, since it genuinely affects every correlation, and
+the referee rejects any proposal that moves it. Equal risk contribution then
+solves over the restricted simplex and reports what the constraint cost.
 
 Every statistic is reported with its uncertainty. A Sharpe ratio the sample
 cannot establish is reported as undetermined, with the track record length

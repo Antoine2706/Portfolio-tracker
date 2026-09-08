@@ -198,6 +198,18 @@ def test_agents_do_not_know_they_are_being_evaluated(path):
         f"measures something that will never happen in production.")
 
 
+@pytest.mark.parametrize("path", AGENT_FILES + EVAL_FILES, ids=lambda p: p.name)
+def test_the_evaluation_layer_does_not_import_the_composition_root(path):
+    """`research.py` wires the data layer to the harness, so it may import
+    anything. Nothing may import it back: an arrow from eval/ to research
+    would drag the network into a package whose whole value is being offline.
+    """
+    bad = {m for m in imported_modules(path) if m.lstrip(".") == "research"}
+    assert not bad, (
+        f"{path.name} imports research, reversing the composition arrow and "
+        f"pulling the data layer into code that must stay offline.")
+
+
 def test_the_layering_guard_actually_bites(tmp_path):
     """Sabotage, because a guard that has never failed proves nothing.
 

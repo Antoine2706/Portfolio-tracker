@@ -65,7 +65,31 @@ def resolve_mode(explicit: str | DataMode | None = None) -> DataMode:
 INSTRUMENT_COLUMNS = ["isin", "name", "short_name", "issuer", "asset_class",
                       "base_currency", "primary_symbol", "exchange",
                       "quote_currency", "provider_symbols", "active",
-                      "manual_overrides", "note"]
+                      "manual_overrides", "note",
+                      # where it is held and what trading it costs; appended
+                      # so a CSV written by an older build still loads
+                      "broker", "tradeable", "tob_rate", "tob_observed",
+                      "half_spread_bps", "spread_observed", "buy_tax_rate"]
+
+
+def _opt_float(raw: str | None) -> float | None:
+    """A blank cell means NOT RECORDED, which is not the same as zero.
+
+    A transaction tax read as 0.0 when the cell was empty would price every
+    trade in that instrument as tax-free -- a plausible number, silently
+    wrong, which is the failure mode this column exists to prevent.
+    """
+    text = (raw or "").strip()
+    return float(text) if text else None
+
+
+def _bool(raw: str | None, default: bool = False) -> bool:
+    text = (raw or "").strip().lower()
+    if not text:
+        return default
+    return text not in {"false", "0", "no"}
+
+
 TRANSACTION_COLUMNS = ["id", "date", "isin", "type", "quantity", "price_per_unit",
                        "currency", "fees", "note"]
 AMENDMENT_COLUMNS = ["id", "target_id", "action", "at", "reason"]
@@ -147,6 +171,13 @@ class DataStore:
                             not in {"false", "0", "no"}),
                     manual_overrides={f for f in (row.get("manual_overrides") or "").split("|") if f},
                     note=row.get("note", ""),
+                    broker=row.get("broker", "") or "",
+                    tradeable=_bool(row.get("tradeable"), default=True),
+                    tob_rate=_opt_float(row.get("tob_rate")),
+                    tob_observed=_bool(row.get("tob_observed")),
+                    half_spread_bps=_opt_float(row.get("half_spread_bps")),
+                    spread_observed=_bool(row.get("spread_observed")),
+                    buy_tax_rate=float(row.get("buy_tax_rate") or 0.0),
                 )
                 out[inst.isin] = inst
         return out
@@ -171,6 +202,14 @@ class DataStore:
                     "active": "true" if inst.active else "false",
                     "manual_overrides": "|".join(sorted(inst.manual_overrides)),
                     "note": inst.note.replace("\n", "; "),
+                    "broker": inst.broker,
+                    "tradeable": "true" if inst.tradeable else "false",
+                    "tob_rate": "" if inst.tob_rate is None else inst.tob_rate,
+                    "tob_observed": "true" if inst.tob_observed else "false",
+                    "half_spread_bps": ("" if inst.half_spread_bps is None
+                                        else inst.half_spread_bps),
+                    "spread_observed": "true" if inst.spread_observed else "false",
+                    "buy_tax_rate": inst.buy_tax_rate,
                 })
 
     # -- ledger ------------------------------------------------------------

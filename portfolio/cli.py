@@ -5,6 +5,7 @@
     portfolio serve --provider fixture   # fully offline demo, synthetic prices
     portfolio check                      # run the core test suite
     portfolio controls                   # calibrate the backtest harness
+    portfolio backtest erc               # equal risk contribution vs buy-and-hold
 
 Deliberately thin: argument parsing and process startup only. Every decision
 about data lives in `api.services`.
@@ -137,6 +138,76 @@ def _controls(args: argparse.Namespace) -> int:
     return 0 if report.passed else 1
 
 
+def _backtest(args: argparse.Namespace) -> int:
+    """Evaluate one policy against buy-and-hold on the real book.
+
+    Prints gross and net side by side, the turnover at which the gross edge
+    is fully consumed, and the cost inputs that are estimates rather than
+    observations -- because the largest single component of trading cost
+    here, the bid-ask spread, is paid inside the execution price and appears
+    on no contract note.
+    """
+    from .eval.registry import Preregistration, Registry, TrialResult
+    from .research import load_book, run_equal_risk_contribution
+
+    try:
+        book = load_book(mode=args.mode, data_root=args.data_root,
+                         provider=args.provider, lookback=args.history,
+                         account_value=args.account_value)
+    except Exception as exc:                       # noqa: BLE001 - reported, not raised
+        print(f"Could not load the book: {exc}", file=sys.stderr)
+        return 2
+
+    if args.register and args.provider == "fixture":
+        print("Refusing to register a run on synthetic prices. The trial count "
+              "feeds the deflated Sharpe ratio, and an attempt that was never "
+              "about the real portfolio would deflate every real attempt that "
+              "follows it. Run against real prices, or drop --register.",
+              file=sys.stderr)
+        return 2
+
+    registry = Registry()
+    trial = None
+    if args.register:
+        trial = registry.register(Preregistration(
+            hypothesis=(
+                "Equalising each holding's contribution to portfolio volatility "
+                "beats leaving the book alone, after the trading it requires."),
+            policy="equal-risk-contribution",
+            parameters={"lookback": args.lookback,
+                        "rebalance_every": args.rebalance,
+                        "frozen": sorted(book.frozen),
+                        "provider": args.provider,
+                        "account_value": book.account_value},
+            success_criterion=(
+                "net annualised Sharpe above buy-and-hold, with the gross edge "
+                "surviving the policy's own turnover"),
+            expected_outcome=(
+                "A small reduction in volatility and a small improvement in "
+                "risk-adjusted return, most or all of it consumed by turnover. "
+                "Written before the run.")))
+
+    comparison = run_equal_risk_contribution(
+        book, lookback=args.lookback, rebalance_every=args.rebalance,
+        trials=args.trials, trial_sharpe_sd=args.trial_spread)
+    print("\n".join(comparison.lines()))
+
+    if trial is not None:
+        registry.record(TrialResult(
+            trial_id=trial.id,
+            sharpe_per_period=comparison.net.sharpe_per_period,
+            observations=comparison.net.observations,
+            independent_observations=comparison.net.independent_observations,
+            verdict=comparison.net.verdict(),
+            met_criterion=bool(
+                comparison.net.sharpe is not None
+                and comparison.benchmark.sharpe is not None
+                and comparison.net.sharpe > comparison.benchmark.sharpe)))
+        print()
+        print(f"Registered in {registry.path}: {registry.summary()}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="portfolio",
                                      description="Portfolio risk tracker")
@@ -170,6 +241,34 @@ def build_parser() -> argparse.ArgumentParser:
     controls.add_argument("--register", action="store_true",
                           help="append the controls to the pre-registration log")
     controls.set_defaults(func=_controls)
+
+    backtest = sub.add_parser(
+        "backtest", help="evaluate a policy against buy-and-hold on your book")
+    backtest.add_argument("policy", choices=["erc"],
+                          help="erc = equal risk contribution")
+    backtest.add_argument("--mode", choices=["seed", "user"], default="user")
+    backtest.add_argument("--provider", choices=["yfinance", "fixture"],
+                          default="yfinance",
+                          help="fixture = deterministic synthetic prices; the "
+                               "machinery runs but the result is not about "
+                               "your holdings")
+    backtest.add_argument("--data-root", default=None)
+    backtest.add_argument("--lookback", type=int, default=252,
+                          help="covariance window, in trading days")
+    backtest.add_argument("--rebalance", type=int, default=21,
+                          help="trading days between decisions")
+    backtest.add_argument("--history", type=int, default=750,
+                          help="price history to evaluate over, in rows")
+    backtest.add_argument("--account-value", type=float, default=None,
+                          help="notional for the cost model; defaults to the "
+                               "book's own market value")
+    backtest.add_argument("--trials", type=int, default=1,
+                          help="pre-registered attempts, for the deflated Sharpe")
+    backtest.add_argument("--trial-spread", type=float, default=0.0,
+                          help="spread of Sharpe estimates across those trials")
+    backtest.add_argument("--register", action="store_true",
+                          help="append this attempt to the pre-registration log")
+    backtest.set_defaults(func=_backtest)
     return parser
 
 
