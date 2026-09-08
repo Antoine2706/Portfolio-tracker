@@ -107,6 +107,39 @@ samples. Moved onto ``s^2``, where the sampling distribution is symmetric and
 the sign survives, the same nominal rule claims 2%. `resolution_control`
 prints both columns.
 
+**A one-year window was throwing away most of the book, and a longer one
+only half rescues it.** The survey first estimated over the holding period,
+about 250 bars, for no better reason than that the covariance window is 250
+bars. A covariance window must be short because correlations move with
+regime; a spread is a microstructure property that moves slowly and has
+nothing to do with when the holding was bought. Measured, at 80 runs a cell,
+as the fraction of samples in which a spread is claimed as a measurement:
+
+    half-spread     250     500    1000    2500   bars
+        2.0 bps      0%      2%      4%      5%
+        4.0 bps      4%      4%     15%     16%
+        6.0 bps     15%     22%     44%     91%
+        8.0 bps     28%     66%     80%     99%
+       10.0 bps     49%     82%     94%    100%
+       15.0 bps     96%    100%    100%    100%
+
+So the whole available history is now taken, and it moves the point at which
+half of samples resolve from about 10 bps to about 6. That rescues the wide
+end of a European ETF book. It does not rescue the tight end: at 2 and 4 bps
+the fraction resolved is flat in the sample length, because that is under the
+floor at every length daily bars can offer, and no window reaches it. Those
+instruments get the upper-bound tier instead, which is why that tier is not a
+nicety.
+
+The longer window has a cost, and it is measured rather than assumed:
+spreads narrow as a fund grows, so a ten-year estimate can be an average of a
+market that no longer exists. `core.spread.sweep_windows` estimates over each
+nested window, prints the sequence, and compares **disjoint** older blocks
+against the most recent one at three standard errors. Flat means take
+everything; a real difference means the spread has moved and the window stops
+there. Disjoint, because nested windows share their data and the difference
+of two nested estimates has a variance smaller than the sum of theirs.
+
 **The estimator runs 1 to 3% high on wide spreads, and it is a finite-trade
 effect rather than a defect.** The positive control's bias column is monotone
 in the spread -- -0.6, +0.9, +1.0, +1.2, +2.1% at 5, 10, 20, 50 and 100 bps --
@@ -156,7 +189,8 @@ from ..core.spread import MINIMUM_BARS, edge
 __all__ = [
     "simulate_bars", "SweepRung", "SpreadControlReport", "positive_control",
     "negative_control", "standard_error_control", "resolution_control",
-    "refusal_control", "run_spread_controls", "SWEEP_BPS",
+    "resolution_by_window_control", "refusal_control", "run_spread_controls",
+    "SWEEP_BPS",
 ]
 
 
@@ -633,6 +667,98 @@ def resolution_control(*, runs: int = 150, bars: int = 500, ticks: int = 60,
         numbers={"below": quiet, "above": loud})
 
 
+def resolution_by_window_control(
+        *, runs: int = 120, ticks: int = 60, sigma: float = 0.01,
+        seed0: int = 30_000,
+        spreads: tuple[float, ...] = (2.0, 4.0, 6.0, 8.0, 10.0, 15.0),
+        lengths: tuple[int, ...] = (250, 500, 1000, 2500)
+        ) -> SpreadControlReport:
+    """What can actually be resolved, at what spread, off how many bars.
+
+    The other controls establish that the estimator works. This one answers
+    the question that decides whether any of it is useful on a particular
+    book: given a European ETF whose true half-spread is 2 to 15 bps, how
+    often does the significance test let it through?
+
+    It exists because the answer changed a design decision. The survey used
+    to estimate over the holding period, about 250 bars, on no better reason
+    than that the covariance window is 250 bars. A covariance window must be
+    short -- correlations move with regime. A spread does not, and the noise
+    floor thins as the fourth root of the sample, so the window was costing
+    resolution for nothing. The survey now takes the whole available history.
+
+    The falsifiable claim: **resolution must improve with sample length at
+    every spread the estimator can reach at all.** A rule that did not would
+    mean the longer window buys nothing and the change was pointless.
+
+    What it does not claim, and what the table shows plainly, is that a longer
+    window rescues everything. It does not. Below about 4 bps the fraction
+    resolved is flat in the sample length, because that is under the floor at
+    every length available, and no amount of daily history reaches it.
+
+    The spreads passed here must include at least one with room to improve.
+    15 bps alone would not do: it already resolves 96% of the time off 250
+    bars, so it has nowhere to go and the control would report that it found
+    no improvement rather than that none exists.
+
+    >>> r = resolution_by_window_control(runs=25, spreads=(8.0, 15.0),
+    ...                                  lengths=(250, 1000))
+    >>> r.passed
+    True
+    """
+    grid = {}
+    for half_bps in spreads:
+        full = 2.0 * half_bps / 10_000.0
+        for bars in lengths:
+            claimed = 0
+            for i in range(runs):
+                o, h, l, c = simulate_bars(full, bars=bars, ticks=ticks,
+                                           sigma=sigma,
+                                           seed=seed0 + int(half_bps * 97) + i)
+                claimed += edge(o, h, l, c, minimum_bars=0).resolved()
+            grid[(half_bps, bars)] = claimed / runs
+
+    # Two claims, because one of them alone is satisfiable for the wrong
+    # reason. A longer sample must never resolve LESS often -- that would mean
+    # something other than sampling error is at work. And where there is room
+    # to improve it must actually improve, or the longer window is buying
+    # nothing and the change that introduced it was pointless.
+    #
+    # A spread already resolving nearly always on the short window has no room
+    # and is excluded from the second claim rather than failing it: 15 bps
+    # resolves 93% off 250 bars and cannot gain fifteen points.
+    reachable = [s for s in spreads if grid[(s, lengths[-1])] >= 0.5]
+    headroom = [s for s in reachable if grid[(s, lengths[0])] < 0.80]
+    never_worse = all(grid[(s, lengths[-1])] >= grid[(s, lengths[0])] - 0.10
+                      for s in spreads)
+    improves = bool(headroom) and all(
+        grid[(s, lengths[-1])] >= grid[(s, lengths[0])] + 0.15
+        for s in headroom)
+    unreachable = [s for s in spreads if grid[(s, lengths[-1])] < 0.5]
+
+    detail = "\n".join(
+        [f"{runs} runs per cell; the fraction claimed as a measurement",
+         "  half-spread  " + "  ".join(f"{b:>6}" for b in lengths) + "   bars"]
+        + [f"  {s:8.1f} bps  "
+           + "  ".join(f"{grid[(s, b)]:5.0%} " for b in lengths)
+           + ("" if s in reachable else "   never reaches half")
+           for s in spreads]
+        + [f"never resolves less often on the longer sample: "
+           f"{'yes' if never_worse else 'NO'}",
+           f"and improves materially where there is room to "
+           f"({', '.join(f'{s:.0f}' for s in headroom) or 'nowhere'} bps): "
+           f"{'yes' if improves else 'NO'}"]
+        + ([f"{', '.join(f'{s:.0f}' for s in unreachable)} bps stay under the "
+            f"floor at every length available, so a longer window does not "
+            f"rescue them and the upper-bound tier is what they get"]
+           if unreachable else []))
+    return SpreadControlReport(
+        name="Resolution by window: what a longer history actually buys",
+        passed=never_worse and improves, detail=detail,
+        numbers={"grid": grid, "reachable": reachable,
+                 "unreachable": unreachable})
+
+
 def run_spread_controls(*, quick: bool = False) -> list[SpreadControlReport]:
     """All five. This is what `portfolio controls --spread` prints."""
     if quick:
@@ -643,7 +769,10 @@ def run_spread_controls(*, quick: bool = False) -> list[SpreadControlReport]:
                                    lag_choices=(0, 1)),
             resolution_control(runs=40, bars=400, below=(0.0, 2.0),
                                above=(20.0, 100.0)),
+            resolution_by_window_control(runs=30, spreads=(4.0, 8.0, 10.0),
+                                         lengths=(250, 1000)),
             refusal_control(runs=20),
         ]
     return [positive_control(), negative_control(), standard_error_control(),
-            resolution_control(), refusal_control()]
+            resolution_control(), resolution_by_window_control(),
+            refusal_control()]

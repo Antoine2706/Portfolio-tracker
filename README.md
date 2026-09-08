@@ -156,26 +156,66 @@ another contaminated one.
 reports 3.97 bps off 500 daily bars, because √|s²| folds a mean-zero
 distribution onto the positive side. That floor thins only as n^(−¼) —
 measured at 0.85 per doubling against a predicted 0.841 — so a 2 bps floor
-would need twenty-four years of bars. This cannot resolve the tightest
-trackers from daily data, and the tier system exists so it never claims to:
+would need twenty-four years of bars.
+
+Which decides how much of a book this can speak to at all. Measured, as the
+fraction of samples in which a spread is claimed as a measurement:
+
+| true half-spread | 250 bars | 500 | 1000 | 2500 |
+|---|---|---|---|---|
+| 2 bps | 0% | 2% | 4% | 5% |
+| 4 bps | 4% | 4% | 15% | 16% |
+| 6 bps | 15% | 22% | 44% | 91% |
+| 8 bps | 28% | 66% | 80% | 99% |
+| 10 bps | 49% | 82% | 94% | 100% |
+| 15 bps | 96% | 100% | 100% | 100% |
+
+So the estimate is taken over the instrument's **whole available history**,
+not over the holding period. A covariance window must be short because
+correlations move with regime; a spread is a microstructure property that
+moves slowly and has nothing to do with when the holding was bought. That
+moves the point at which half of samples resolve from about 10 bps to about
+6 — and it plainly does *not* rescue the tight end, where the fraction
+resolved is flat in the sample length because no daily window reaches it.
+
+The long window has a cost — spreads narrow as a fund grows, so a ten-year
+estimate can average a market that no longer exists — so it is measured
+rather than assumed. The estimate is computed over each nested window, the
+sequence is printed, and **disjoint** older blocks are compared against the
+most recent at three standard errors. Flat means take everything; a real
+difference means the spread has moved and the window stops there.
+
+Four tiers, and the third is why any of this is useful on a tight book:
 
 | tier | meaning |
 |---|---|
 | `observed` | somebody watched it. Outranks everything below, and `--write` will not overwrite it |
 | `estimated` | EDGE on that instrument's own bars, clearing **all** of: two standard errors clear of zero *on s²*, at or above half a tick, off at least 60 bars |
-| `assumed` | the declared constant, for everything else |
+| `bounded` | not distinguishable from zero, so the **upper confidence bound** `√(s² + 2·SE)` is charged and labelled a ceiling |
+| `assumed` | the declared constant, for an instrument that was not measurable at all |
 
-An estimate that fails a gate is discarded, not shaded — a 4 bps reading at
-the noise floor and a real 4 bps spread are the same number, and only one is a
-measurement. The tick is inferred from the prices themselves (the coarsest
-grid essentially every print falls on) rather than from a table of venue rules
-nobody here could check.
+Failing the significance test does not mean nothing was learned: it puts a
+ceiling on the spread, and that ceiling is per instrument because the standard
+error depends on that instrument's own volatility and bar count. So the
+differentiation survives even where nothing resolves. It errs toward
+overstating cost, which makes the allocator too reluctant rather than too
+eager, and unlike a constant it is falsifiable — a bound below a spread later
+seen on a quote screen is a bug report.
 
-Five controls back it, and they are the reason to believe any of the above:
+The tick is inferred from the prices themselves (the coarsest grid essentially
+every print falls on) rather than from a table of venue rules nobody here
+could check, and off **recent** bars only: a split divides older prices by its
+ratio and takes them off any grid, and the MiFID II regime bands by price, so
+the tick that applies today is the one today's prices are on. A recent tail
+that is off grid means an adjusted series arrived, and an adjusted price never
+traded — that instrument is refused rather than measured.
+
+Six controls back it, and they are the reason to believe any of the above:
 a positive sweep from 2 to 100 bps reporting bias and dispersion at each rung,
 a negative control measuring the floor and checking it thins as sampling noise
 must, a standard error checked against the dispersion it claims to predict, a
-resolution control, and a refusal below a minimum bar count. Plus a ranking
+resolution control, a resolution-by-window control that says what a longer
+history actually buys, and a refusal below a minimum bar count. Plus a ranking
 check on the result as a whole: estimated spread against median daily traded
 value, because an ordering that contradicts liquidity is more likely a wiring
 fault than a market fact, and `--write` refuses when it fails.

@@ -466,25 +466,30 @@ def _spreads(args: argparse.Namespace) -> int:
 
     if args.write:
         from .data.store import DataMode, DataStore
-        from .agents.spreads import ESTIMATED
+        from .agents.spreads import BOUNDED, ESTIMATED
         root = pathlib.Path(args.data_root) if args.data_root else None
         store = DataStore.open(DataMode(args.mode), root=root)
         instruments = store.load_instruments()
-        written = 0
+        counts = {ESTIMATED: 0, BOUNDED: 0}
         for isin, decision in survey.decisions.items():
-            if decision.source != ESTIMATED or isin not in instruments:
+            # A bound is written as well as a measurement, and stored under
+            # its own source so that nothing downstream can mistake the two.
+            # An instrument that was not measurable at all is left alone.
+            if decision.source not in counts or isin not in instruments:
                 continue
             instruments[isin] = dataclasses.replace(
                 instruments[isin],
                 half_spread_bps=round(decision.half_spread_bps, 2),
                 spread_observed=False,
                 spread_source=decision.source)
-            written += 1
+            counts[decision.source] += 1
         store.save_instruments(instruments)
         print()
-        print(f"Wrote {written} estimated half-spread(s) to "
-              f"{store.directory}. Instruments that")
-        print("did not clear the gates were left alone, keeping the declared "
+        print(f"Wrote {counts[ESTIMATED]} measured half-spread(s) and "
+              f"{counts[BOUNDED]} upper bound(s) to")
+        print(f"{store.directory}, each under its own source. Instruments "
+              f"that were not")
+        print("measurable at all were left alone, keeping the declared "
               "constant.")
     return 0
 

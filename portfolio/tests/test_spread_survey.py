@@ -17,12 +17,14 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from portfolio.agents.spreads import (ASSUMED, ESTIMATED, decide_spread,
-                                      ranking_is_plausible)
+from portfolio.agents.spreads import (ASSUMED, BOUNDED, ESTIMATED,
+                                      decide_spread, ranking_is_plausible)
 from portfolio.core.spread import SpreadEstimate, TickSize, edge, infer_tick_size
 from portfolio.data.cache import PriceCache
 from portfolio.data.provider import MarketDataProvider, ProviderError
 from portfolio.data.providers.fixture import FixtureProvider
+from portfolio.eval.spread_controls import simulate_bars
+from portfolio.research import tick_for
 
 SYMBOLS = ["IWDA.AS", "EUDF.DE", "AIGG.MI", "WEAT.MI", "GLUX.PA", "ISAE.AS",
            "MEUD.PA", "SMEA.MI", "ESIE.DE", "AIGE.MI"]
@@ -173,15 +175,48 @@ class TestTheTiers:
         assert d.source == ESTIMATED and d.is_evidence
         assert d.half_spread_bps == pytest.approx(20.0)
 
-    def test_an_unresolved_estimate_is_discarded_not_shaded(self):
-        """The number is thrown away rather than used with a caveat. A 4 bps
-        estimate at the noise floor and a genuine 4 bps spread are the same
-        number, and only one of them is a measurement."""
+    def test_an_unresolved_estimate_becomes_a_ceiling_not_a_number(self):
+        """The point estimate is not charged -- a 4 bps reading at the noise
+        floor and a genuine 4 bps spread are the same number, and only one is
+        a measurement. But the sample still bounds the spread from above, and
+        that bound is per instrument, so it beats the constant."""
         weak = SpreadEstimate(0.0008, 6.4e-7, 0.0006, 500, 499,
                               square_standard_error=9.6e-7)
         d = decide_spread(weak, price=50.0, fallback_bps=8.0)
+        assert d.source == BOUNDED
+        assert d.is_evidence and not d.is_measurement
+        assert d.half_spread_bps != pytest.approx(weak.half_spread_bps)
+        assert d.half_spread_bps > weak.half_spread_bps      # it is a ceiling
+        # sqrt(s^2 + 2 SE) in half-bps: sqrt(6.4e-7 + 1.92e-6) * 1e4 / 2
+        assert d.half_spread_bps == pytest.approx(8.0, abs=0.05)
+
+    def test_the_bound_is_per_instrument_which_is_the_whole_point(self):
+        """Two instruments that both fail the significance test must still
+        get different numbers, or the exercise has delivered nothing on a
+        book where nothing resolves."""
+        # Both unresolved: t = 1.6 and t = 0.4, either side of nothing and
+        # both under the threshold of 2. Only the standard error differs.
+        quiet = SpreadEstimate(0.0008, 6.4e-7, 0.0006, 2000, 1999,
+                               square_standard_error=4.0e-7)
+        noisy = SpreadEstimate(0.0008, 6.4e-7, 0.0006, 300, 299,
+                               square_standard_error=1.6e-6)
+        a = decide_spread(quiet, price=50.0)
+        b = decide_spread(noisy, price=50.0)
+        assert a.source == b.source == BOUNDED
+        assert b.half_spread_bps > 1.5 * a.half_spread_bps, (
+            f"{a.half_spread_bps:.1f} vs {b.half_spread_bps:.1f}: the "
+            f"instrument with four times the standard error must carry the "
+            f"wider ceiling, or the bound is not per instrument")
+
+    def test_a_significantly_negative_square_is_not_a_tight_spread(self):
+        """s^2 + k SE below zero is the data contradicting the estimator.
+        Charging sqrt of it, or charging zero, would both be inventing."""
+        impossible = SpreadEstimate(0.0008, -6.4e-6, 0.0006, 500, 499,
+                                    square_standard_error=9.6e-7)
+        d = decide_spread(impossible, price=50.0, fallback_bps=8.0)
         assert d.source == ASSUMED and not d.is_evidence
         assert d.half_spread_bps == 8.0
+        assert "contradicting the estimator" in d.reason
 
     def test_a_refusal_passes_through_as_the_constant(self):
         nothing = SpreadEstimate(None, None, None, 30, 29,
@@ -401,3 +436,55 @@ class TestAnObservedSpreadOutranksAnEstimatedOne:
         nothing = SpreadEstimate(None, None, None, 20, 19, refusal="too short")
         d = decide_spread(nothing, price=50.0, observed_bps=6.0)
         assert d.source == "observed" and d.half_spread_bps == 6.0
+
+
+class TestTheTickIsReadOffRecentBarsOnly:
+    """The guard that a whole-series read would break, and nothing caught.
+
+    A split divides every older price by the ratio and takes that section off
+    any grid, so reading the whole series finds no tick and the instrument is
+    refused for having had a split -- which is not a reason to refuse
+    anything. A dividend adjustment does the same to the section before the
+    last ex-date, and that one IS a reason to refuse, because an adjusted
+    price never traded.
+
+    The two look identical in a whole-series read and different in a recent
+    one, which is the entire argument for reading recent bars.
+    """
+
+    def frame(self, *, bars_count: int = 800, seed: int = 3):
+        o, h, l, c = simulate_bars(0.004, bars=bars_count, seed=seed,
+                                   tick_size=0.01)
+        return pd.DataFrame({"open": o, "high": h, "low": l, "close": c},
+                            index=pd.bdate_range("2020-01-01",
+                                                 periods=bars_count))
+
+    def test_a_split_does_not_cost_the_instrument_its_tick(self):
+        frame = self.frame()
+        frame.iloc[:500] /= 3.0                    # a 3:1 split, 300 bars ago
+        assert tick_for(frame).usable, (
+            "a split took the tick away; the inference is reading more than "
+            "the recent tail")
+        # ...and the whole-series read is what would have failed.
+        assert not infer_tick_size(frame.to_numpy().ravel()).usable
+
+    def test_a_dividend_adjusted_series_is_still_caught(self):
+        """The guard must not become so permissive that it stops catching the
+        thing it is for."""
+        frame = self.frame()
+        frame *= 0.98317
+        assert not tick_for(frame).usable
+
+    def test_an_adjustment_inside_the_recent_window_is_caught(self):
+        """The realistic case for FR0000121972, which pays every year: the
+        last ex-date is recent, so part of the tail is scaled and part is
+        not."""
+        frame = self.frame()
+        frame.iloc[:-80] *= 0.98317
+        assert not tick_for(frame).usable
+
+    def test_a_clean_series_reads_its_grid(self):
+        assert tick_for(self.frame()).size == pytest.approx(0.01)
+
+    def test_a_series_shorter_than_the_window_still_reads(self):
+        assert tick_for(self.frame(bars_count=120)).usable

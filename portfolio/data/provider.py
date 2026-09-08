@@ -145,8 +145,16 @@ class MarketDataProvider(abc.ABC):
     def quote(self, symbol: str) -> Quote:
         """Latest price, with its as-of timestamp and stated delay."""
 
-    def bars(self, symbol: str, start: dt.date | None = None) -> pd.DataFrame:
+    def bars(self, symbol: str, start: dt.date | None = None, *,
+             period: str = "2y") -> pd.DataFrame:
         """Open, high, low, close and volume per day, indexed by date.
+
+        `period` is how far back to reach when `start` is not given. The
+        spread survey asks for "max", because a spread is a microstructure
+        property of the instrument rather than of the holding period, and the
+        estimator's noise floor thins as the fourth root of the sample: on a
+        one-year window nothing under about 9 bps resolves, which is most of
+        a European ETF book.
 
         `volume` is shares traded, and is here rather than in a separate call
         because it arrives in the same response and because the spread survey

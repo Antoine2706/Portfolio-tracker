@@ -20,9 +20,16 @@ provenance report totals by it:
                conditions, and any one of them failing drops the instrument to
                the tier below rather than shading the number.
 
+    bounded    not distinguishable from zero, so the *upper confidence
+               bound* is charged and labelled as a bound rather than an
+               estimate. See below: failing the significance test does not
+               mean nothing was learned.
+
     assumed    the declared constant. What every instrument used before this,
-               and what an instrument still gets when its own data cannot
-               support anything better.
+               and what an instrument still gets when it was not measurable
+               at all -- too few bars, or prices that are not on any venue's
+               tick grid, which means the series has been adjusted and is the
+               wrong input entirely.
 
 The point of the split is not decoration. The cost model already reports what
 fraction of its figure rests on documents; until now the spread -- the largest
@@ -32,19 +39,43 @@ change, and it changes per instrument, which is the whole reason to estimate
 rather than assume: a 4 bps tracker and a 60 bps thematic fund are the same
 number under a constant and 15 times apart under a measurement.
 
-Why an unresolved estimate is discarded rather than used
---------------------------------------------------------
+Why an unresolved estimate becomes a bound rather than a number
+---------------------------------------------------------------
 The estimator has a noise floor of roughly 4 bps off two years of daily bars,
 which thins only as the fourth root of the sample. Below that it returns a
 number that looks exactly like a measurement and is its own sampling error.
 An instrument whose true spread is 2 bps and one whose data is simply too
-short both come back near 4, and nothing in the number distinguishes them.
+short both come back near 4, and nothing in the *point estimate*
+distinguishes them.
 
-Charging 4 bps to such an instrument would not be a small error. It would be
-an error that *reads as evidence*, and the cost model would report it in the
-observed-or-estimated column, which is the one a reader uses to decide how
-much of the answer to believe. The declared constant is worse as a number and
-better as a claim.
+Charging that 4 bps as an estimate would be an error that *reads as
+evidence*. But falling back to the declared constant, which is what this file
+did first, throws away something real. ``|s^2| >= k SE(s^2)`` failing says the
+spread is not distinguishable from zero. It does not say nothing was learned:
+it puts a **ceiling** on the spread, and the ceiling is per instrument.
+
+So the upper confidence bound is charged instead:
+
+    s_upper = sqrt(max(s^2 + k SE(s^2), 0))
+
+which beats the constant on three counts. It is per instrument, because the
+standard error depends on that instrument's own volatility and bar count, so
+the differentiation the whole exercise exists for survives even where nothing
+resolves. It errs in the direction that costs least, since overstating the
+spread makes the allocator too reluctant to trade rather than too eager. And
+it is falsifiable: a bound that sits below a spread later observed on a quote
+screen is a bug report, which a constant never could be.
+
+There is a step at the threshold -- just below it the bound is charged, just
+above it the point estimate -- and at exactly ``s^2 = k SE`` the bound is
+``sqrt(2)`` times the estimate. That discontinuity is real and is the price of
+a hard threshold. It is not smoothed over, because the two sides answer
+different questions and the label says which is being answered.
+
+If ``s^2 + k SE(s^2)`` is still negative, the squared spread is significantly
+*negative*, which the model does not permit. That is not a tight spread; it is
+the data contradicting the estimator, and it falls through to the constant
+with that said.
 
 Why the tick floor is a separate gate
 -------------------------------------
@@ -63,14 +94,16 @@ support wearing the estimated label.
 from __future__ import annotations
 
 import dataclasses
+import math
 
 from ..core.spread import SpreadEstimate, TickSize
 
-__all__ = ["OBSERVED", "ESTIMATED", "ASSUMED", "SpreadDecision",
+__all__ = ["OBSERVED", "ESTIMATED", "BOUNDED", "ASSUMED", "SpreadDecision",
            "decide_spread", "ranking_is_plausible", "RankingCheck"]
 
 OBSERVED = "observed"
 ESTIMATED = "estimated"
+BOUNDED = "bounded"
 ASSUMED = "assumed"
 
 # The significance the estimate must clear, on s^2 -- see
@@ -90,6 +123,17 @@ class SpreadDecision:
 
     @property
     def is_evidence(self) -> bool:
+        """Did this number come from the instrument's own data at all?"""
+        return self.source in (OBSERVED, ESTIMATED, BOUNDED)
+
+    @property
+    def is_measurement(self) -> bool:
+        """Is it a measurement of the spread, as opposed to a ceiling on it?
+
+        Separate from `is_evidence` because the two answer different
+        questions and conflating them is how a bound would come to be counted
+        as a measurement in a provenance report.
+        """
         return self.source in (OBSERVED, ESTIMATED)
 
     def line(self, isin: str) -> str:
@@ -146,16 +190,26 @@ def decide_spread(estimate: SpreadEstimate, *, price: float,
     >>> d.source, round(d.half_spread_bps, 1)
     ('estimated', 20.0)
 
-    One that does not is not a narrow spread, it is no reading:
+    One that does not is not a narrow spread; it is a ceiling, and the
+    ceiling is charged:
 
     >>> weak = SpreadEstimate(0.0008, 6.4e-7, 0.0006, 500, 499,
     ...                       square_standard_error=9.6e-7)
     >>> d = decide_spread(weak, price=50.0)
+    >>> d.source, round(d.half_spread_bps, 1)
+    ('bounded', 8.0)
+    >>> print(d.reason)
+    4.0 bps is 0.7 standard errors from zero, under 2.0, so it is a ceiling
+    and not a measurement: the spread is at most 8.0 bps off 499 bars
+
+    A squared spread that is significantly negative is the data contradicting
+    the estimator, not a tight market:
+
+    >>> impossible = SpreadEstimate(0.0008, -6.4e-6, 0.0006, 500, 499,
+    ...                             square_standard_error=9.6e-7)
+    >>> d = decide_spread(impossible, price=50.0)
     >>> d.source, d.half_spread_bps
     ('assumed', 8.0)
-    >>> print(d.reason)
-    4.0 bps is 0.7 standard errors from zero, under 2.0; not distinguishable
-    from no spread at all, which the estimator's own noise floor also is
     """
     if observed_bps is not None:
         note = ("recorded from a quote, which outranks an inference from "
@@ -180,17 +234,47 @@ def decide_spread(estimate: SpreadEstimate, *, price: float,
 
     got = estimate.half_spread_bps
     assert got is not None
+    floor = tick.floor_bps(price) if tick is not None else None
     t = estimate.t_statistic
+
     if t is None or t < significance:
         shown = "unknown" if t is None else f"{t:.1f}"
+        ceiling = _upper_bound_bps(estimate, significance)
+        if ceiling is None:
+            return SpreadDecision(
+                fallback_bps, ASSUMED,
+                f"the squared spread is {shown} standard errors from zero, "
+                f"so its upper bound is\nnegative too. That is the data "
+                f"contradicting the estimator rather than a\ntight market, "
+                f"and it is not something to charge",
+                estimate=estimate, tick=tick)
+        clamped = floor is not None and ceiling < floor
+        charged = max(ceiling, floor) if clamped else ceiling
+        # How the point estimate is described depends on the sign of the
+        # square, and the distinction is not pedantic. Where s^2 is positive
+        # the root is a spread estimate that merely fails a significance test.
+        # Where s^2 is NEGATIVE the root is sqrt(|s^2|), which is not an
+        # estimate of anything -- printing it as "10.8 bps" next to a ceiling
+        # of 6.5 reads as a contradiction, when in fact a negative square is
+        # exactly what a spread too small to detect looks like and the low
+        # ceiling is the informative half.
+        if (estimate.signed_square or 0.0) < 0:
+            head = (f"the squared spread came out negative "
+                    f"({shown} standard errors below zero), which is what a "
+                    f"spread too\nsmall for {estimate.usable_bars} bars to "
+                    f"detect looks like. So there is no reading, only a "
+                    f"ceiling:\nthe spread is at most {charged:.1f} bps")
+        else:
+            head = (f"{got:.1f} bps is {shown} standard errors from zero, "
+                    f"under {significance:.1f}, so it is a ceiling\nand not "
+                    f"a measurement: the spread is at most {charged:.1f} bps "
+                    f"off {estimate.usable_bars} bars")
         return SpreadDecision(
-            fallback_bps, ASSUMED,
-            f"{got:.1f} bps is {shown} standard errors from zero, under "
-            f"{significance:.1f}; not distinguishable\nfrom no spread at all, "
-            f"which the estimator's own noise floor also is",
-            estimate=estimate, tick=tick)
+            charged, BOUNDED,
+            head + ("\n(raised to half a tick, which is a firmer floor than "
+                    "the data gives)" if clamped else ""),
+            clamped_to_tick=clamped, estimate=estimate, tick=tick)
 
-    floor = tick.floor_bps(price) if tick is not None else None
     if floor is not None and got < floor:
         return SpreadDecision(
             floor, ESTIMATED,
@@ -293,6 +377,33 @@ def ranking_is_plausible(spreads: dict[str, float],
     return RankingCheck(rho, n, (
         "More liquid instruments are estimated tighter, which is the "
         "ordering\nliquidity predicts."), True)
+
+
+def _upper_bound_bps(estimate: SpreadEstimate,
+                     significance: float) -> float | None:
+    """The upper confidence bound on the half-spread, in bps, or None.
+
+    Formed on ``s^2`` and then rooted, because that is where the sampling
+    distribution is symmetric and where the standard error was validated.
+    None when the bound is itself negative, which means the estimate is
+    significantly below zero and the model is contradicted rather than the
+    spread being small.
+
+    >>> from portfolio.core.spread import SpreadEstimate
+    >>> e = SpreadEstimate(0.0008, 6.4e-7, 0.0006, 500, 499,
+    ...                    square_standard_error=9.6e-7)
+    >>> round(_upper_bound_bps(e, 2.0), 2)      # sqrt(6.4e-7 + 2*9.6e-7)
+    8.0
+    >>> _upper_bound_bps(SpreadEstimate(0.001, -1e-5, 0.0005, 500, 499,
+    ...                                 square_standard_error=1e-6), 2.0) is None
+    True
+    """
+    if estimate.signed_square is None or not estimate.square_standard_error:
+        return None
+    upper = estimate.signed_square + significance * estimate.square_standard_error
+    if upper <= 0:
+        return None
+    return float(math.sqrt(upper) * 10_000.0 / 2.0)
 
 
 def _spearman(a: list[float], b: list[float]) -> float:

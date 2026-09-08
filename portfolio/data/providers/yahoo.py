@@ -111,17 +111,25 @@ class YahooProvider(MarketDataProvider):
         series.name = symbol
         return series
 
-    def bars(self, symbol: str, start: dt.date | None = None) -> pd.DataFrame:
+    def bars(self, symbol: str, start: dt.date | None = None, *,
+             period: str = "2y") -> pd.DataFrame:
         """Unadjusted OHLC. See `MarketDataProvider.bars` for why unadjusted.
 
         The same call `history` makes, with `auto_adjust=False` and three more
         columns kept. Yahoo has been returning them all along; this fetch
         simply stops throwing them away.
+
+        `auto_adjust=False` leaves dividends out of the prices, which is what
+        the tick-grid inference needs. It does **not** undo splits: yfinance
+        applies those whatever this flag says, so a series spanning a split
+        has its older half divided by the split ratio and off the grid. That
+        is why `core.spread.infer_tick_size` is given only recent bars --
+        the tick that matters is today's anyway.
         """
         ticker = self._ticker(symbol)
         try:
             hist = ticker.history(start=start.isoformat() if start else None,
-                                  period=None if start else "2y",
+                                  period=None if start else period,
                                   interval="1d", auto_adjust=False)
         except ProviderError:
             raise

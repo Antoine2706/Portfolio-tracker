@@ -405,6 +405,39 @@ def replay_the_ledger(book: Book, *, mode: str = "user",
 # --------------------------------------------------------------------------
 
 
+# How many recent bars the tick grid is read off. Long enough that the
+# candidate grids are distinguishable, short enough to sit inside the period
+# since the instrument's last split -- splits are applied by the provider
+# whatever the adjustment flag says, and they divide older prices by a ratio
+# that takes them off any grid.
+TICK_WINDOW = 250
+
+
+def tick_for(prices: "pd.DataFrame") -> "object":
+    """The venue tick grid, read off RECENT bars only.
+
+    Two reasons, and only one of them is about splits.
+
+    yfinance applies split adjustments whatever `auto_adjust` says, so a
+    series spanning a split has its older section divided by the ratio and
+    sitting on no grid at all. Reading the whole series would then find no
+    tick and the instrument would be refused for having had a split, which is
+    not a reason to refuse anything.
+
+    And the MiFID II tick regime bands by price as well as by liquidity, so
+    the tick that applies to a trade today is the one today's prices are on.
+    A ten-year series can span several tick bands, and the average of them is
+    not a tick.
+
+    The grid is also the check on whether the right series arrived at all:
+    dividend adjustment multiplies prices by a factor that is not a multiple
+    of the tick, so a recent tail that is off grid means an adjusted series
+    reached this code, and an adjusted price is one that never traded.
+    """
+    from .core.spread import infer_tick_size
+    return infer_tick_size(prices.tail(TICK_WINDOW).to_numpy().ravel())
+
+
 @dataclasses.dataclass(frozen=True)
 class SpreadSurvey:
     """What every instrument's spread is, and how much of it is evidence."""
@@ -413,6 +446,7 @@ class SpreadSurvey:
     names: dict
     fallback_bps: float
     refused: dict                        # isin -> why no bars at all
+    sweeps: dict = dataclasses.field(default_factory=dict)  # isin -> WindowSweep
 
     def lines(self) -> list[str]:
         from .agents.spreads import ASSUMED, ESTIMATED
@@ -430,6 +464,9 @@ class SpreadSurvey:
                        f"{'  CLAMPED TO TICK' if d.clamped_to_tick else ''}")
             for line in d.reason.splitlines():
                 out.append(f"           {line}")
+            sweep = self.sweeps.get(isin)
+            if sweep is not None and len(sweep.rungs) > 1:
+                out.extend(f"      {line}" for line in sweep.lines())
             rho = None if d.estimate is None else d.estimate.autocorrelation
             if rho is not None:
                 # The standard error treats the per-bar series as independent,
@@ -450,22 +487,55 @@ class SpreadSurvey:
             out.append(f"    no bars: {why}")
             out.append("")
 
-        estimated = [i for i, d in self.decisions.items() if d.source == ESTIMATED]
-        assumed = ([i for i, d in self.decisions.items() if d.source == ASSUMED]
-                   + list(self.refused))
+        from .agents.spreads import BOUNDED, OBSERVED
+
+        by_tier = {tier: [i for i, d in self.decisions.items()
+                          if d.source == tier]
+                   for tier in (OBSERVED, ESTIMATED, BOUNDED, ASSUMED)}
+        total = len(self.decisions) + len(self.refused)
+        measured = by_tier[OBSERVED] + by_tier[ESTIMATED]
+        bounded = by_tier[BOUNDED]
+        constant = by_tier[ASSUMED] + list(self.refused)
+
         out.append("-" * 74)
-        out.append(f"{len(estimated)} of {len(estimated) + len(assumed)} "
-                   f"instruments carry a measured spread; {len(assumed)} keep "
-                   f"the declared")
-        out.append(f"{self.fallback_bps:.0f} bps because their own data cannot "
-                   f"support anything better.")
-        if estimated:
-            got = [self.decisions[i].half_spread_bps for i in estimated]
-            out.append(f"Measured spreads run {min(got):.1f} to {max(got):.1f} "
-                       f"bps -- a factor of {max(got) / min(got):.1f} that a "
-                       f"single constant")
-            out.append("could not express, which is the whole reason to "
-                       "estimate rather than assume.")
+        out.append(f"Of {total} instruments: {len(measured)} carry a measured "
+                   f"spread, {len(bounded)} carry an upper")
+        out.append(f"bound from their own data, and {len(constant)} were not "
+                   f"measurable at all and keep")
+        out.append(f"the declared {self.fallback_bps:.0f} bps.")
+
+        own = measured + bounded
+        if own:
+            got = [self.decisions[i].half_spread_bps for i in own]
+            if min(got) > 0:
+                out.append(f"The numbers coming from the instruments' own "
+                           f"data run {min(got):.1f} to {max(got):.1f} bps, a "
+                           f"factor of")
+                out.append(f"{max(got) / min(got):.1f} that a single constant "
+                           f"could not express -- which is the whole reason "
+                           f"to measure.")
+        if bounded:
+            over = [i for i in bounded
+                    if self.decisions[i].half_spread_bps > self.fallback_bps]
+            if over:
+                out.append(f"{len(over)} of the {len(bounded)} ceilings "
+                           f"{'sits' if len(over) == 1 else 'sit'} ABOVE the "
+                           f"{self.fallback_bps:.0f} bps constant "
+                           f"{'it replaces' if len(over) == 1 else 'they replace'}, "
+                           f"so the")
+                out.append("modelled cost of trading those has gone up. That "
+                           "is the intended direction:")
+                out.append("the data cannot rule those spreads out, and a "
+                           "ceiling that made the")
+                out.append("allocator keener to trade than ignorance did "
+                           "would be the wrong error.")
+        if bounded and not measured:
+            out.append("Nothing resolved. Every number above is a ceiling "
+                       "rather than a reading,")
+            out.append("which is still per instrument and still beats one "
+                       "constant for all of them,")
+            out.append("but no spread here has been measured and none should "
+                       "be quoted as one.")
         out.append("")
         out.extend(self.ranking.line().splitlines())
         return out
@@ -488,7 +558,7 @@ def survey_spreads(book: Book, *, mode: str = "user",
     the venue is the reason.
     """
     from .agents.spreads import decide_spread, ranking_is_plausible
-    from .core.spread import edge, infer_tick_size
+    from .core.spread import infer_tick_size, sweep_windows
     from .data.cache import PriceCache
     from .data.market import MarketData
 
@@ -508,6 +578,7 @@ def survey_spreads(book: Book, *, mode: str = "user",
     # loader uses, rather than a second one that could drift from it.
     resolver = MarketData(market_provider, cache)
     decisions, refused, spreads, liquidity, names = {}, {}, {}, {}, {}
+    sweeps: dict = {}
 
     for isin, inst in book.instruments.items():
         names[isin] = getattr(inst, "name", "") or ""
@@ -521,17 +592,35 @@ def survey_spreads(book: Book, *, mode: str = "user",
             frame = cached[0]
         if frame is None or frame.empty:
             try:
-                frame = market_provider.bars(symbol)
+                # "max", not the two years the price loader takes. A spread is
+                # a property of the instrument and its market makers rather
+                # than of the holding period, and the noise floor thins as the
+                # fourth root of the sample: on 250 bars nothing under about
+                # 9 bps resolves, which is most of a European ETF book.
+                frame = market_provider.bars(symbol, period="max")
             except Exception as exc:
                 refused[isin] = f"{type(exc).__name__}: {exc}"
                 continue
             cache.put_bars(symbol, frame)
 
         prices = frame[["open", "high", "low", "close"]]
-        estimate = edge(prices["open"].to_numpy(), prices["high"].to_numpy(),
-                        prices["low"].to_numpy(), prices["close"].to_numpy())
-        tick = infer_tick_size(prices.to_numpy().ravel())
+        sweep = sweep_windows(
+            prices["open"].to_numpy(), prices["high"].to_numpy(),
+            prices["low"].to_numpy(), prices["close"].to_numpy())
+        estimate = sweep.chosen
+        tick = tick_for(prices)
         price = float(frame["close"].iloc[-1])
+        if not tick.usable:
+            # Off-grid recent prices mean the series has been adjusted, and an
+            # adjusted series is the wrong input to the estimator too, not
+            # merely to the tick inference. Refuse rather than charge a number
+            # derived from prices that never traded.
+            refused[isin] = (
+                f"the last {min(len(prices), TICK_WINDOW)} bars do not sit on "
+                f"any venue tick grid ({tick.agreement:.0%} of prices fit the "
+                f"best candidate). That means the series has been adjusted "
+                f"for distributions, and an adjusted price never traded")
+            continue
         # An already-recorded observed spread wins, and the estimate is
         # reported beside it rather than discarded: two independent readings
         # of the same quantity are worth comparing, and `--write` must never
@@ -543,6 +632,7 @@ def survey_spreads(book: Book, *, mode: str = "user",
                                  fallback_bps=fallback_bps,
                                  observed_bps=watched)
         decisions[isin] = decision
+        sweeps[isin] = sweep
         if decision.is_evidence:
             spreads[isin] = decision.half_spread_bps
         # Liquidity for the ranking check: median daily traded value, which
@@ -558,4 +648,5 @@ def survey_spreads(book: Book, *, mode: str = "user",
     cache.close()
     return SpreadSurvey(decisions=decisions,
                         ranking=ranking_is_plausible(spreads, liquidity),
-                        names=names, fallback_bps=fallback_bps, refused=refused)
+                        names=names, fallback_bps=fallback_bps,
+                        refused=refused, sweeps=sweeps)

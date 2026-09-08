@@ -346,7 +346,8 @@ class Provenance:
                 counts[tier] = counts.get(tier, 0) + 1
             total = len(self.spread_tiers)
             measured = counts.get("estimated", 0) + counts.get("observed", 0)
-            if measured:
+            bounded = counts.get("bounded", 0)
+            if measured or bounded:
                 parts = [f"{count} {tier}"
                          for tier, count in sorted(counts.items())]
                 out.append(
@@ -354,8 +355,15 @@ class Provenance:
                     f"instrument{'' if total == 1 else 's'}. An estimated "
                     f"spread is EDGE on that instrument's own open, high, low "
                     f"and close, kept only where it stands two standard errors "
-                    f"clear of zero and above half a tick; the rest keep the "
-                    f"declared constant.")
+                    f"clear of zero and above half a tick.")
+            if bounded:
+                out.append(
+                    f"{bounded} of those {'is' if bounded == 1 else 'are'} an "
+                    f"upper bound rather than a reading: the sample could not "
+                    f"distinguish the spread from zero, so what is charged is "
+                    f"the most it could be, which is per instrument and errs "
+                    f"towards overstating cost. Those are not measurements "
+                    f"and are not counted as evidence above.")
             else:
                 out.append(
                     f"Half-spread: every one of the {total} is the declared "

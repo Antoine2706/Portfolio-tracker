@@ -20,7 +20,7 @@ import numpy as np
 import pytest
 
 from portfolio.core.spread import (MINIMUM_BARS, SpreadEstimate, TickSize,
-                                   edge, infer_tick_size)
+                                   edge, infer_tick_size, sweep_windows)
 from portfolio.eval.spread_controls import simulate_bars
 
 
@@ -371,3 +371,101 @@ class TestTheFiniteTradeBias:
         """A cost model that overstates cost declines trades it could have
         afforded. One that understates it takes trades it could not."""
         assert self._bias(100.0, ticks=30) > 0
+
+
+class TestChoosingTheWindow:
+    """The window is a choice, and it is not the covariance window's choice.
+
+    A covariance window must be short because correlations move with regime.
+    A spread moves slowly and has nothing to do with when the holding was
+    bought, so the whole available history is the right starting point --
+    which matters because the noise floor thins only as the fourth root of
+    the sample, and on one year of bars almost nothing in a European ETF book
+    resolves at all.
+    """
+
+    def test_a_stable_spread_takes_the_whole_history(self):
+        sweep = sweep_windows(*bars(30.0, n=1200, seed=5))
+        assert sweep.drifted_at is None
+        assert sweep.chosen_bars == 1200
+        assert "nothing is gained by throwing history away" in sweep.reason
+
+    def test_the_longer_window_is_the_tighter_estimate(self):
+        """The entire reason for the change: more bars, smaller error bar,
+        and therefore more instruments that resolve at all."""
+        sweep = sweep_windows(*bars(30.0, n=1200, seed=5))
+        short = next(r for r in sweep.rungs if r.bars == 250)
+        assert (sweep.chosen.half_spread_error_bps
+                < 0.6 * short.estimate.half_spread_error_bps)
+
+    def test_a_spread_that_halved_is_not_averaged_across(self):
+        """A ten-year window on a fund whose spread has halved is an average
+        of a market that no longer exists."""
+        old = simulate_bars(0.012, bars=700, seed=6)
+        new = simulate_bars(0.004, bars=500, seed=7)
+        o, h, l, c = (np.concatenate([a, b]) for a, b in zip(old, new))
+        sweep = sweep_windows(o, h, l, c)
+        assert sweep.drifted_at is not None
+        assert sweep.chosen_bars < 1200
+        assert "a market that is gone" in sweep.reason
+        # And it took the recent regime, not the old one.
+        assert abs(sweep.chosen.half_spread_bps - 20.0) < 15.0
+
+    def test_the_drift_test_uses_disjoint_blocks(self):
+        """Nested windows share their data, so the difference of two nested
+        estimates has a variance smaller than the sum of theirs. Comparing
+        them as if independent would call drift on stable instruments."""
+        sweep = sweep_windows(*bars(30.0, n=1200, seed=5))
+        assert len(sweep.blocks) > 1
+        # Every block after the first starts where the previous window ended.
+        assert [b.ends_bars_ago for b in sweep.blocks] == [0, 250, 500, 1000]
+        assert sum(b.bars for b in sweep.blocks) == 1200
+
+    def test_a_short_series_still_produces_one_rung(self):
+        sweep = sweep_windows(*bars(30.0, n=300, seed=9))
+        assert sweep.chosen_bars == 300 and sweep.chosen.spread is not None
+
+    def test_the_sequence_does_not_drift_when_the_truth_is_constant(self):
+        """The free diagnostic. An estimator that trended with window length
+        on a constant spread would be a bug, and this is where it would show.
+        """
+        sweep = sweep_windows(*bars(30.0, n=2000, seed=11))
+        got = [r.estimate.half_spread_bps for r in sweep.rungs]
+        assert max(got) - min(got) < 4.0, got
+
+
+class TestAnAdjustedSeriesIsDetected:
+    """The tick grid is the check on whether the right series arrived.
+
+    yfinance returns adjusted closes by default, and adjustment multiplies
+    every historical price by a factor that is not a multiple of the tick. On
+    an adjusted series the grid is destroyed. The accumulating ETFs pay no
+    distribution so adjustment is a no-op for them and the grid survives;
+    FR0000121972 pays a dividend every year, so its adjusted history is off
+    grid at every point before the most recent ex-date.
+    """
+
+    def test_an_adjusted_series_does_not_silently_produce_a_tick(self):
+        o, h, l, c = simulate_bars(0.004, bars=500, seed=3, tick_size=0.01)
+        raw = np.concatenate([o, h, l, c])
+        assert infer_tick_size(raw).usable
+        # One dividend adjustment factor applied to the whole series.
+        assert not infer_tick_size(raw * 0.98317).usable
+
+    def test_a_dividend_adjusted_tail_is_caught_too(self):
+        """The realistic shape: everything before the last ex-date is scaled
+        and everything after it is not."""
+        o, h, l, c = simulate_bars(0.004, bars=500, seed=3, tick_size=0.01)
+        raw = np.concatenate([o, h, l, c]).reshape(4, -1)
+        raw[:, :400] *= 0.98317
+        assert not infer_tick_size(raw.ravel()).usable
+
+    def test_the_recent_tail_of_a_split_series_still_reads(self):
+        """A split divides older prices by the ratio and takes them off grid,
+        which is why the inference is given recent bars rather than all of
+        them. The recent tail is post-split and reads cleanly."""
+        o, h, l, c = simulate_bars(0.004, bars=800, seed=3, tick_size=0.01)
+        frame = np.stack([o, h, l, c])
+        frame[:, :500] /= 3.0                       # a 3:1 split, 300 bars ago
+        assert not infer_tick_size(frame.ravel()).usable
+        assert infer_tick_size(frame[:, -250:].ravel()).usable

@@ -200,7 +200,8 @@ import math
 import numpy as np
 
 __all__ = ["SpreadEstimate", "edge", "MINIMUM_BARS", "TickSize",
-           "infer_tick_size", "CANDIDATE_TICKS"]
+           "infer_tick_size", "CANDIDATE_TICKS", "WindowRung", "WindowSweep",
+           "sweep_windows", "WINDOWS", "DRIFT_SIGMA"]
 
 
 # Below this many usable bars the estimator returns a refusal rather than a
@@ -607,3 +608,203 @@ def infer_tick_size(prices: np.ndarray, *,
     size, agreement = best
     return TickSize(size if agreement >= 0.98 else None, agreement,
                     int(clean.size))
+
+
+# --------------------------------------------------------------------------
+# Choosing the window: bias against variance, measured rather than assumed
+# --------------------------------------------------------------------------
+
+# Nested windows, most recent first, `None` meaning everything available.
+# 250 is about a year, which is where a holding period typically lands and
+# where the noise floor is 4.7 bps; 2500 is about ten years, where it is 2.7.
+WINDOWS: tuple[int | None, ...] = (250, 500, 1000, None)
+
+# How many standard errors an older block must differ by before the spread is
+# called drifting. Three rather than two, and deliberately: with several
+# blocks compared against one reference, a two-sigma rule would call drift on
+# a stable instrument roughly one time in seven, and the cost of that error is
+# throwing away most of the history for nothing.
+DRIFT_SIGMA = 3.0
+
+
+@dataclasses.dataclass(frozen=True)
+class WindowRung:
+    """One window's estimate, and where in the series it came from."""
+    bars: int
+    label: str
+    estimate: SpreadEstimate
+    ends_bars_ago: int = 0               # 0 for a window ending at the last bar
+
+    def line(self) -> str:
+        e = self.estimate
+        if e.spread is None:
+            return f"  {self.label:>12}  {'-':>8}  {e.refusal}"
+        error = e.half_spread_error_bps or 0.0
+        return (f"  {self.label:>12}  {e.half_spread_bps:7.2f}  "
+                f"+/- {error:5.2f}   t = {e.t_statistic:+6.2f}")
+
+
+@dataclasses.dataclass(frozen=True)
+class WindowSweep:
+    """The same instrument measured over several windows, and which was taken.
+
+    The window is a choice and it is not the same choice as the covariance
+    window. A covariance window should be short because correlations move with
+    regime and a stale one models a portfolio nobody holds. A spread is a
+    microstructure property of the instrument and its market makers, it moves
+    slowly, and it has nothing to do with when the holding was bought -- so the
+    whole available history is the right starting point, and the only reason
+    not to take it is that spreads narrow as a fund grows, which makes a long
+    window an average of a market that no longer exists.
+
+    That is a bias-variance trade with a measurable answer rather than a
+    matter of taste, so it is measured: estimate over each nested window and
+    print the sequence. Flat within its error bars means take everything. A
+    trend means the spread is drifting and the long window is measuring
+    history, so take the longest window that is still stable and say which.
+
+    The sequence is a free diagnostic besides. An estimator that drifted
+    monotonically with window length on an instrument whose spread was
+    constant would be a bug, and it would show up here.
+    """
+    rungs: tuple[WindowRung, ...]        # nested, shortest first
+    blocks: tuple[WindowRung, ...]       # disjoint, oldest last -- the drift test
+    chosen: SpreadEstimate
+    chosen_bars: int
+    reason: str
+    drifted_at: int | None = None        # bars of the window that first drifted
+
+    @property
+    def available_bars(self) -> int:
+        return max((r.bars for r in self.rungs), default=0)
+
+    def lines(self) -> list[str]:
+        out = ["      window   half-spread          significance"]
+        out.extend(r.line() for r in self.rungs)
+        if len(self.blocks) > 1:
+            out.append("  drift test, on disjoint blocks against the most "
+                       "recent one:")
+            for block in self.blocks[1:]:
+                out.append(f"    {block.label:>18}  {_drift_line(self.blocks[0], block)}")
+        out.append(f"  taken: {self.reason}")
+        return out
+
+
+def _drift_line(reference: WindowRung, block: WindowRung) -> str:
+    z = _drift_z(reference.estimate, block.estimate)
+    if z is None:
+        return "not estimable, so it cannot argue either way"
+    direction = "wider" if z > 0 else "tighter"
+    verdict = "DRIFT" if abs(z) > DRIFT_SIGMA else "consistent"
+    return f"{z:+5.1f} sigma {direction:>7}   {verdict}"
+
+
+def _drift_z(reference: SpreadEstimate, other: SpreadEstimate) -> float | None:
+    """How many standard errors apart two disjoint windows' estimates are.
+
+    On ``s^2``, not on ``s``, for the reason `SpreadEstimate.t_statistic`
+    gives: the square is the quantity with the symmetric sampling
+    distribution, and its standard error is the one that was validated.
+
+    The two windows must be **disjoint** for this to be the right arithmetic.
+    Nested windows share their data, so the difference of two nested estimates
+    has a variance smaller than the sum of theirs and comparing them this way
+    would call drift far too readily.
+    """
+    if (reference.signed_square is None or other.signed_square is None
+            or not reference.square_standard_error
+            or not other.square_standard_error):
+        return None
+    spread = math.hypot(reference.square_standard_error,
+                        other.square_standard_error)
+    return float((other.signed_square - reference.signed_square) / spread)
+
+
+def sweep_windows(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
+                  close: np.ndarray, *, windows: tuple[int | None, ...] = WINDOWS,
+                  minimum_bars: int = MINIMUM_BARS,
+                  drift_sigma: float = DRIFT_SIGMA) -> WindowSweep:
+    """Estimate over nested windows and take the longest one that is stable.
+
+    >>> from portfolio.eval.spread_controls import simulate_bars
+    >>> o, h, l, c = simulate_bars(0.004, bars=1200, seed=5)
+    >>> sweep = sweep_windows(o, h, l, c)
+    >>> sweep.chosen_bars                     # nothing drifts, so take it all
+    1200
+    >>> sweep.drifted_at is None
+    True
+
+    A spread that halves partway through the history is drift, and the sweep
+    declines to average across it:
+
+    >>> import numpy as np
+    >>> old = simulate_bars(0.012, bars=700, seed=6)
+    >>> new = simulate_bars(0.004, bars=500, seed=7)
+    >>> o, h, l, c = (np.concatenate([a, b]) for a, b in zip(old, new))
+    >>> sweep = sweep_windows(o, h, l, c)
+    >>> sweep.drifted_at is not None and sweep.chosen_bars < 1200
+    True
+    """
+    n = int(np.asarray(close).size)
+    sizes = sorted({min(w or n, n) for w in windows if (w or n) >= minimum_bars})
+    sizes = [s for s in sizes if s >= minimum_bars]
+    if not sizes:
+        estimate = edge(open_, high, low, close, minimum_bars=minimum_bars)
+        return WindowSweep((), (), estimate, n,
+                           f"the only window there is, {n} bars")
+
+    def run(lo: int, hi: int) -> SpreadEstimate:
+        """`lo` and `hi` are counted back from the end; hi is exclusive-older."""
+        stop = n - lo if lo else n
+        return edge(open_[n - hi:stop], high[n - hi:stop],
+                    low[n - hi:stop], close[n - hi:stop],
+                    minimum_bars=minimum_bars)
+
+    rungs = tuple(
+        WindowRung(size, "all " + str(size) if size == n else str(size),
+                   run(0, size))
+        for size in sizes)
+
+    # Disjoint blocks: the most recent `sizes[0]` bars, then each older slab
+    # between consecutive window edges. These are what the drift test uses,
+    # because only disjoint samples make the difference's standard error the
+    # sum of theirs.
+    blocks = [WindowRung(sizes[0], f"most recent {sizes[0]}", rungs[0].estimate)]
+    for older, newer in zip(sizes[1:], sizes):
+        if older - newer >= minimum_bars:
+            blocks.append(WindowRung(
+                older - newer, f"{newer} to {older} back",
+                run(newer, older), ends_bars_ago=newer))
+    blocks_t = tuple(blocks)
+
+    reference = blocks_t[0].estimate
+    drifted_at: int | None = None
+    if reference.signed_square is None:
+        chosen_size = sizes[-1]
+        reason = (f"all {chosen_size} bars. The most recent {sizes[0]} could "
+                  f"not be estimated on their own, so the drift test could "
+                  f"not run and the longest window is taken by default")
+    else:
+        chosen_size = sizes[-1]
+        for block in blocks_t[1:]:
+            z = _drift_z(reference, block.estimate)
+            if z is not None and abs(z) > drift_sigma:
+                # The window stops at the near edge of the drifting block.
+                drifted_at = block.ends_bars_ago
+                chosen_size = block.ends_bars_ago
+                break
+        if drifted_at is None:
+            reason = (f"all {chosen_size} bars. Every older block agrees with "
+                      f"the most recent {sizes[0]} within "
+                      f"{drift_sigma:.0f} standard errors, so nothing is "
+                      f"gained by throwing history away")
+        else:
+            reason = (f"the most recent {chosen_size} bars. Older data "
+                      f"disagrees by more than {drift_sigma:.0f} standard "
+                      f"errors, so the spread has moved and a longer window "
+                      f"would be averaging a market that is gone")
+
+    chosen = next(r.estimate for r in rungs if r.bars == chosen_size)
+    return WindowSweep(rungs=rungs, blocks=blocks_t, chosen=chosen,
+                       chosen_bars=chosen_size, reason=reason,
+                       drifted_at=drifted_at)

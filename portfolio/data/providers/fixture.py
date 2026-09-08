@@ -172,7 +172,8 @@ class FixtureProvider(MarketDataProvider):
         """
         return 4.0 + (_seed(symbol, 11) % 4100) / 100.0
 
-    def bars(self, symbol: str, start: dt.date | None = None) -> pd.DataFrame:
+    def bars(self, symbol: str, start: dt.date | None = None, *,
+             period: str = "2y") -> pd.DataFrame:
         """OHLC built around the close path, with a per-symbol spread imposed.
 
         The bar generator is written here rather than borrowed from
@@ -195,6 +196,11 @@ class FixtureProvider(MarketDataProvider):
         imposed 18 bps and the estimator, correctly, reported 29. A bridge is
         pinned at both ends and has no such jump.
         """
+        # `period` is accepted and ignored: the fixture generates one fixed
+        # series per symbol, so "max" and "2y" are the same thing here. It is
+        # in the signature because the interface has it and a fixture that
+        # rejected an argument the real provider accepts would fail a test
+        # the real provider passes.
         closes = self._series(symbol)
         rng = np.random.default_rng(_seed(symbol, self.seed + 977))
         spread = 2.0 * self.fixture_half_spread_bps(symbol) / 10_000.0
