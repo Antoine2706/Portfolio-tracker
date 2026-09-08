@@ -532,8 +532,16 @@ def survey_spreads(book: Book, *, mode: str = "user",
                         prices["low"].to_numpy(), prices["close"].to_numpy())
         tick = infer_tick_size(prices.to_numpy().ravel())
         price = float(frame["close"].iloc[-1])
+        # An already-recorded observed spread wins, and the estimate is
+        # reported beside it rather than discarded: two independent readings
+        # of the same quantity are worth comparing, and `--write` must never
+        # replace something somebody watched with something inferred.
+        watched = (float(inst.half_spread_bps)
+                   if getattr(inst, "spread_observed", False)
+                   and inst.half_spread_bps is not None else None)
         decision = decide_spread(estimate, price=price, tick=tick,
-                                 fallback_bps=fallback_bps)
+                                 fallback_bps=fallback_bps,
+                                 observed_bps=watched)
         decisions[isin] = decision
         if decision.is_evidence:
             spreads[isin] = decision.half_spread_bps

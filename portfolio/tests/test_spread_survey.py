@@ -356,3 +356,48 @@ class TestEndToEnd:
         check = ranking_is_plausible(spreads, liquidity)
         assert check.passed
         assert check.rho is not None and check.rho < -0.4, check.rho
+
+
+class TestAnObservedSpreadOutranksAnEstimatedOne:
+    """A quote screen beats an inference from daily bars.
+
+    The gap this closes: `--write` computes an estimate for every instrument,
+    and without this it would overwrite a half-spread somebody had watched
+    and recorded by hand with one this code inferred. The tier ordering is
+    the whole point of having tiers, and it has to bind in the direction that
+    costs something.
+    """
+
+    def _estimate(self, half_bps: float, *, certain: bool = True):
+        s = 2.0 * half_bps / 10_000.0
+        return SpreadEstimate(s, s * s, s / 20.0, 500, 499,
+                              square_standard_error=(s * s) / (5.0 if certain
+                                                               else 0.5))
+
+    def test_the_observed_value_is_what_is_charged(self):
+        d = decide_spread(self._estimate(45.0), price=50.0, observed_bps=6.0)
+        assert d.source == "observed"
+        assert d.half_spread_bps == pytest.approx(6.0)
+
+    def test_it_wins_even_against_a_confidently_resolved_estimate(self):
+        """Not "whichever is better supported". The tiers are an ordering of
+        kinds of evidence, not a contest between error bars."""
+        confident = self._estimate(45.0, certain=True)
+        assert confident.resolved()
+        d = decide_spread(confident, price=50.0, observed_bps=6.0)
+        assert d.half_spread_bps == pytest.approx(6.0)
+
+    def test_a_large_disagreement_is_printed_rather_than_swallowed(self):
+        """Two independent readings a factor apart is a finding about one of
+        them, and the reader is the one who can tell which."""
+        d = decide_spread(self._estimate(45.0), price=50.0, observed_bps=6.0)
+        assert "7.5x apart" in d.reason and "which is stale" in d.reason
+
+    def test_agreement_is_also_said(self):
+        d = decide_spread(self._estimate(7.0), price=50.0, observed_bps=6.0)
+        assert "agrees" in d.reason
+
+    def test_it_still_wins_when_there_is_no_estimate_at_all(self):
+        nothing = SpreadEstimate(None, None, None, 20, 19, refusal="too short")
+        d = decide_spread(nothing, price=50.0, observed_bps=6.0)
+        assert d.source == "observed" and d.half_spread_bps == 6.0

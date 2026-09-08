@@ -101,12 +101,31 @@ class SpreadDecision:
 def decide_spread(estimate: SpreadEstimate, *, price: float,
                   tick: TickSize | None = None,
                   fallback_bps: float = 8.0,
-                  significance: float = SIGNIFICANCE) -> SpreadDecision:
+                  significance: float = SIGNIFICANCE,
+                  observed_bps: float | None = None) -> SpreadDecision:
     """Turn an estimate into a charge, or decline to.
 
     `fallback_bps` is the declared constant, used whenever the estimate does
     not clear every gate. `price` is a recent price for the instrument, needed
     only to express the tick as a fraction.
+
+    `observed_bps` is a half-spread somebody watched and recorded. It wins
+    outright -- a quote screen beats an inference from daily bars, and this
+    file exists to rank evidence, not to prefer its own arithmetic. The
+    estimate is still computed and still reported beside it, because two
+    independent readings of the same quantity disagreeing by a factor is a
+    finding about one of them:
+
+    >>> from portfolio.core.spread import SpreadEstimate
+    >>> wide = SpreadEstimate(0.0090, 8.1e-5, 0.0006, 500, 499,
+    ...                       square_standard_error=1.1e-5)
+    >>> d = decide_spread(wide, price=50.0, observed_bps=6.0)
+    >>> d.source, d.half_spread_bps
+    ('observed', 6.0)
+    >>> print(d.reason)
+    recorded from a quote, which outranks an inference from daily bars
+    (EDGE on the same instrument's bars says 45.0 bps, 7.5x apart -- worth
+    checking which is stale)
 
     A refusal from the estimator itself passes straight through:
 
@@ -138,6 +157,22 @@ def decide_spread(estimate: SpreadEstimate, *, price: float,
     4.0 bps is 0.7 standard errors from zero, under 2.0; not distinguishable
     from no spread at all, which the estimator's own noise floor also is
     """
+    if observed_bps is not None:
+        note = ("recorded from a quote, which outranks an inference from "
+                "daily bars")
+        if estimate.spread is not None and observed_bps > 0:
+            ratio = estimate.half_spread_bps / observed_bps
+            if ratio > 2.0 or ratio < 0.5:
+                note += (f"\n(EDGE on the same instrument's bars says "
+                         f"{estimate.half_spread_bps:.1f} bps, "
+                         f"{max(ratio, 1 / ratio):.1f}x apart -- worth\n"
+                         f"checking which is stale)")
+            else:
+                note += (f"\n(EDGE on the same instrument's bars says "
+                         f"{estimate.half_spread_bps:.1f} bps, which agrees)")
+        return SpreadDecision(float(observed_bps), OBSERVED, note,
+                              estimate=estimate, tick=tick)
+
     if estimate.spread is None:
         return SpreadDecision(fallback_bps, ASSUMED,
                               f"no estimate: {estimate.refusal}",
