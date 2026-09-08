@@ -71,6 +71,11 @@ INSTRUMENT_COLUMNS = ["isin", "name", "short_name", "issuer", "asset_class",
                       # so a CSV written by an older build still loads
                       "broker", "tradeable", "tob_rate", "tob_observed",
                       "half_spread_bps", "spread_observed", "buy_tax_rate",
+                      # the venue the trade executes on, the commission the
+                      # broker actually charged, and which of the three
+                      # evidence tiers the spread came from
+                      "venue", "commission", "commission_observed",
+                      "spread_source",
                       # whether NEW money may go in, which is not the same
                       # question as whether the weight can be rebalanced
                       "buyable"]
@@ -188,7 +193,11 @@ class DataStore:
                     tob_observed=_bool(row.get("tob_observed")),
                     half_spread_bps=_opt_float(row.get("half_spread_bps")),
                     spread_observed=_bool(row.get("spread_observed")),
+                    spread_source=row.get("spread_source", "") or "",
                     buy_tax_rate=float(row.get("buy_tax_rate") or 0.0),
+                    venue=row.get("venue", "") or "",
+                    commission=_opt_float(row.get("commission")),
+                    commission_observed=_bool(row.get("commission_observed")),
                 )
                 out[inst.isin] = inst
         if out:
@@ -256,7 +265,13 @@ class DataStore:
                     "half_spread_bps": ("" if inst.half_spread_bps is None
                                         else inst.half_spread_bps),
                     "spread_observed": "true" if inst.spread_observed else "false",
+                    "spread_source": inst.spread_source,
                     "buy_tax_rate": inst.buy_tax_rate,
+                    "venue": inst.venue,
+                    "commission": ("" if inst.commission is None
+                                   else inst.commission),
+                    "commission_observed": ("true" if inst.commission_observed
+                                            else "false"),
                 })
 
     # -- ledger ------------------------------------------------------------

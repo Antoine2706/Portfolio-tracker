@@ -341,6 +341,12 @@ def _instruments(args: argparse.Namespace) -> int:
             print("--spread-observed needs --half-spread-bps: a spread cannot "
                   "be observed without a value.", file=sys.stderr)
             return 2
+    if args.commission_observed and args.commission is None:
+        if any(instruments[i].commission is None for i in targets):
+            print("--commission-observed needs --commission: a charge cannot "
+                  "be read off a confirmation without a figure.",
+                  file=sys.stderr)
+            return 2
 
     changes: list[str] = []
     for isin in targets:
@@ -350,6 +356,8 @@ def _instruments(args: argparse.Namespace) -> int:
                              ("tob_rate", args.tob_rate),
                              ("half_spread_bps", args.half_spread_bps),
                              ("buy_tax_rate", args.buy_tax_rate),
+                             ("venue", args.venue),
+                             ("commission", args.commission),
                              ("short_name", args.short_name),
                              ("note", args.note)):
             if value is None:
@@ -363,8 +371,12 @@ def _instruments(args: argparse.Namespace) -> int:
         # a new rate without saying where it came from resets the claim.
         for flag, field, value in (("observed", "tob_observed", args.observed),
                                    ("spread_observed", "spread_observed",
-                                    args.spread_observed)):
-            source = args.tob_rate if field == "tob_observed" else args.half_spread_bps
+                                    args.spread_observed),
+                                   ("commission_observed", "commission_observed",
+                                    args.commission_observed)):
+            source = {"tob_observed": args.tob_rate,
+                      "spread_observed": args.half_spread_bps,
+                      "commission_observed": args.commission}[field]
             if value is None and source is None:
                 continue
             new = bool(value) if value is not None else False
@@ -521,6 +533,22 @@ def build_parser() -> argparse.ArgumentParser:
                         action="store_false", default=None)
     setter.add_argument("--buy-tax-rate", type=_rate, default=None,
                         help="one-sided taxes, e.g. the French FTT")
+    setter.add_argument("--venue", default=None,
+                        help="MIC the trade executes on, off the confirmation. "
+                             "Not the primary listing used to fetch prices: "
+                             "the same holding traded XETA in February and "
+                             "JPEU in June. It is the key for tick size")
+    setter.add_argument("--commission", type=float, default=None,
+                        help="what the broker actually charged, per order. "
+                             "Per instrument because the same broker charges "
+                             "differently by type: MeDirect takes nothing on "
+                             "an ETF and 7.00 EUR on a share")
+    charged = setter.add_mutually_exclusive_group()
+    charged.add_argument("--commission-observed", dest="commission_observed",
+                         action="store_true", default=None,
+                         help="read off a confirmation")
+    charged.add_argument("--commission-assumed", dest="commission_observed",
+                         action="store_false", default=None)
     setter.add_argument("--short-name", default=None,
                         help="the label used on charts and in dense tables")
     setter.add_argument("--note", default=None)

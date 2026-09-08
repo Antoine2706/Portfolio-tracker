@@ -116,13 +116,17 @@ class TestRecordingTheAccountsFacts:
                    "--not-tradeable") == 0
         after = book(root)
         for isin in (BANKS, PROPERTY):
-            assert after[isin].tob_rate == pytest.approx(0.0012)
+            expected = 0.0132 if isin == PROPERTY else 0.0012
+            assert after[isin].tob_rate == pytest.approx(expected)
             assert after[isin].broker == "MeDirect" and after[isin].tradeable
         assert after[SCHNEIDER].tob_rate == pytest.approx(0.0035)
         assert after[SCHNEIDER].buy_tax_rate == pytest.approx(0.004)
         assert after[GOLD].tob_rate is None
         assert after[GOLD].broker == "Keytrade" and not after[GOLD].tradeable
-        assert {i for i, v in after.items() if v.tob_observed} == {BANKS}
+        # Six contract notes now, not one. Only the gold ETC is unread, and
+        # it is the only holding still refused.
+        assert {i for i, v in after.items() if v.tob_observed} == set(after) - {GOLD}
+        assert {i for i, v in after.items() if v.tob_rate is None} == {GOLD}
 
     def test_an_edit_is_marked_as_a_manual_override(self, root):
         """So a later automatic re-resolution cannot quietly revert it."""
@@ -166,8 +170,8 @@ class TestListing:
     def test_it_shows_what_is_evidence_and_what_is_not(self, root, capsys):
         assert run(root, "list") == 0
         out = capsys.readouterr().out
-        assert "0.1200% observed" in out          # the contract-note rate
-        assert "0.1200% assumed" in out           # derived from the asset class
+        assert "0.1200% observed" in out          # four contract notes at this band
+        assert "1.3200% observed" in out          # and the one eleven times it
         assert "NOT RECORDED" in out              # the ETC
         assert "8.0 bps fallback" in out          # no quotes have been read
 

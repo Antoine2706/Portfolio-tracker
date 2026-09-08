@@ -33,25 +33,33 @@ failure the column was added to prevent. Triggering on the header instead
 makes the migration one-shot by construction: after it writes, the columns
 exist, and it never looks at that file again.
 
-What it fills is only what can be derived from the instrument record itself:
+What it fills is what a document says, and the list is short on purpose:
 
-    tob_rate       from the asset class. A UCITS fund and a debt security do
-                   not sit in the same band, so an ETC gets None and stays
-                   unpriceable -- correctly, because nobody has read its
-                   contract note.
-    buy_tax_rate   the French FTT, for French-domiciled shares.
-    tob_observed   False, except for instruments whose contract note is
-                   reproduced in this repository (see OBSERVED_CONTRACT_NOTES).
+    tob_rate       from a contract note, per ISIN, or not at all. See
+                   OBSERVED_CONTRACT_NOTES.
+    tob_observed   True where a note exists, absent where none does.
+    buy_tax_rate   the French FTT, for French-domiciled shares -- the one
+                   thing still derived, because it follows from domicile and
+                   asset class rather than from a registration nobody can see.
+
+It used to derive `tob_rate` from the asset class as well, on the reasoning
+that a UCITS fund and a debt security do not sit in the same band. That was
+true and insufficient. IE00BGDQ0L74 is an accumulating iShares UCITS ETF at
+the same broker, in the same week, as four others that paid 0.1200%; its
+corrected note says 1.3198%. The band turns on per-compartment Belgian
+registration, which is on no field of the row. The table went, and an unread
+rate is refused rather than guessed.
 
 It does **not** invent a broker, because which institution holds a position
 is not a property of the instrument and cannot be derived from anything on
-the row. It does not invent a spread either: `cost_table` already falls back
-to a conservative estimate and reports it as one.
+the row. It does not invent a spread either: that is now estimated per
+instrument from its own price history and reported as a third tier of
+evidence, neither observed nor assumed.
 
-Everything it writes is marked as an assumption and named in the notice it
-prints, and `CostModel.provenance()` keeps reporting the observed-against-
-assumed split underneath every result afterwards. A derived number that
-presents itself as a measurement would be worse than the crash it replaces.
+Everything it writes names the document it came from, and
+`CostModel.provenance()` keeps reporting the observed-against-estimated split
+underneath every result afterwards. A derived number that presents itself as
+a measurement would be worse than the crash it replaces.
 """
 
 from __future__ import annotations
@@ -61,8 +69,7 @@ import dataclasses
 import pathlib
 
 from ..core.models import AssetClass, Instrument
-from ..core.taxes import (BELGIAN_TOB_BANDS, FRENCH_FTT_RATE,
-                          OBSERVED_TOB_RATE)
+from ..core.taxes import FRENCH_FTT_RATE
 
 __all__ = ["TRADING_COLUMNS", "OBSERVED_CONTRACT_NOTES", "Backfill",
            "MigrationReport", "derived_facts", "backfill_trading_facts",
@@ -82,37 +89,63 @@ class ObservedRate:
     source: str
 
 
-# The one instrument in this project whose transaction tax was read off a
-# contract note rather than assumed. The note is reproduced in
-# `agents/execution.py` and checked to the cent by `tests/test_execution.py`,
-# so recording it as observed here is citing evidence that is in the
-# repository, not asserting a fact about someone's account.
+# Every transaction tax rate read off an actual MeDirect contract note. Each
+# reconciles to the cent against the notional on the same document, and
+# `tests/test_migrations.py` checks that arithmetic rather than trusting the
+# transcription.
 #
 # Belgian TOB is a property of the instrument and the investor's regime
 # rather than of the broker, which is why this is keyed by ISIN alone.
 OBSERVED_CONTRACT_NOTES: dict[str, ObservedRate] = {
     "DE000A2QP372": ObservedRate(
-        tob_rate=OBSERVED_TOB_RATE,
-        source=("MeDirect contract note, 2 February 2026: 2.43 EUR on a "
-                "2,024.87 EUR notional, 0.120%")),
+        tob_rate=0.0012,
+        source=("MeDirect contract note, 2 February 2026, XAMS: 2.43 EUR on a "
+                "2,024.87 EUR notional, 0.1200%")),
+    "IE00BKM4GZ66": ObservedRate(
+        tob_rate=0.0012,
+        source=("MeDirect contract note, 20 February 2026, GSEI: 2.38 EUR on "
+                "a 1,985.86 EUR notional, 0.1198%")),
+    "IE00BMW42520": ObservedRate(
+        tob_rate=0.0012,
+        source=("MeDirect contract note, 20 February 2026, GSEI: 2.40 EUR on "
+                "a 2,001.89 EUR notional, 0.1199%")),
+    "IE00BMC38736": ObservedRate(
+        tob_rate=0.0012,
+        source=("MeDirect contract note, 23 February 2026, XETA: 2.35 EUR on "
+                "a 1,955.84 EUR notional, 0.1202%")),
+    "IE00BGDQ0L74": ObservedRate(
+        tob_rate=0.0132,
+        source=("MeDirect corrected contract note, 23 February 2026, XETA: "
+                "26.13 EUR on a 1,979.80 EUR notional, 1.3198% -- ELEVEN "
+                "TIMES the band four other iShares accumulating ETFs on the "
+                "same account paid on the same schedule")),
+    "FR0000121972": ObservedRate(
+        tob_rate=0.0035,
+        source=("MeDirect contract note, 2 March 2026, XPAR: 8.46 EUR on a "
+                "2,418.30 EUR notional, 0.3500%")),
 }
 
-# Which band an instrument sits in turns on whether it is a fund or a debt
-# security. That is exactly what `asset_class` records, and it is the only
-# part of the question an ISIN can answer -- distribution policy and Belgian
-# registration cannot be derived from the row, which is why every derived
-# rate below is marked assumed and has to be confirmed against a contract
-# note before it counts as evidence.
-DERIVED_TOB_BANDS: dict[AssetClass, float | None] = {
-    AssetClass.ETF: BELGIAN_TOB_BANDS["observed_medirect_etf"],
-    AssetClass.FUND: BELGIAN_TOB_BANDS["observed_medirect_etf"],
-    AssetClass.EQUITY: BELGIAN_TOB_BANDS["equity"],
-    # A commodity ETC is a collateralised debt security, not a UCITS fund. It
-    # does not take a fund's band, and no contract note for one has been read
-    # here, so it stays unpriceable rather than taking a plausible number.
-    AssetClass.ETC: None,
-    AssetClass.OTHER: None,
-}
+# There is no table here on purpose, and the empty space is the point.
+#
+# There used to be one: ETF and FUND took the fund band, EQUITY took the
+# equity band, ETC and OTHER stayed unpriced. It was reasoned from the only
+# thing an ISIN can answer -- whether the instrument is a fund or a debt
+# security -- and every rate it produced was marked assumed and flagged for
+# confirmation. It was still wrong, and not at the margin.
+#
+# IE00BGDQ0L74 is an accumulating iShares UCITS ETF at the same broker, on the
+# same schedule, in the same week as four others that paid 0.1200%. It paid
+# 1.3198%. The difference is not the share class, not the issuer, not the
+# asset class and not the venue: it is per-compartment Belgian registration,
+# which appears nowhere on the instrument's label and cannot be derived from
+# any field in the row. A table that reproduced the observed rate for four
+# instruments and was out by a factor of eleven on the fifth is not a
+# conservative default; it is a confident number about something it could not
+# see, which is the failure mode this project keeps finding.
+#
+# So an unread rate is refused, not guessed, and the migration fills in only
+# what a document says. The cost is that a new instrument is unpriceable until
+# its first contract note arrives, which is the correct cost.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,53 +162,48 @@ class Backfill:
 
 
 def derived_facts(inst: Instrument) -> list[Backfill]:
-    """What can honestly be filled in for one instrument, and why.
+    """What a document says about one instrument, and nothing else.
 
-    An ETF takes the observed fund band, marked assumed because one contract
-    note for one instrument does not establish the band for another:
+    An instrument with a contract note takes the rate off it, marked observed:
 
-    >>> etf = Instrument("IE00BGDQ0L74", "iShares European Property Yield")
-    >>> [(b.field, b.value) for b in derived_facts(etf)]
-    [('tob_rate', 0.0012), ('tob_observed', False)]
+    >>> banks = Instrument("DE000A2QP372", "iShares EURO STOXX Banks 30-15")
+    >>> [(b.field, b.value) for b in derived_facts(banks)]
+    [('tob_rate', 0.0012), ('tob_observed', True)]
 
-    A French share takes the equity band and the FTT, which is charged on
-    purchases only:
+    Including the one that falsified the table this function used to have. It
+    is an accumulating iShares UCITS ETF like the four that paid 0.1200%, and
+    it paid eleven times that:
 
-    >>> share = Instrument("FR0000121972", "Schneider Electric SE",
-    ...                    AssetClass.EQUITY)
-    >>> [(b.field, b.value) for b in derived_facts(share)]
-    [('tob_rate', 0.0035), ('tob_observed', False), ('buy_tax_rate', 0.004)]
+    >>> yield_ = Instrument("IE00BGDQ0L74", "iShares European Property Yield")
+    >>> [(b.field, b.value) for b in derived_facts(yield_)]
+    [('tob_rate', 0.0132), ('tob_observed', True)]
 
-    An ETC gets nothing, because nothing about it can be derived. It stays
-    unpriceable, which is the honest state and the one the cost model is
-    built to refuse on:
+    An instrument with no note gets no rate. It stays unpriceable, which is the
+    honest state and the one the cost model is built to refuse on -- and it is
+    now the answer for an unknown ETF as much as for an ETC, because the label
+    turned out not to predict the band:
 
     >>> etc = Instrument("IE00B579F325", "Invesco Physical Gold ETC",
     ...                  AssetClass.ETC)
     >>> derived_facts(etc)
     []
+    >>> derived_facts(Instrument("IE00B4L5Y983", "iShares Core MSCI World"))
+    []
 
-    And the one instrument with a contract note in this repository is marked
-    observed rather than assumed:
+    The French FTT is the one thing still derived, because it follows from the
+    instrument's domicile and asset class rather than from a registration
+    nobody can see:
 
-    >>> banks = Instrument("DE000A2QP372", "iShares EURO STOXX Banks 30-15")
-    >>> [(b.field, b.value) for b in derived_facts(banks)]
-    [('tob_rate', 0.0012), ('tob_observed', True)]
+    >>> share = Instrument("FR0000121972", "Schneider Electric SE",
+    ...                    AssetClass.EQUITY)
+    >>> [(b.field, b.value) for b in derived_facts(share)]
+    [('tob_rate', 0.0035), ('tob_observed', True), ('buy_tax_rate', 0.004)]
     """
     out: list[Backfill] = []
     note = OBSERVED_CONTRACT_NOTES.get(inst.isin)
     if note is not None:
         out.append(Backfill(inst.isin, "tob_rate", note.tob_rate, note.source))
         out.append(Backfill(inst.isin, "tob_observed", True, note.source))
-    else:
-        rate = DERIVED_TOB_BANDS.get(inst.asset_class)
-        if rate is not None:
-            out.append(Backfill(
-                inst.isin, "tob_rate", rate,
-                f"assumed: the {inst.asset_class.value} band, not read off a "
-                f"contract note for this instrument"))
-            out.append(Backfill(inst.isin, "tob_observed", False,
-                                "no contract note has been read for it"))
 
     # France taxes acquisitions of shares in French-headquartered companies
     # above 1bn EUR of market capitalisation. The threshold is not derivable
@@ -219,12 +247,14 @@ class MigrationReport:
                         f"{', '.join(self.columns_added)} column(s), now added.")
         out = [headline, ""]
         if self.filled:
-            out.append("Filled in, all of it assumed unless a source is named:")
+            out.append("Filled in, each from the document named:")
             out += [f"  - {b.line()}" for b in self.filled]
         if self.unresolved:
             out += ["", "Still not priceable, deliberately:"]
-            out += [f"  - {isin}: no transaction tax band can be derived from "
-                    f"its asset class. Read it off a contract note."
+            out += [f"  - {isin}: no contract note has been read for it. The "
+                    f"band cannot be derived from the asset class -- one "
+                    f"holding here pays eleven times what an identical-looking "
+                    f"one pays -- so it stays refused rather than guessed."
                     for isin in self.unresolved]
         if self.brokers_missing:
             out += ["", "No broker recorded (which institution holds a position "

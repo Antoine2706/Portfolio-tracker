@@ -293,6 +293,65 @@ class TestCostTable:
         assert not cost_table(book)[BANKS].spread_observed
 
 
+class TestAnObservedCommissionBeatsTheSchedule:
+    """The same broker charges differently by instrument type.
+
+    MeDirect took 0.00 on five ETF confirmations and 7.00 EUR flat on a share
+    confirmation, on the same account within a month. A schedule keyed on the
+    broker alone is wrong for one of those whichever way it is written, so a
+    figure read off a confirmation overrides it.
+    """
+
+    def _model(self, **kw):
+        return CostModel(account_value=15_000.0, per_instrument={
+            "ETF": InstrumentCost(name="An ETF", broker="MeDirect",
+                                  tob_rate=0.0012, half_spread_bps=0.0),
+            "SHARE": InstrumentCost(name="A share", broker="MeDirect",
+                                    tob_rate=0.0035, half_spread_bps=0.0, **kw),
+        }, slippage_bps=0.0)
+
+    def test_the_schedule_applies_when_nothing_was_read(self):
+        model = self._model()
+        parts = model.cost_breakdown("SHARE", 2_418.30, "buy")
+        assert parts["commission"] == pytest.approx(
+            model.broker_for("SHARE").commission(2_418.30))
+
+    def test_and_the_confirmation_wins_when_one_was(self):
+        """7.00 EUR on the Schneider purchase of 2 March 2026."""
+        model = self._model(commission=7.00, commission_observed=True)
+        parts = model.cost_breakdown("SHARE", 2_418.30, "buy")
+        assert parts["commission"] == pytest.approx(7.00)
+
+    def test_zero_is_a_figure_and_not_a_missing_one(self):
+        """The five ETF confirmations charged nothing, which is an observation.
+        Treating 0.0 as "unset" would silently re-apply the schedule."""
+        model = CostModel(account_value=15_000.0, per_instrument={
+            "ETF": InstrumentCost(name="An ETF", broker="Keytrade",
+                                  tob_rate=0.0012, half_spread_bps=0.0,
+                                  commission=0.0, commission_observed=True)},
+            slippage_bps=0.0)
+        assert model.broker_for("ETF").commission(200.0) > 0, (
+            "the fixture no longer has a broker that would charge, so this "
+            "test cannot tell an override from an absence")
+        assert model.cost_breakdown("ETF", 200.0, "buy")["commission"] == 0.0
+
+    def test_the_two_confirmations_reconcile(self):
+        """Schneider, 2 March 2026: 2,418.30 notional, 7.00 commission,
+        8.46 TOB at 0.3500%, 9.67 French FTT at 0.4000%."""
+        model = CostModel(account_value=15_000.0, per_instrument={
+            "FR0000121972": InstrumentCost(
+                name="Schneider Electric SE", broker="MeDirect",
+                tob_rate=0.0035, tob_observed=True, buy_tax_rate=0.004,
+                commission=7.00, commission_observed=True,
+                half_spread_bps=0.0)}, slippage_bps=0.0)
+        parts = model.cost_breakdown("FR0000121972", 2_418.30, "buy")
+        assert parts["commission"] == pytest.approx(7.00)
+        assert parts["tax"] == pytest.approx(8.46 + 9.67, abs=0.01)
+        # And the sell side does not pay the FTT, which is an acquisition tax.
+        assert model.cost_breakdown("FR0000121972", 2_418.30, "sell")["tax"] \
+            == pytest.approx(8.46, abs=0.01)
+
+
 class TestCostsScale:
     def test_cost_is_proportional_where_the_fee_is(self):
         model = CostModel(per_instrument={BANKS: InstrumentCost()})

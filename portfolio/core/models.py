@@ -303,8 +303,29 @@ class Instrument:
     tob_rate: float | None = None            # transaction tax, each way
     tob_observed: bool = False               # read off a contract note?
     half_spread_bps: float | None = None     # paid inside the execution price
-    spread_observed: bool = False            # from quotes, or estimated?
+    spread_observed: bool = False            # DEPRECATED: see spread_source
+    # Three tiers, not two. "observed" is read off a document; "estimated" is
+    # computed from this instrument's own price history; "assumed" is a
+    # constant somebody typed. The distinction between the last two is the
+    # whole point: a spread estimated from an instrument's own prices varies
+    # across holdings the way the real cost does, and a constant identical
+    # across all of them cancels out of every comparison the allocator makes.
+    # A number that cannot influence any decision is not a conservative
+    # estimate, it is a decorative one.
+    spread_source: str = ""                  # "" = not set; observed/estimated/assumed
     buy_tax_rate: float = 0.0                # one-sided taxes, e.g. the French FTT
+    # The commission the broker actually charged, read off a confirmation.
+    # Per instrument rather than per broker because the same broker charges
+    # differently by instrument type: MeDirect charges nothing on five ETFs
+    # and 7.00 EUR flat on a share, on the same account in the same month.
+    commission: float | None = None          # None = use the broker schedule
+    commission_observed: bool = False
+    # The MIC the trade actually executes on, off the confirmation. Not the
+    # same as `exchange`, which is the primary listing used to fetch prices:
+    # DE000A2QP372 is fetched from Amsterdam and IE00BMC38736 executed on
+    # XETA in February and JPEU in June. It is the right key for tick size,
+    # which is what a spread floor is computed from.
+    venue: str = ""                          # MIC, from the confirmation
 
     primary_symbol: str = ""
     exchange: str = ""                       # MIC of the primary listing

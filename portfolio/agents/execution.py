@@ -222,6 +222,15 @@ class InstrumentCost:
     half_spread_bps: float = 8.0
     spread_observed: bool = False
     buy_tax_rate: float = 0.0            # the French FTT, where it applies
+    # What the broker actually charged, read off a confirmation. Overrides the
+    # broker's published schedule when set, because the schedule is a rule and
+    # this is what happened: MeDirect's ETF commission is zero on five
+    # confirmations and 7.00 EUR flat on a share, at the same broker in the
+    # same month. A schedule keyed on the broker alone gets one of those wrong
+    # whichever way it is written.
+    commission: float | None = None      # None = use the broker schedule
+    commission_observed: bool = False
+    venue: str = ""                      # MIC off the confirmation
     needs_fx: bool = False
     name: str = ""
     asset_class: str = ""
@@ -469,7 +478,9 @@ class CostModel:
         if side == "buy":
             tax += value * facts.buy_tax_rate
         return {
-            "commission": float(self.broker_for(isin).commission(value)),
+            "commission": (float(facts.commission)
+                           if facts.commission is not None
+                           else float(self.broker_for(isin).commission(value))),
             "tax": float(tax),
             "spread": float(value * facts.half_spread_bps / 10_000.0),
             "slippage": float(value * self.slippage_bps / 10_000.0),
@@ -677,6 +688,11 @@ def cost_table(instruments) -> dict:
             spread_observed=bool(inst.spread_observed
                                  and inst.half_spread_bps is not None),
             buy_tax_rate=float(inst.buy_tax_rate),
+            commission=(None if inst.commission is None
+                        else float(inst.commission)),
+            commission_observed=bool(inst.commission_observed
+                                     and inst.commission is not None),
+            venue=inst.venue,
             name=inst.display_name,
             asset_class=inst.asset_class.value,
         )

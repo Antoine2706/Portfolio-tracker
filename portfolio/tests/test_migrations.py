@@ -123,10 +123,21 @@ class TestWhatItFillsIn:
     def book(self, tmp_path):
         return store_with(tmp_path, OLD_SCHEMA).load_instruments()
 
-    def test_funds_take_the_fund_band(self, book):
-        for isin in (PROPERTY, SEMIS):
-            assert book[isin].tob_rate == pytest.approx(0.0012)
-            assert not book[isin].tob_observed
+    def test_a_fund_takes_the_rate_off_its_own_contract_note(self, book):
+        """Not off another instrument's. SEMIS paid 0.1202% and PROPERTY paid
+        1.3198% on the same schedule in the same week, both accumulating
+        iShares UCITS ETFs, so nothing about one predicts the other."""
+        assert book[SEMIS].tob_rate == pytest.approx(0.0012)
+        assert book[PROPERTY].tob_rate == pytest.approx(0.0132)
+        assert book[SEMIS].tob_observed and book[PROPERTY].tob_observed
+
+    def test_a_fund_with_no_note_gets_no_rate(self, tmp_path):
+        """The table that used to fill this in was out by a factor of eleven
+        on a real holding. Unpriceable is now the answer for an unknown ETF as
+        much as for an ETC."""
+        from portfolio.core.models import Instrument
+        unknown = Instrument("IE00B4L5Y983", "iShares Core MSCI World")
+        assert [b for b in derived_facts(unknown) if b.field == "tob_rate"] == []
 
     def test_the_share_takes_the_equity_band_and_the_french_tax(self, book):
         assert book[SCHNEIDER].tob_rate == pytest.approx(0.0035)
@@ -138,10 +149,30 @@ class TestWhatItFillsIn:
         assert book[GOLD].tob_rate is None
         assert not book[GOLD].tob_observed
 
-    def test_only_the_instrument_with_a_contract_note_is_marked_observed(self, book):
+    def test_every_rate_in_the_book_is_now_off_a_document(self, book):
+        """Six of seven. The seventh is the gold ETC, whose broker's site is
+        unreachable, and it stays refused rather than guessed."""
         observed = {i for i, inst in book.items() if inst.tob_observed}
-        assert observed == {BANKS}
-        assert set(OBSERVED_CONTRACT_NOTES) == {BANKS}
+        unpriced = {i for i, inst in book.items() if inst.tob_rate is None}
+        assert observed == set(book) - {GOLD}
+        assert unpriced == {GOLD}
+
+    def test_and_each_one_reconciles_against_its_own_notional(self):
+        """The transcription is checked, not trusted. Each note gives a tax
+        amount and a notional; the rate recorded here has to be the quotient,
+        to the precision the confirmation prints."""
+        charged = {
+            BANKS: (2.43, 2_024.87), "IE00BKM4GZ66": (2.38, 1_985.86),
+            "IE00BMW42520": (2.40, 2_001.89), SEMIS: (2.35, 1_955.84),
+            PROPERTY: (26.13, 1_979.80), SCHNEIDER: (8.46, 2_418.30),
+        }
+        assert set(charged) == set(OBSERVED_CONTRACT_NOTES)
+        for isin, (tax, notional) in charged.items():
+            implied = tax / notional
+            assert OBSERVED_CONTRACT_NOTES[isin].tob_rate == pytest.approx(
+                implied, abs=5e-6), (
+                f"{isin}: the note charges {tax} on {notional}, which is "
+                f"{implied:.6%}, not {OBSERVED_CONTRACT_NOTES[isin].tob_rate:.6%}")
 
     def test_it_does_not_invent_a_broker(self, book):
         """Which institution holds a position is not on the instrument row.
@@ -155,12 +186,17 @@ class TestWhatItFillsIn:
     def test_it_does_not_invent_a_spread(self, book):
         assert all(inst.half_spread_bps is None for inst in book.values())
 
-    def test_the_derived_values_are_reported_as_assumptions(self, tmp_path):
+    def test_no_transaction_tax_is_reported_as_an_assumption_any_more(self, tmp_path):
+        """Every rate in this book is now off a document, so the only tax note
+        left is the refusal for the one that is not."""
         store = store_with(tmp_path, OLD_SCHEMA)
         model = CostModel(per_instrument=cost_table(store.load_instruments()))
         notes = model.assumptions()
-        assert any(n.startswith(f"{PROPERTY}: transaction tax 0.1200% assumed")
-                   for n in notes)
+        assert not [n for n in notes if "transaction tax" in n
+                    and "assumed" in n], (
+            "a transaction tax is being presented as an assumption when every "
+            "rate in this book was read off a contract note")
+        assert any(f"{GOLD}: transaction tax NOT RECORDED" in n for n in notes)
         assert any("no broker recorded" in n for n in notes)
         assert not [n for n in notes
                     if n.startswith(BANKS) and "transaction tax" in n], (
@@ -246,7 +282,7 @@ class TestItPreservesWhatItRewrites:
         store = store_with(tmp_path, OLD_SCHEMA)
         monkeypatch.setattr(DataStore, "save_instruments", _refuse_to_write)
         book = store.load_instruments()
-        assert book[PROPERTY].tob_rate == pytest.approx(0.0012)
+        assert book[PROPERTY].tob_rate == pytest.approx(0.0132)
         assert store.last_migration is not None
         assert not store.last_migration.persisted
         assert "NOT WRITTEN BACK" in "\n".join(store.last_migration.lines())
@@ -262,20 +298,28 @@ class TestItPreservesWhatItRewrites:
 
 
 class TestDerivation:
-    """The table, checked directly, so a change to it has to be deliberate."""
+    """What is still derived, and the much longer list of what no longer is."""
 
-    @pytest.mark.parametrize("asset_class,expected", [
-        (AssetClass.ETF, 0.0012),
-        (AssetClass.FUND, 0.0012),
-        (AssetClass.EQUITY, 0.0035),
-        (AssetClass.ETC, None),
-        (AssetClass.OTHER, None),
-    ])
-    def test_the_band_follows_the_asset_class(self, asset_class, expected):
+    @pytest.mark.parametrize("asset_class", list(AssetClass))
+    def test_the_asset_class_no_longer_implies_a_band(self, asset_class):
+        """The falsified instruction, pinned so it cannot come back.
+
+        A table keyed on asset class produced 0.1200% for every accumulating
+        UCITS ETF. IE00BGDQ0L74 is one and paid 1.3198%: the band turns on
+        per-compartment Belgian registration, which is on no field of the row.
+        An ISIN with no contract note therefore gets no rate, whatever its
+        label says.
+        """
         from portfolio.core.models import Instrument
-        inst = Instrument(PROPERTY, "Something", asset_class)
-        rates = [b.value for b in derived_facts(inst) if b.field == "tob_rate"]
-        assert rates == ([expected] if expected is not None else [])
+        unseen = Instrument("IE00B4L5Y983", "Something", asset_class)
+        assert [b for b in derived_facts(unseen) if b.field == "tob_rate"] == []
+
+    def test_the_two_that_look_identical_and_are_not(self):
+        """Same issuer, same domicile, same asset class, same broker, same
+        week. Eleven times apart."""
+        assert (OBSERVED_CONTRACT_NOTES[PROPERTY].tob_rate
+                == pytest.approx(11.0 * OBSERVED_CONTRACT_NOTES[SEMIS].tob_rate,
+                                 rel=0.01))
 
     def test_the_french_tax_is_only_for_french_shares(self):
         from portfolio.core.models import Instrument
@@ -348,7 +392,12 @@ class TestTheBookLoadsAndRuns:
         text = "\n".join(run_equal_risk_contribution(
             book, lookback=126, rebalance_every=21).lines())
         assert "How much of the cost figure rests on observed inputs" in text
-        assert "1 of 5 rates was read off a contract note" in text
+        # Was "1 of 5"; six contract notes later it is four of the five in
+        # this fixture, and the share of the cost figure resting on evidence
+        # went from 9% to 84%. The remaining estimate is almost entirely the
+        # spread, which no document states.
+        assert "4 of 5 rates were read off a contract note" in text
+        assert "rests on inputs read off a document" in text
         assert "of the book by value" in text
 
 
