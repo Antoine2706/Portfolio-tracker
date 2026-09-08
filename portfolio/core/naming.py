@@ -38,9 +38,11 @@ import re
 __all__ = ["shorten_name", "short_names", "derive_issuer",
            "DEFAULT_SHORT_NAME_LIMIT", "ISSUER_PREFIXES"]
 
-# Wide enough for "European Property Yield" (23) to survive intact, narrow
-# enough that a horizontal bar chart's labels do not eat the plot area.
-DEFAULT_SHORT_NAME_LIMIT = 24
+# Measured against the widest place these appear: the y-axis of the divergence
+# chart, whose label column holds about 180px, which is roughly 30 characters
+# at 11px. 28 keeps "Future of European Defence" (26) and "European Property
+# Yield" (23) whole while still leaving the plot the majority of the card.
+DEFAULT_SHORT_NAME_LIMIT = 28
 
 # Removed from the END only, repeatedly. A leading or middle occurrence is
 # left alone: "EURO STOXX Banks" and "Core MSCI EM IMI" both contain tokens
@@ -48,7 +50,7 @@ DEFAULT_SHORT_NAME_LIMIT = 24
 _TRAILING_NOISE = {
     # wrapper
     "UCITS", "ETF", "ETC", "ETP", "ETN", "FUND", "SICAV", "ICAV", "INDEX",
-    "SECTOR", "SWAP",
+    "SECTOR", "SWAP", "SCREENED",
     # share class and payout policy
     "ACC", "ACC.", "DIST", "DIS", "DIST.", "ACCUMULATING", "DISTRIBUTING",
     "CAP", "INC.", "CLASS", "SHARES", "SHARE",
@@ -199,8 +201,8 @@ def shorten_name(name: str, issuer: str = "",
 
     What is left over the limit is trimmed between words, never through one.
 
-    >>> shorten_name("Amundi Index Solutions Global Aggregate Green Bond")
-    'Global Aggregate Green…'
+    >>> shorten_name("Amundi Index Solutions Global Aggregate Green Bond Climate")
+    'Global Aggregate Green Bond…'
 
     An empty or whitespace name gives an empty result rather than raising: the
     caller has an ISIN to fall back on and a chart should not fail to draw.

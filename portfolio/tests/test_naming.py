@@ -26,7 +26,7 @@ class TestShortening:
         assert shorten_name("iShares Core MSCI World UCITS ETF USD Acc") == "Core MSCI World"
 
     def test_never_cuts_a_word_in_half(self):
-        out = shorten_name("Amundi Index Solutions Global Aggregate Green Bond")
+        out = shorten_name("Amundi Index Solutions Global Aggregate Green Bond Climate")
         assert out.endswith("…")
         # The ellipsis replaces whole words, so what remains is still words.
         assert all(w.strip("…") for w in out.split())
@@ -150,6 +150,8 @@ class TestStoreRoundTrip:
 
 @pytest.mark.parametrize("name,expected", [
     ("iShares EURO STOXX Banks 30-15 UCITS ETF DE EUR Acc", "EURO STOXX Banks 30-15"),
+    ("HANetf Future of European Defence Screened UCITS ETF Acc",
+     "Future of European Defence"),
     ("Invesco Physical Gold ETC", "Physical Gold"),
     ("iShares Core MSCI EM IMI UCITS ETF USD Acc", "Core MSCI EM IMI"),
     ("iShares European Property Yield UCITS ETF EUR Acc", "European Property Yield"),
@@ -159,4 +161,4 @@ def test_the_real_portfolio(name, expected):
     """The seven instruments this was built against, all inside the limit."""
     out = shorten_name(name)
     assert out == expected
-    assert len(out) <= 24 and "…" not in out
+    assert len(out) <= 28 and "…" not in out
