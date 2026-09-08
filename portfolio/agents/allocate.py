@@ -45,11 +45,37 @@ the best reachable *with this much money*, and the best reachable if selling
 were allowed. A 2% improvement presented on its own is a result; presented
 against a floor it cannot pass, it is a fact about the account.
 
-The reachable sets nest -- C1 < C2 implies reachable(C1) is contained in
-reachable(C2), since every lower bound v_i / (V + C) falls -- so the floor is
+Does more money always help? Only if every holding can receive it
+----------------------------------------------------------------
+The tempting claim is that the reachable sets nest, so the floor is
 non-increasing in C and the inverse question ("how much would I need?") is
-answerable by bisection. `test_allocate.py` checks that monotonicity rather
-than assuming it.
+answerable by bisection from zero. The proof is a rescaling. Given a
+reachable x1 = v + b1 at C1, put lambda = (V + C2) / (V + C1) for C2 > C1.
+Then x2 = lambda x1 has *identical* risk shares, since shares are homogeneous
+of degree zero, and it is reachable at C2:
+
+    b2 = x2 - v = (lambda - 1) v + lambda b1 >= 0,   sum(b2) = C2.
+
+That is correct, and it is what this module claimed. It is also conditional,
+and the condition was not stated: b2_i must be zero for a holding that cannot
+receive new money, and (lambda - 1) v_i is strictly positive whenever v_i is.
+A pinned holding's weight is an equality v_i / (V + C) that *moves* with C,
+not an inequality that relaxes. So the configurations do not nest, and the
+floor can rise.
+
+On the seed book it does. Three holdings there cannot receive; as C grows
+their weights are diluted towards nothing, so their risk shares go to zero
+and the best the other seven can manage is equality among themselves. Seven
+equal shares and three zeros disperse by (1/7) / (1/10) = 10/7, and the
+measured floor climbs towards that: 1.4189 at four times the book, 1.4259 at
+sixteen, 1.4277 at fifty, against a limit of 1.4286. Nothing is broken. Money
+cannot fix a structure it is not allowed to touch, and past a point it makes
+the gap worse by diluting what it cannot buy.
+
+So the guarantee has two halves, and `cash_for_dispersion` states both: the
+amount it names really does reach the target, always; that no smaller amount
+does holds only when nothing is pinned. `test_allocate.py` checks the
+monotonicity where it is real and checks the counterexample where it is not.
 
 How it is solved, and why not the way the specification assumed
 --------------------------------------------------------------
@@ -101,10 +127,11 @@ from .risk import equal_risk_weights, risk_contribution_spread
 
 __all__ = ["project_onto_simplex", "risk_shares", "dispersion_of",
            "metric_on_arrays", "objective_and_gradient", "solve_continuous",
-           "pattern_search", "reachable_floor", "unconstrained_floor",
+           "pattern_search", "aim_at_equal_risk", "reachable_floor",
+           "unconstrained_floor",
            "Purchase", "Refusal", "Destination", "BuyOnlyAllocation",
-           "allocate_buy_only", "cash_for_dispersion",
-           "smallest_meaningful_cash"]
+           "allocate_buy_only", "cash_for_dispersion", "pinned_holdings",
+           "best_reachable_dispersion", "smallest_meaningful_cash"]
 
 
 def project_onto_simplex(y: np.ndarray, total: float) -> np.ndarray:
@@ -393,6 +420,105 @@ def pattern_search(b: np.ndarray, held: np.ndarray, metric,
     return best
 
 
+def aim_at_equal_risk(held: np.ndarray, cov: pd.DataFrame, cash: float,
+                      allowed: np.ndarray) -> "np.ndarray | None":
+    """Start the search from the answer, when the answer is reachable.
+
+    Every other start in this module is agnostic: an equal split, a vertex, a
+    random simplex point. None of them knows what equal risk contribution
+    looks like, and past the amount at which that portfolio becomes reachable
+    it is the answer, so a start there is a start at the optimum.
+
+    The construction. A holding new money cannot enter has weight exactly
+    `v_i / (V + C)` at every reachable point, so it is *pinned*, not
+    approximated -- which is precisely `equal_risk_weights`' `fixed`
+    argument. Solve for the weights that equalise the rest against it, turn
+    those weights back into euros, and subtract what is already held:
+
+        b = w (V + C) - v
+
+    That sums to C by construction, since `w` sums to one. It is feasible if
+    and only if no component is negative, and a negative component is a
+    holding already above its equal-risk weight -- a sale, which is the one
+    thing not on offer. Projecting onto the simplex is what makes it a start
+    rather than a proposal: it returns the nearest point that is buy-only and
+    spends exactly C.
+
+    Why it matters, and it is not a refinement. On the seed book with every
+    holding allocatable -- the case where the module docstring's nesting
+    argument does hold, so the floor provably cannot rise -- the floor
+    measured without this start was
+
+        0.25x     1x      4x     16x     50x
+        2.3838  1.3556  2.2424  1.7013  1.2996
+
+    which rises at four times the book and does not reach equal risk at
+    fifty. That is forbidden, so it was the solver, not the account. With
+    this start:
+
+        2.3838  1.3556  0.0000  0.0000  0.0000
+
+    Past the point where the equal risk portfolio becomes reachable it is
+    found exactly, because it is handed over rather than searched for. Over
+    forty-eight random books at ten amounts each, the floor now never rises.
+
+    What makes the surface hard is worth naming, because it is not book size
+    and it is not the number of holdings. It is *negative correlation*. When
+    (Sigma x)_i is negative a holding's risk share is negative, so the minimum
+    of the range is not bounded below by zero and the surface acquires local
+    minima that no exchange between two holdings can leave. On books of
+    independent assets the search never failed at all -- forty-eight of them,
+    ten amounts each, monotone with the start and monotone without it, which
+    is why `test_allocate.py` checks this on a fixture with a hedge in it
+    instead. The real book is that fixture: its gold ETC runs at -0.98
+    against one of the equity holdings, which is the entire reason it is
+    held.
+
+    Two uncorrelated assets, the second twice as volatile, so equal risk is
+    two thirds and one third. A book that is 90% in the volatile one, and
+    enough new money to fix it outright:
+
+    >>> cov = pd.DataFrame([[0.01, 0.0], [0.0, 0.04]], index=["A", "B"],
+    ...                    columns=["A", "B"])
+    >>> held = np.array([100.0, 900.0])
+    >>> b = aim_at_equal_risk(held, cov, 9000.0, np.ones(2, dtype=bool))
+    >>> [round(float(v), 4) for v in b]
+    [6566.6667, 2433.3333]
+    >>> round(dispersion_of(held + b, cov), 10)
+    0.0
+
+    A tenth of that money cannot reach it: the aim asks for 733 in A and 367
+    in B against 900 already held in B, so B's component is negative. The
+    projection spends the lot on A rather than proposing the sale:
+
+    >>> b = aim_at_equal_risk(held, cov, 100.0, np.ones(2, dtype=bool))
+    >>> [round(float(v), 6) for v in b]
+    [100.0, 0.0]
+    """
+    free = np.nonzero(allowed)[0]
+    if cash <= 0 or free.size == 0:
+        return None
+    total = float(held.sum()) + float(cash)
+    if total <= 0:
+        return None
+
+    keys = [str(c) for c in cov.columns]
+    fixed = {keys[i]: float(held[i]) / total
+             for i in range(len(keys)) if not allowed[i]}
+    try:
+        weights = equal_risk_weights(cov, fixed=fixed)
+    except (RuntimeError, ValueError):
+        # A degenerate covariance matrix has no equal-risk portfolio to aim
+        # at. The other starts still stand; this one simply has nothing to
+        # contribute, and a fabricated aim would be worse than none.
+        return None
+
+    raw = weights.to_numpy(dtype=float) * total - held
+    out = np.zeros(held.size, dtype=float)
+    out[free] = project_onto_simplex(raw[free], float(cash))
+    return out
+
+
 def reachable_floor(held: np.ndarray, cov: pd.DataFrame, cash: float,
                     allowed: np.ndarray, among=None, *, thorough: bool = True
                     ) -> "tuple[float, np.ndarray]":
@@ -408,6 +534,9 @@ def reachable_floor(held: np.ndarray, cov: pd.DataFrame, cash: float,
     free = np.nonzero(allowed)[0]
     candidates = solve_continuous(held, sigma, cash, allowed,
                                   randoms=12 if thorough else 2)
+    aim = aim_at_equal_risk(held, cov, cash, allowed)
+    if aim is not None:
+        candidates.append(aim)
     # The gradient descents supply good starts; raw simplex points supply
     # starts whose basin the surrogate never visits. Both are needed: the
     # surrogate's optimum sat in the wrong basin on the fixture above, and a
@@ -662,7 +791,29 @@ class BuyOnlyAllocation:
             return 0.0
         return float((self.dispersion_now - self.floor_at_cash) / room)
 
+    @staticmethod
+    def _labels(rows) -> "dict[str, str]":
+        """Display names, with the ISIN attached where two holdings share one.
+
+        The seed book carries two ETFs both shortening to "Europe Defence",
+        and a table listing both under one name is a table nobody can act on.
+        Only the colliding rows are lengthened, since an ISIN on every line
+        would cost the width the names need -- but the collision is decided
+        across the whole report rather than per table, so a name that is
+        qualified in one place is not bare in another.
+        """
+        # By ISIN first: a holding appears in the order AND in the
+        # destinations table, and counting it twice would qualify every
+        # purchased name as though it collided with itself.
+        named = {row.isin: row.name for row in rows}
+        counts: "dict[str, int]" = {}
+        for name in named.values():
+            counts[name] = counts.get(name, 0) + 1
+        return {isin: (f"{name[:14]} {isin}" if counts[name] > 1 else name)
+                for isin, name in named.items()}
+
     def lines(self) -> list[str]:
+        names = self._labels([*self.purchases, *self.destinations])
         out = [f"Directing {self.cash:,.0f} EUR of new money", "=" * 64, ""]
         if self.meaningful_cash is None:
             out.append("No purchase of any size meaningfully changes the risk "
@@ -682,12 +833,25 @@ class BuyOnlyAllocation:
         if not self.purchases:
             out.append("  nothing to buy")
         for p in self.purchases:
-            out.append(f"  {p.shares:>6} x {p.name[:26]:26} "
+            # 27 wide, because a qualified label is a 14-character name, a
+            # space and a 12-character ISIN, and half an ISIN identifies
+            # nothing -- it is worse than the collision it was meant to fix.
+            out.append(f"  {p.shares:>6} x {names[p.isin][:27]:27} "
                        f"{p.amount:>9,.0f} EUR at {p.price:>8,.2f}  "
                        f"({p.broker})")
             out.append(f"         risk share {p.risk_before:>6.1%} -> "
                        f"{p.risk_after:>6.1%}   weight {p.weight_before:>6.1%} "
                        f"-> {p.weight_after:>6.1%}")
+        if any(min(p.risk_before, p.risk_after) < 0 for p in self.purchases):
+            out += ["",
+                    "  A risk share below zero is not a misprint. A holding "
+                    "that moves against the rest of the book has a negative "
+                    "marginal contribution to its volatility, so it carries "
+                    "risk away rather than adding it -- that is what a hedge "
+                    "is for, and the shares still sum to 100%. It does mean "
+                    "the dispersion figure below spans a wider range than an "
+                    "unhedged book's would, so compare it against this book "
+                    "over time rather than against a number from elsewhere."]
         out += [
             "",
             f"  invested   {self.invested:>10,.2f} EUR",
@@ -715,11 +879,12 @@ class BuyOnlyAllocation:
             for d in sorted(self.destinations, key=lambda x: x.dispersion):
                 per = "n/a" if d.per_euro is None else f"{d.per_euro:.5f}"
                 cost = "n/a" if d.cost is None else f"{d.cost:,.2f}"
-                out.append(f"  {d.name[:27]:28}{d.dispersion:>11.4f}"
+                out.append(f"  {names[d.isin][:27]:28}{d.dispersion:>11.4f}"
                            f"{cost:>9}{per:>11}")
         if self.refused:
             out += ["", "Refused", "-" * 64]
             for r in self.refused:
+                # Already prefixed by its ISIN, so it needs no qualifying.
                 out.append(f"  {r.isin} ({r.name}): {r.reason}")
         if self.assumptions:
             out += ["", "Cost inputs that are estimates", "-" * 64]
@@ -857,19 +1022,29 @@ def cash_for_dispersion(target: float, *, values: "dict[str, float]",
     """The smallest purchase that reaches `target` dispersion, buy-only.
 
     The question worth asking, and more decision-relevant than any single
-    allocation: if the answer is 40,000 EUR on a 15,000 EUR book, the
-    structure cannot be fixed by contributions and the real choice is whether
-    to sell.
+    allocation: if the answer is 40,000 EUR on a 15,000 EUR book, contributions
+    of the size this account actually makes will not fix the structure and the
+    real choice is whether to sell.
 
-    Bisection is valid because the reachable set grows with the money -- every
-    lower bound v_i / (V + C) falls as C rises, so reachable(C1) is contained
-    in reachable(C2) for C1 < C2 and the floor is non-increasing. That
-    monotonicity is a property of the problem, not of the solver, so
-    `test_allocate.py` checks the solver actually exhibits it.
+    It scans a geometric ladder for the first amount that reaches the target
+    and bisects inside the bracket, rather than bisecting from zero. Bisecting
+    from zero is what a non-increasing floor would allow, and the module
+    docstring shows the floor is non-increasing only when every holding can
+    receive new money -- a pinned holding is diluted by the money it cannot
+    take, and on the seed book the floor rises towards 10/7 because of it.
 
-    None when no purchase up to `ceiling` times the book reaches the target.
+    What that costs is stated rather than hidden. Every step of both the scan
+    and the bisection keeps `floor(high) <= target`, and the floor is
+    evaluated by the same search the allocation uses at a lower start count,
+    which can only find a worse floor than the thorough one. So the amount
+    returned really does reach the target, always. What is guaranteed only in
+    the unpinned case is that no *smaller* amount does: with a pinned holding
+    the ladder can in principle step over a window where the target was
+    briefly reachable, and the answer is then too high rather than wrong.
+
+    None when no rung up to `ceiling` times the book reaches the target.
     Returning a very large number instead would suggest a plan; None says
-    there is not one.
+    this search did not find one.
     """
     keys = [str(c) for c in cov.columns]
     held = np.array([float(values.get(k, 0.0)) for k in keys], dtype=float)
@@ -891,12 +1066,29 @@ def cash_for_dispersion(target: float, *, values: "dict[str, float]",
 
     if dispersion_of(held, cov, among) <= target:
         return 0.0
-    high = book
-    while floor(high) > target:
-        high *= 2.0
-        if high > ceiling * book:
-            return None
-    low = 0.0
+
+    # The ladder. It starts at the resolution rather than at the book, because
+    # the amount that matters is often a small fraction of it -- that is what
+    # `smallest_meaningful_cash` asks -- and climbs by halves so a window where
+    # a pinned book briefly reaches the target is narrow enough to land in.
+    # The ceiling is tested explicitly: a target reachable only at the very top
+    # would otherwise be missed by a rung that overshot it.
+    rungs = []
+    rung = tolerance * book
+    while rung < ceiling * book:
+        rungs.append(rung)
+        rung *= 1.5
+    rungs.append(ceiling * book)
+
+    low, high = 0.0, None
+    for rung in rungs:
+        if floor(rung) <= target:
+            high = rung
+            break
+        low = rung
+    if high is None:
+        return None
+
     while (high - low) > tolerance * book:
         mid = 0.5 * (low + high)
         if floor(mid) <= target:
@@ -904,6 +1096,58 @@ def cash_for_dispersion(target: float, *, values: "dict[str, float]",
         else:
             low = mid
     return float(high)
+
+
+def pinned_holdings(*, values: "dict[str, float]", cov: pd.DataFrame, costs,
+                    buyable: "set[str] | frozenset[str]") -> "list[str]":
+    """Holdings with money in them that new money cannot enter.
+
+    The condition under which the floor stops being monotone in cash, so the
+    thing a report has to name before it explains why more money made the
+    number worse. A pinned holding worth nothing does not count: the rescaling
+    in the module docstring needs `(lambda - 1) v_i` to be zero, and a zero
+    value gives that without any purchase.
+    """
+    keys = [str(c) for c in cov.columns]
+    allowed = _allowed_mask(keys, set(buyable), costs, [])
+    return [k for i, k in enumerate(keys)
+            if not allowed[i] and float(values.get(k, 0.0)) > 0]
+
+
+def best_reachable_dispersion(*, values: "dict[str, float]", cov: pd.DataFrame,
+                              costs, buyable: "set[str] | frozenset[str]",
+                              among=None, ceiling: float = 50.0,
+                              tolerance: float = 0.01
+                              ) -> "tuple[float, float]":
+    """The lowest dispersion any purchase reaches, and roughly what it takes.
+
+    What to say when `cash_for_dispersion` returns None, because "no" on its
+    own is not a decision. With a pinned holding the floor falls, bottoms out
+    and rises again -- the money dilutes towards nothing a risk share it is
+    not allowed to buy -- so there is a *best* amount rather than "as much as
+    you can", and it is worth naming even when the target is out of reach.
+
+    The amount is the best rung of the same ladder `cash_for_dispersion`
+    climbs, so it is accurate to about a factor of a half. That is the right
+    precision for a number whose use is deciding whether to sell instead.
+    """
+    keys = [str(c) for c in cov.columns]
+    held = np.array([float(values.get(k, 0.0)) for k in keys], dtype=float)
+    allowed = _allowed_mask(keys, set(buyable), costs, [])
+    now = dispersion_of(held, cov, among)
+    if not allowed.any():
+        return now, 0.0
+    book = float(held.sum()) or 1.0
+
+    best, at = now, 0.0
+    rung = tolerance * book
+    while rung < ceiling * book * 1.5:
+        value = reachable_floor(held, cov, min(rung, ceiling * book), allowed,
+                                among, thorough=False)[0]
+        if value < best:
+            best, at = value, min(rung, ceiling * book)
+        rung *= 1.5
+    return float(best), float(at)
 
 
 def smallest_meaningful_cash(*, values: "dict[str, float]", cov: pd.DataFrame,

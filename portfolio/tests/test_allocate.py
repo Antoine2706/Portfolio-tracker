@@ -24,10 +24,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from portfolio.agents.allocate import (allocate_buy_only, cash_for_dispersion,
-                                       dispersion_of, metric_on_arrays,
+from portfolio.agents.allocate import (allocate_buy_only,
+                                       best_reachable_dispersion,
+                                       cash_for_dispersion, dispersion_of,
+                                       metric_on_arrays,
                                        objective_and_gradient,
-                                       pattern_search, project_onto_simplex,
+                                       pattern_search, pinned_holdings,
+                                       project_onto_simplex,
                                        reachable_floor, risk_shares,
                                        smallest_meaningful_cash)
 from portfolio.agents.execution import CostModel, InstrumentCost
@@ -360,26 +363,103 @@ class TestItFindsTheOptimum:
         assert mine < self.brute(held, cov, cash, 14) - 1e-6
 
 
-class TestTheFloorIsMonotone:
-    """More money can only reach a wider set, so the floor cannot rise.
+LADDER = (0.0, 0.05, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 50.0)
 
-    A property of the problem -- every lower bound v_i / (V + C) falls as C
-    rises -- which makes the bisection in `cash_for_dispersion` valid. Checked
-    on the solver rather than assumed of it, because a search that got stuck
-    at one amount and not at another would break the bisection while the
-    mathematics stayed true.
+
+def hedged_book(n: int, seed: int):
+    """A book where something hedges something else.
+
+    One common factor and betas from -1.2 to 1.6, so some pairs correlate
+    negatively. The real book does: its gold ETC runs at -0.98 against one of
+    the equity holdings, which is the entire reason it is held.
+
+    The distinction is not cosmetic, and finding that out is why this fixture
+    exists rather than `book` above. Independent normals make the equal-risk
+    problem easy: over forty-eight of them at ten amounts each, the floor was
+    monotone whether or not `aim_at_equal_risk` was in the code, so a
+    monotonicity check built on them passes either way and is not a check.
+    Let one correlation go negative and the solver fails on most seeds. A
+    holding whose marginal contribution (Sigma x)_i is negative has a
+    *negative* risk share, so the minimum of the range is not bounded below by
+    zero and the surface grows local minima a pairwise search cannot leave.
+    """
+    rng = np.random.default_rng(seed)
+    factor = rng.normal(0.0, 0.011, 500)
+    beta = rng.uniform(-1.2, 1.6, n)
+    idiosyncratic = rng.normal(0.0, 1.0, (n, 500)) * rng.uniform(0.002, 0.008,
+                                                                 (n, 1))
+    returns = beta[:, None] * factor[None, :] + idiosyncratic
+    # Twelve characters, like a real ISIN: the report qualifies a colliding
+    # name by appending one, and whether that fits its column is a question
+    # about ISIN-length keys rather than about "A3".
+    keys = [f"IE00HEDGE{i:03d}" for i in range(n)]
+    cov = pd.DataFrame(np.cov(returns) * 252, index=keys, columns=keys)
+    return cov, rng.uniform(500, 5000, n)
+
+
+def floors_up_the_ladder(held, cov, allowed, ladder=LADDER):
+    total = float(held.sum())
+    return [reachable_floor(held, cov, f * total, allowed)[0] for f in ladder]
+
+
+class TestTheFloorIsMonotone:
+    """More money can only reach a wider set -- if every holding can receive it.
+
+    The condition is the whole of it, and the module docstring carries the
+    proof: rescaling a reachable allocation by (V + C2) / (V + C1) preserves
+    every risk share and stays feasible, *provided* no holding is pinned. When
+    one is, its weight is an equality that moves with the money rather than an
+    inequality that relaxes, and `TestPinningBreaksTheMonotonicity` below is
+    the counterexample.
+
+    Where it does hold it is a property of the problem, not of the solver, so
+    what is checked here is that the solver exhibits it -- a search that gets
+    stuck at one amount and not at another breaks `cash_for_dispersion` while
+    the mathematics stays true. It did, and `test_the_check_bites` is that.
     """
 
     @pytest.mark.parametrize("n,seed", [(4, 2), (6, 4)])
     def test_more_money_never_reaches_a_worse_floor(self, n, seed):
         cov, values, _ = book(n, seed)
         held = np.array([values[str(c)] for c in cov.columns])
-        allowed = np.ones(n, dtype=bool)
-        total = float(held.sum())
-        floors = [reachable_floor(held, cov, f * total, allowed)[0]
-                  for f in (0.0, 0.05, 0.2, 0.5, 1.0, 3.0, 10.0)]
+        floors = floors_up_the_ladder(held, cov, np.ones(n, dtype=bool))
         for earlier, later in zip(floors, floors[1:]):
             assert later <= earlier + 1e-6
+
+    @pytest.mark.parametrize("seed", [2, 3, 4])
+    def test_nor_on_a_book_with_a_hedge_in_it(self, seed):
+        """The case the independent-normal fixture cannot see."""
+        cov, held = hedged_book(8, seed)
+        floors = floors_up_the_ladder(held, cov, np.ones(8, dtype=bool))
+        for i, (earlier, later) in enumerate(zip(floors, floors[1:])):
+            assert later <= earlier + 1e-6, (
+                f"the floor rose from {earlier:.4f} at {LADDER[i]}x the book "
+                f"to {later:.4f} at {LADDER[i + 1]}x, which the nesting "
+                f"argument forbids when nothing is pinned")
+
+    def test_the_check_bites(self, monkeypatch):
+        """Delete the aimed start and the check above must fail.
+
+        Otherwise it is a check on nothing. Without `aim_at_equal_risk` the
+        floor on this book, up the same ladder, runs
+
+            7.6371 6.7747 1.9746 1.1604 0.4161 0.0031 0.0078 0.0035
+                                                       1.4254 1.2380
+
+        It finds the equal-risk portfolio at four times the book and then
+        *loses* it at sixteen, reporting a floor four hundred times worse for
+        strictly more money on a strictly larger feasible set. With the start
+        the last five entries are 0.0000 exactly.
+        """
+        import portfolio.agents.allocate as module
+        monkeypatch.setattr(module, "aim_at_equal_risk", lambda *a, **k: None)
+        cov, held = hedged_book(8, 2)
+        floors = [module.reachable_floor(held, cov, f * float(held.sum()),
+                                         np.ones(8, dtype=bool))[0]
+                  for f in LADDER]
+        assert max(b - a for a, b in zip(floors, floors[1:])) > 0.5
+        assert min(floors) < 0.01, "it found equal risk at some amount"
+        assert floors[-1] > 1.0, "and then lost it when handed more money"
 
     def test_enough_money_reaches_equal_risk(self):
         """The buy-only constraint binds less and less; in the limit it does
@@ -389,6 +469,111 @@ class TestTheFloorIsMonotone:
         far, _ = reachable_floor(held, cov, 400.0 * float(held.sum()),
                                  np.ones(5, dtype=bool))
         assert far < 0.05
+
+    def test_and_it_reaches_it_exactly_not_approximately(self):
+        """Because the start is the answer, not a neighbourhood of it."""
+        cov, held = hedged_book(8, 3)
+        far, _ = reachable_floor(held, cov, 50.0 * float(held.sum()),
+                                 np.ones(8, dtype=bool))
+        assert far < 1e-9
+
+
+class TestPinningBreaksTheMonotonicity:
+    """The condition, and what happens when it fails.
+
+    This module claimed monotonicity unconditionally and bisected on it. The
+    claim is false whenever a holding with money in it cannot receive more:
+    the rescaling needs b2_i = (lambda - 1) v_i to be zero for such a holding,
+    and it is strictly positive whenever v_i is. The floor then falls, bottoms
+    out, and climbs again as the pinned holding is diluted towards a zero risk
+    share.
+    """
+
+    LADDER = (0.05, 0.2, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 50.0)
+
+    def floors(self, n=5, seed=1, pin=0):
+        cov, values, _ = book(n, seed)
+        held = np.array([values[str(c)] for c in cov.columns])
+        allowed = np.ones(n, dtype=bool)
+        allowed[pin] = False
+        return cov, held, allowed, floors_up_the_ladder(held, cov, allowed,
+                                                        self.LADDER)
+
+    def test_the_floor_really_does_rise(self):
+        _, _, _, floors = self.floors()
+        bottom = min(floors)
+        assert bottom < 0.2, "it should fall a long way before it turns"
+        assert floors[-1] > bottom + 1.0, (
+            "the floor did not rise, so the counterexample this class exists "
+            "for is not being exercised")
+
+    def test_it_climbs_towards_the_dilution_limit(self):
+        """Which is arithmetic, not a fitted constant.
+
+        As C grows the pinned holding's weight goes to zero, so its risk share
+        does too, and the best the other four can do is share the risk equally
+        among themselves. Four shares of 1/4 and one of 0 have a range of 1/4
+        about a mean of 1/5, so the dispersion tends to n / (n - 1) = 1.25.
+        """
+        _, _, _, floors = self.floors(n=5)
+        assert floors[-1] == pytest.approx(5.0 / 4.0, abs=0.02)
+        assert floors[-1] < 5.0 / 4.0, "it is a limit, approached from below"
+
+    @pytest.mark.parametrize("n", [4, 5, 6])
+    def test_the_limit_holds_at_every_size(self, n):
+        _, _, _, floors = self.floors(n=n, seed=1, pin=0)
+        assert floors[-1] == pytest.approx(n / (n - 1.0), abs=0.03)
+
+    def test_the_amount_named_still_reaches_the_target(self):
+        """Minimality is what pinning costs. Sufficiency is not negotiable:
+        every step of the scan and the bisection keeps floor(high) <= target,
+        and the cheap search can only overstate the floor, so the amount
+        reported is one that really does reach it."""
+        cov, values, _ = book(5, 1)
+        keys = [str(c) for c in cov.columns]
+        held = np.array([values[k] for k in keys])
+        allowed = np.ones(5, dtype=bool)
+        allowed[0] = False
+        buyable = set(keys[1:])
+        for target in (1.0, 0.8, 0.5, 0.3):
+            needed = cash_for_dispersion(target, values=values, cov=cov,
+                                         costs=free_costs(keys),
+                                         buyable=buyable)
+            assert needed is not None, f"a target of {target} was reachable"
+            reached, _ = reachable_floor(held, cov, needed, allowed)
+            assert reached <= target + 1e-9, (
+                f"it named {needed:,.0f} EUR for a dispersion of {target}, "
+                f"and {needed:,.0f} EUR reaches only {reached:.4f}")
+
+    def test_a_pinned_holding_is_named(self):
+        cov, values, _ = book(5, 1)
+        keys = [str(c) for c in cov.columns]
+        assert pinned_holdings(values=values, cov=cov,
+                               costs=free_costs(keys),
+                               buyable=set(keys[1:])) == [keys[0]]
+
+    def test_a_pinned_holding_worth_nothing_is_not_pinning_anything(self):
+        """The rescaling needs (lambda - 1) v_i to vanish, and a zero value
+        gives that without any purchase."""
+        cov, values, _ = book(5, 1)
+        keys = [str(c) for c in cov.columns]
+        values = dict(values, **{keys[0]: 0.0})
+        assert pinned_holdings(values=values, cov=cov, costs=free_costs(keys),
+                               buyable=set(keys[1:])) == []
+
+    def test_an_unreachable_target_comes_with_the_best_that_is_reachable(self):
+        """"No" is not a decision on its own, and with a pinned holding it is
+        not even "as much as possible": there is a best amount, past which
+        more money makes the number worse."""
+        cov, values, _ = book(5, 1)
+        keys = [str(c) for c in cov.columns]
+        best, at = best_reachable_dispersion(values=values, cov=cov,
+                                             costs=free_costs(keys),
+                                             buyable=set(keys[1:]))
+        assert best < 0.2 and at > 0
+        assert cash_for_dispersion(best * 0.5, values=values, cov=cov,
+                                   costs=free_costs(keys),
+                                   buyable=set(keys[1:])) is None
 
 
 class TestTheInverseQuestion:
@@ -482,6 +667,93 @@ class TestWhatItReports:
         text = "\n".join(tiny.lines())
         assert ("does not much matter where this goes" in text
                 or "Where this goes matters" in text)
+
+    def _hedged_allocation(self, cash=5000.0, names=None):
+        """An allocation on a book with a hedge in it, optionally with two
+        holdings deliberately sharing a display name."""
+        cov, held = hedged_book(6, 2)
+        keys = [str(c) for c in cov.columns]
+        names = names or {}
+        costs = CostModel(account_value=20_000.0, per_instrument={
+            k: InstrumentCost(name=names.get(k, k)) for k in keys})
+        return allocate_buy_only(
+            values=dict(zip(keys, held)),
+            prices={k: 20.0 + 5.0 * i for i, k in enumerate(keys)},
+            cov=cov, cash=cash, costs=costs, buyable=set(keys))
+
+    def test_a_negative_risk_share_is_explained_rather_than_printed_bare(self):
+        """A hedge earns a negative marginal contribution, so its risk share
+        is negative. Correct, and unreadable without a sentence: the seed book
+        prints -46.0% next to +205.1%."""
+        allocation = self._hedged_allocation()
+        assert any(min(p.risk_before, p.risk_after) < 0
+                   for p in allocation.purchases), (
+            "this fixture no longer produces a negative risk share, so the "
+            "assertion below is checking nothing")
+        assert "not a misprint" in "\n".join(allocation.lines())
+
+    def test_and_the_sentence_stays_away_when_there_is_nothing_to_explain(self):
+        allocation = allocate(n=6, seed=3, cash=5000.0)
+        assert all(min(p.risk_before, p.risk_after) >= 0
+                   for p in allocation.purchases)
+        assert "not a misprint" not in "\n".join(allocation.lines())
+
+    def test_two_holdings_with_one_name_are_told_apart(self):
+        """The seed book has two ETFs that both shorten to "Europe Defence".
+        A table listing both under one name cannot be acted on."""
+        cov, _ = hedged_book(6, 2)
+        keys = [str(c) for c in cov.columns]
+        clash = {keys[0]: "Europe Defence", keys[1]: "Europe Defence"}
+        allocation = self._hedged_allocation(names=clash)
+        labels = allocation._labels([*allocation.purchases,
+                                     *allocation.destinations])
+        assert labels[keys[0]] == f"Europe Defence {keys[0]}"
+        assert labels[keys[1]] == f"Europe Defence {keys[1]}"
+        text = "\n".join(allocation.lines())
+        assert f"Europe Defence {keys[0]}" in text
+        assert f"Europe Defence {keys[1]}" in text
+
+    def test_a_name_nobody_shares_is_left_alone(self):
+        """An ISIN on every row would cost the width the names need."""
+        allocation = self._hedged_allocation()
+        labels = allocation._labels([*allocation.purchases,
+                                     *allocation.destinations])
+        assert set(labels.values()) == set(labels)
+
+    def test_a_holding_is_not_read_as_colliding_with_itself(self):
+        """It appears in the order AND in the destinations table, and counting
+        the two rows separately would qualify every purchased name."""
+        allocation = self._hedged_allocation()
+        assert allocation.purchases and allocation.destinations
+        bought = {p.isin for p in allocation.purchases}
+        assert bought & {d.isin for d in allocation.destinations}, (
+            "the two lists no longer overlap, so this test is vacuous")
+        labels = allocation._labels([*allocation.purchases,
+                                     *allocation.destinations])
+        for isin in bought:
+            assert labels[isin] == isin, "qualified against itself"
+
+    def test_a_qualified_label_is_never_truncated_mid_isin(self):
+        """Half an ISIN identifies nothing, which is worse than the collision
+        it was meant to fix. The order column is 27 wide for exactly this: a
+        14-character name, a space, and a 12-character ISIN."""
+        cov, _ = hedged_book(6, 2)
+        keys = [str(c) for c in cov.columns]
+        long = "A rather long instrument name"
+        allocation = self._hedged_allocation(names={keys[0]: long,
+                                                    keys[1]: long})
+        labels = allocation._labels([*allocation.purchases,
+                                     *allocation.destinations])
+        qualified = [labels[k] for k in (keys[0], keys[1])]
+        assert len(set(qualified)) == 2, "the collision was not resolved"
+        for isin, label in zip((keys[0], keys[1]), qualified):
+            assert label.endswith(isin)
+            assert len(label) <= 27, (
+                f"{label!r} is {len(label)} characters and the order column "
+                f"is 27, so the ISIN would be cut in half")
+        text = "\n".join(allocation.lines())
+        for label in qualified:
+            assert label in text
 
     def test_every_destination_is_costed(self):
         allocation = allocate(n=6, seed=3, cash=5000.0)

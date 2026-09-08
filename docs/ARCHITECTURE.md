@@ -203,11 +203,30 @@ brute-force grid: least squares equalises four holdings and abandons the
 fifth, while a range prefers lifting the laggards. The result is labelled
 "best found", and `test_allocate.py` checks it against a dense grid.
 
-**The floor is monotone in the cash**, because every lower bound `v_i/(V+C)`
-falls as C rises, so the reachable sets nest. That is what makes
-`cash_for_dispersion` bisectable — and it is checked on the solver rather than
-assumed of it, since a search that stuck at one amount and not another would
-break the bisection while the mathematics stayed true.
+**The floor is monotone in the cash — only if every holding can receive it.**
+The proof is a rescaling: for `λ = (V+C₂)/(V+C₁)`, the vector `λx` has
+identical risk shares (they are homogeneous of degree zero) and is affordable
+at `C₂`, since `b₂ = (λ−1)v + λb₁ ≥ 0`. This module asserted that
+unconditionally and bisected on it. It is false the moment a holding cannot
+receive: `b₂ᵢ` must then be zero and `(λ−1)vᵢ` is strictly positive. The
+pinned weight is an equality that *moves* with the money, not a bound that
+relaxes, so the configurations do not nest and the floor can rise. On the demo
+book it does, climbing towards `10/7` — seven equal risk shares and three
+diluted to zero. `cash_for_dispersion` therefore scans a geometric ladder and
+bisects inside the bracket: every step keeps `floor(high) ≤ target`, so the
+amount named always reaches it; minimality is what pinning costs.
+
+Where monotonicity *is* real it is checked on the solver, not assumed of it —
+and the check has to be able to fail. Two findings shaped it. Books of
+independent assets are monotone whether or not the fix is in, so a check on
+them checks nothing; the failure needs **negative correlation**, where a
+holding's `(Σx)ᵢ` goes negative, its risk share with it, and the range
+acquires local minima no two-holding exchange can leave. And the fix is
+`aim_at_equal_risk`: start from `b = w_erc·(V+C) − v` projected onto the
+simplex, which is the optimum itself once the money makes it reachable.
+Without it the floor on a hedged eight-holding book *finds* equal risk at four
+times the book and loses it at sixteen, reporting 1.4254 for strictly more
+money on a strictly larger feasible set.
 
 **Whole shares, then the report.** Solve continuously; drop any holding whose
 allocation falls below its own broker's minimum economic trade, or above the

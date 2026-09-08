@@ -148,8 +148,10 @@ Buy-only can only reduce an overweight risk share by dilution, so the output
 carries three numbers rather than one — where the book is now, the best
 reachable *with this much money*, and the best reachable if selling were
 allowed. It answers the inverted question too, which is usually the
-decision-relevant one: *no purchase of any size reaches that, so the choice
-is whether to sell*. And it says when the destination hardly matters:
+decision-relevant one — *reaching 1.00 would take about 40,000 EUR against a
+book of 17,000* — and when the answer is that nothing reaches it, it says
+what the best reachable is and at what amount, because "no" on its own is
+not a decision. And it says when the destination hardly matters:
 
 > At 500 EUR it does not much matter where this goes: the best and worst
 > destinations differ by 0.115 of dispersion. The smallest purchase that
@@ -164,6 +166,18 @@ wide-spread holding cannot quietly consume the improvement it delivers.
 cannot be rebalanced against the rest of the book but can be bought with new
 money perfectly well; reading one flag as the other gets the constraint wrong
 in one direction or the other.
+
+**More money does not always help, and the tool no longer pretends it does.**
+Rescaling a reachable allocation leaves every risk share unchanged and stays
+affordable, so the best reachable dispersion falls as the purchase grows —
+*provided every holding can receive it*. One that cannot has its weight pinned
+at `v/(V+C)`, an equality that moves with the money rather than a bound that
+relaxes, so more cash dilutes it towards a zero risk share and past some
+amount the floor turns and climbs. On the demo book it converges to 10/7,
+which is what seven equal risk shares and three zeros disperse to. The inverse
+question is therefore answered by a scan rather than a bisection: the amount
+named always reaches the target, and what a pinned holding costs is the
+guarantee that nothing smaller would.
 
 The allocator is evaluated by **replaying the real ledger** — same dates,
 same amounts, destination changed — because its claim is about risk

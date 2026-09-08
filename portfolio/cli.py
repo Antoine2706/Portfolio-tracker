@@ -414,23 +414,42 @@ def _allocate(args: argparse.Namespace) -> int:
     allocation = allocate_new_money(book, args.amount, lookback=args.lookback)
     print("\n".join(allocation.lines()))
     if args.target is not None:
-        from .agents.allocate import cash_for_dispersion
+        from .agents.allocate import (best_reachable_dispersion,
+                                      cash_for_dispersion, pinned_holdings)
         from .core.returns import simple_returns
         from .core.risk import covariance_matrix
         window = simple_returns(book.panel.closes).dropna().iloc[-args.lookback:]
-        needed = cash_for_dispersion(
-            args.target, values=book.values, cov=covariance_matrix(window),
-            costs=book.costs, buyable=book.buyable)
+        cov = covariance_matrix(window)
+        shared = dict(values=book.values, cov=cov, costs=book.costs,
+                      buyable=book.buyable)
+        needed = cash_for_dispersion(args.target, **shared)
+        pinned = pinned_holdings(**shared)
+        total = sum(book.values.values())
         print()
         if needed is None:
+            # "No" is not a decision on its own, and with a pinned holding it
+            # is not even "as much as possible": the floor bottoms out and
+            # then rises as the money dilutes a risk share it may not buy.
+            best, at = best_reachable_dispersion(**shared)
             print(f"No purchase reaches a dispersion of {args.target:.2f} "
-                  f"buy-only, at any size this tool will consider. The "
-                  f"structure cannot be fixed by contributions; the real "
-                  f"choice is whether to sell.")
+                  f"buy-only, at any size this tool searched. The best it "
+                  f"found was {best:.2f}, at about {at:,.0f} EUR against a "
+                  f"book of {total:,.0f} EUR.")
         else:
             print(f"Reaching a dispersion of {args.target:.2f} buy-only would "
                   f"take about {needed:,.0f} EUR of new money, against a book "
-                  f"of {sum(book.values.values()):,.0f} EUR.")
+                  f"of {total:,.0f} EUR.")
+        if pinned:
+            frozen = sum(book.values.get(k, 0.0) for k in pinned)
+            many = len(pinned) > 1
+            print(f"\nThat is a search rather than a proof. "
+                  f"{len(pinned)} holding{'s' if many else ''} worth "
+                  f"{frozen:,.0f} EUR cannot receive new money, so past some "
+                  f"amount more cash dilutes {'them' if many else 'it'} "
+                  f"towards a zero risk share faster than it evens the rest "
+                  f"out, and the floor starts rising again. Every amount named "
+                  f"above does reach what it claims; what a pinned holding "
+                  f"costs is the guarantee that nothing smaller would.")
     return 0
 
 

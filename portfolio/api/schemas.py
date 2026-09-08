@@ -668,3 +668,81 @@ class ErrorOut(BaseModel):
 
 
 HoldingDetail.model_rebuild()
+
+
+# --------------------------------------------------------------------------
+# Directing new money
+# --------------------------------------------------------------------------
+
+
+class AllocateRequest(BaseModel):
+    amount: float                                 # new cash, base currency
+    target: float | None = None                   # also: what would this cost?
+
+
+class AllocationPurchase(BaseModel):
+    isin: str
+    name: str
+    broker: str
+    shares: int
+    price: float
+    amount: float
+    cost: float
+    weight_before: float
+    weight_after: float
+    risk_before: float
+    risk_after: float
+
+
+class AllocationDestination(BaseModel):
+    """What the whole purchase in one holding would do, and what it would cost.
+
+    `cost` is null when the broker has no published fee for an order that
+    size, which is a refusal rather than a zero.
+    """
+    isin: str
+    name: str
+    dispersion: float
+    cost: float | None
+    improvement: float
+    per_euro: float | None
+
+
+class AllocationRefusal(BaseModel):
+    isin: str
+    name: str
+    reason: str
+
+
+class AllocationOut(BaseModel):
+    cash: float
+    invested: float
+    leftover: float
+    book_value: float
+    purchases: list[AllocationPurchase]
+    destinations: list[AllocationDestination]
+    refused: list[AllocationRefusal]
+    # Three floors, not one: where the book is, the best reachable with this
+    # much money, and the best reachable if selling were allowed.
+    dispersion_now: float
+    dispersion_after: float
+    floor_at_cash: float
+    floor_unlimited: float
+    rounding_penalty: float
+    closable: float
+    cost_parts: dict[str, float]
+    total_cost: float
+    meaningful_cash: float | None
+    best_worst_gap: float
+    assumptions: list[str]
+    target: float | None = None
+    # `cash_for_target` is null when no purchase the search considered reaches
+    # the target; `best_reachable` and `best_reachable_cash` then say what the
+    # best is and roughly what it would take, because "no" on its own is not a
+    # decision. `pinned` names the holdings that cannot receive new money --
+    # the reason the floor stops falling and starts rising, and the reason the
+    # amount above is the smallest found rather than provably the smallest.
+    cash_for_target: float | None = None
+    best_reachable: float | None = None
+    best_reachable_cash: float | None = None
+    pinned: list[str] = []

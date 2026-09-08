@@ -382,6 +382,79 @@ class TestSimulate:
         assert client.post("/api/simulate", json={}).status_code == 400
 
 
+class TestAllocate:
+    """Directing new money, over HTTP.
+
+    The route computes nothing itself -- that is the point of it, since a
+    second implementation for the screen would be a second answer to defend --
+    so these check the wiring and the two things the route does decide: which
+    holdings new money may enter, and that the covariance is the analysis's
+    own rather than a matrix assembled here.
+    """
+
+    def test_it_answers_with_an_executable_order(self, client):
+        r = client.post("/api/allocate", json={"amount": 5000})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["purchases"]
+        assert all(p["shares"] > 0 and p["amount"] > 0 for p in body["purchases"])
+        assert body["invested"] <= 5000.0 + 1e-6
+        assert body["invested"] + body["leftover"] == pytest.approx(5000.0)
+
+    def test_the_three_floors_come_back_ordered(self, client):
+        body = client.post("/api/allocate", json={"amount": 5000}).json()
+        assert body["floor_unlimited"] <= body["floor_at_cash"] + 1e-9
+        assert body["floor_at_cash"] <= body["dispersion_after"] + 1e-9
+        assert body["dispersion_after"] <= body["dispersion_now"] + 1e-9
+
+    def test_it_never_proposes_a_sale(self, client):
+        """`b >= 0` is a constraint of the problem, not a preference, and the
+        screen must not be the one place it stops holding."""
+        for amount in (200, 5000, 60_000):
+            body = client.post("/api/allocate", json={"amount": amount}).json()
+            assert all(p["shares"] > 0 for p in body["purchases"])
+
+    def test_a_reachable_target_names_an_amount(self, client):
+        first = client.post("/api/allocate", json={"amount": 5000}).json()
+        # Between the floor at 5,000 EUR and the book as it stands, so it is
+        # reachable by construction and costs something to reach. Hardcoding a
+        # level here would be a test of the seed data, not of the route.
+        target = 0.5 * (first["floor_at_cash"] + first["dispersion_now"])
+        body = client.post("/api/allocate",
+                           json={"amount": 5000, "target": target}).json()
+        assert body["cash_for_target"] is not None
+        assert 0 < body["cash_for_target"] <= 5000.0
+        assert body["best_reachable"] is None, (
+            "the fallback is for the unreachable case only")
+
+    def test_an_unreachable_target_names_the_best_that_is_reachable(self, client):
+        """"No" on its own is not a decision, and with a pinned holding it is
+        not even "as much as possible": there is a best amount."""
+        body = client.post("/api/allocate",
+                           json={"amount": 5000, "target": 1.0}).json()
+        assert body["cash_for_target"] is None
+        assert body["best_reachable"] > 1.0
+        assert body["best_reachable_cash"] > 0
+
+    def test_a_holding_that_cannot_receive_new_money_is_named(self, client):
+        """It is the reason the floor stops falling and starts rising, so a
+        report that omits it cannot explain its own numbers."""
+        body = client.post("/api/allocate", json={"amount": 5000}).json()
+        assert body["pinned"]
+        assert body["refused"]
+
+    def test_no_target_asked_means_no_target_answered(self, client):
+        body = client.post("/api/allocate", json={"amount": 5000}).json()
+        assert body["target"] is None
+        assert body["cash_for_target"] is None
+        assert body["best_reachable"] is None
+
+    @pytest.mark.parametrize("amount", [0, -100, 10 ** 12])
+    def test_an_impossible_amount_is_400(self, client, amount):
+        assert client.post("/api/allocate",
+                           json={"amount": amount}).status_code == 400
+
+
 class TestClient_:
     def test_index_is_served_at_root_and_for_unknown_paths(self, client):
         from portfolio.api.app import WEB_DIR
