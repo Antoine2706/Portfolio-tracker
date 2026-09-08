@@ -321,11 +321,28 @@ pattern is now the most reliable predictor of where the next one is.
 | 6 | the risk-share dispersion of a book | a rank statistic on two holdings of six, while the solver minimised a different function entirely |
 | 7 | the volatility of two portfolios | the cash flowing into them, and a refusal to rank them justified by *"nearly the same portfolio"* for series correlating at 0.363 |
 | 8 | a gap worth closing | 1e-17 of solver residual, because the threshold was compared against exact zero and answered differently on two machines |
+| 9 | a two-standard-error test that a spread is real | one standard error, because `SE(s) = SE(s²)/2s` makes `s ≥ 2·SE(s)` identical to `\|s²\| ≥ SE(s²)`; it claimed a spread in 32% of samples that had none |
+| 10 | a Newey-West correction absorbing the per-bar series' overlap | nothing — the autocorrelation is −0.003 ± 0.002 — while adding up to 15% of noise to a single sample's error bar |
+| 11 | *"the i.i.d. standard error fails this control"* | a control that in fact passes at every lag, in a sentence written before the measurement it describes |
+| 12 | an instrument's bid-ask spread, on the fixture | a discontinuity the fixture's own bar generator left at the close-to-open boundary, which is exactly where the estimator reads its bounce |
 
-Three of the eight were false sentences rather than false numbers (5, 7, and
-the "the structure cannot be fixed by contributions" that overclaimed what a
-search had established). Prose is not exempt from the standard and gets no
+Four of the twelve were false sentences rather than false numbers (5, 7, 11,
+and the "the structure cannot be fixed by contributions" that overclaimed what
+a search had established). Prose is not exempt from the standard and gets no
 review by default, which is why it is where they survive.
+
+#11 deserves its own line because of *where* it was. It was not a claim about
+a result; it was a claim about a **check** — a docstring asserting that a
+control discriminated, in a file whose entire purpose is to insist that checks
+be shown to bite. Written from the structural argument, before running it. The
+argument was reasonable and the measurement disagreed, which is the whole
+reason to run one.
+
+#9 and #10 are the same lesson from opposite sides. Both came from arguments
+that were sound in form: consecutive terms share a bar, *therefore* correlate;
+two standard errors *is* two standard errors. Both were wrong, and neither was
+findable by reading — only by generating data where the answer was known and
+looking at how often the rule fired.
 
 The working rules that fall out of it, in the order they pay off:
 
@@ -335,10 +352,21 @@ The working rules that fall out of it, in the order they pay off:
 2. **Compare a threshold against a scale, never against zero or an absolute.**
    #8 and the scale-dependent "meaningful purchase" threshold are the same
    error at different magnitudes.
-3. **Measure what you are about to assert.** #7's ρ, not "nearly the same".
+3. **Measure what you are about to assert.** #7's ρ, not "nearly the same";
+   #10's autocorrelation, not "they share a bar so they must correlate";
+   #11's control, not the argument for it.
 4. **Prove the check bites.** Half these were caught by a control that could
    fail; a fixture that passes whether or not the fix is in is not a test, and
-   two of the fixtures here had silently become that.
+   three of the fixtures here had silently become that.
+5. **Apply a significance test on the scale where the sampling distribution is
+   symmetric.** #9 survived because `s` and `s²` carry the same information
+   and only one of them can be centred on zero. A transformation that looks
+   like relabelling can halve a threshold.
+6. **A generator that produces data for a validated estimator is itself
+   unvalidated.** #12 was found only because the estimator had already been
+   calibrated against something else, so a disagreement pointed at the
+   fixture. Had both been written together, they would have agreed on the
+   wrong answer.
 
 ## Why not Streamlit any more
 
