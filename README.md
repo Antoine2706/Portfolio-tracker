@@ -64,11 +64,52 @@ portfolio/
   api/     FastAPI: one cached snapshot per (mode, benchmark, lookback),
            invalidated by ledger writes or an explicit refresh. Projects only.
   web/     Zero-build single-page client: Preact + htm + ECharts, vendored.
+  agents/  Decision policies. A policy is an object with one method, not a
+           language model: it sees a point-in-time view and returns target
+           weights with a written reason. Includes the trading cost model.
+  eval/    The walk-forward harness, the statistics that say whether a result
+           means anything, the pre-registration log, and the controls that
+           calibrate all of it.
 ```
 
 The layering is enforced by tests, not by convention: `core/` cannot import a
-web framework or a network client, and `api/` cannot import numpy. See
+web framework or a network client, `api/` cannot import numpy, and `agents/`
+cannot import `eval/` — a policy that could tell it was being backtested
+could behave differently there. See
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the contract between layers.
+
+## Evaluating a strategy
+
+```bash
+portfolio controls          # calibrate the harness before trusting a result
+```
+
+A backtest produces a confident Sharpe ratio whether or not it is measuring
+anything, so the harness is calibrated before any strategy is run against it:
+
+| Control | What it proves |
+|---|---|
+| **Negative** | A no-skill policy with matched turnover, over 200 seeds. The harness must show no edge, reject a true null at close to 5%, and produce t-statistics with standard deviation 1 — a standard error wrong by a factor shows up here as its reciprocal. |
+| **Positive** | A policy given a known probability of foreseeing the next bar, in a world where its true Sharpe is available in closed form. The measured figure must match the injected one. Without this, "we found no edge" and "we could not have found an edge" are the same sentence. |
+| **Canary** | A policy that decides today using tomorrow's close. It must produce an absurd Sharpe. If it does not, the data feed leaks. |
+| **Leak detector** | Rewrites every price after a date and re-runs. Everything decided before it must be bit-identical. It also refuses to run when wired so that it could not fail. |
+
+Costs are mandatory, not optional: `walk_forward` takes a cost model, and the
+one in `agents/execution.py` is side-aware because some taxes are charged on
+purchases only. The benchmark is always buy-and-hold of the portfolio you
+already own, since that is the actual alternative to any policy.
+
+Every statistic is reported with its uncertainty. A Sharpe ratio the sample
+cannot establish is reported as undetermined, with the track record length
+that *would* establish it — a true annual Sharpe of 0.5 needs sixteen years
+of daily data to reach t = 2, and the tool says so rather than printing a
+number. Attempts are pre-registered in `research/registry.jsonl`, because the
+deflated Sharpe ratio takes the number of attempts as an argument and a count
+that omits the failures is not a count.
+
+Paper trading only. Automatic execution on a real account is portfolio
+management under MiFID II; `portfolio/tests/test_paper_only.py` fails if a
+live broker endpoint appears anywhere in the repository.
 
 Performance: every network call goes through a thread pool and an on-disk
 cache; history is fetched incrementally and quotes expire after 15 minutes.

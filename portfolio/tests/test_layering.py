@@ -144,6 +144,86 @@ def test_app_does_not_reach_into_private_helpers(path):
         f"it belongs in the module's public interface.")
 
 
+# --------------------------------------------------------------------------
+# The evaluation layer
+# --------------------------------------------------------------------------
+# `agents/` holds decision policies and `eval/` the harness that measures
+# them. Two rules matter here, and only one of them is obvious.
+#
+# The obvious one: neither may reach the network or a UI framework. A policy
+# that fetched a price would be untestable and non-reproducible, and a
+# backtest that fetched anything would give a different answer on Tuesday.
+#
+# The one that actually matters: `agents/` may not import `eval/`. A policy
+# must not be able to tell that it is being backtested. If it could, it could
+# behave differently under evaluation than in production -- which is the
+# single most expensive bug available in this domain, because the backtest
+# would be measuring something that will never happen. So `agents/` defines
+# both its input type (MarketView) and its output type (Proposal), `eval/`
+# imports `agents/`, and the arrow never points back.
+
+AGENTS = pathlib.Path(__file__).resolve().parents[1] / "agents"
+EVAL = pathlib.Path(__file__).resolve().parents[1] / "eval"
+
+FORBIDDEN_IN_EVALUATION = {
+    "streamlit", "fastapi", "starlette", "pydantic",
+    "requests", "httpx", "urllib", "urllib3", "http", "socket",
+    "yfinance", "aiohttp", "sqlite3",
+}
+
+AGENT_FILES = sorted(AGENTS.glob("*.py"))
+EVAL_FILES = sorted(EVAL.glob("*.py"))
+
+
+def test_evaluation_layer_has_modules_to_check():
+    assert AGENT_FILES and EVAL_FILES, (
+        "no agents/ or eval/ modules found; these guards would pass vacuously")
+
+
+@pytest.mark.parametrize("path", AGENT_FILES + EVAL_FILES, ids=lambda p: p.name)
+def test_evaluation_layer_is_offline(path):
+    offenders = imported_modules(path) & FORBIDDEN_IN_EVALUATION
+    assert not offenders, (
+        f"{path.name} imports {sorted(offenders)}. A policy or a backtest that "
+        f"reaches the network is not reproducible, and a result that cannot be "
+        f"reproduced is not a result.")
+
+
+@pytest.mark.parametrize("path", AGENT_FILES, ids=lambda p: p.name)
+def test_agents_do_not_know_they_are_being_evaluated(path):
+    bad = {m for m in imported_modules(path) if m.lstrip(".") == "eval"}
+    assert not bad, (
+        f"{path.name} imports from eval/. A policy that can tell it is inside "
+        f"a backtest can behave differently there, and then the backtest "
+        f"measures something that will never happen in production.")
+
+
+def test_the_layering_guard_actually_bites(tmp_path):
+    """Sabotage, because a guard that has never failed proves nothing.
+
+    This project has hit the same class of bug three times: a check that
+    looked like it worked without exercising what it claimed. The rule here
+    is that no guard is trusted until it has been shown to fail on a file
+    that violates it.
+    """
+    offender = tmp_path / "leaky_policy.py"
+    offender.write_text(
+        "import requests\n"
+        "from ..eval.harness import walk_forward\n", encoding="utf-8")
+    found = imported_modules(offender)
+    assert found & FORBIDDEN_IN_EVALUATION == {"requests"}, (
+        "the network guard did not flag a deliberate `import requests`")
+    assert {m for m in found if m.lstrip(".") == "eval"}, (
+        "the arrow-direction guard did not flag a deliberate import of eval/")
+
+    clean = tmp_path / "clean_policy.py"
+    clean.write_text(
+        "import numpy as np\n"
+        "from ..agents.base import Proposal\n", encoding="utf-8")
+    assert not imported_modules(clean) & FORBIDDEN_IN_EVALUATION, (
+        "the guard flags a clean file, so it is not testing what it claims")
+
+
 def test_data_layer_may_use_the_network_but_core_may_not():
     """A sanity check that the rule is about layering, not about banning HTTP.
 

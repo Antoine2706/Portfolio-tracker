@@ -29,6 +29,14 @@ jobs:
       - name: Run the suite (API tests skip themselves without fastapi)
         run: pytest
 
+      # The backtest harness is only worth having if it discriminates, and
+      # that is a property of the running code rather than of any one test.
+      # This fails the build if the no-skill control starts showing an edge,
+      # if the known injected edge stops being recovered, or if the
+      # look-ahead canary goes quiet.
+      - name: The harness must still discriminate
+        run: portfolio controls --quick
+
   install:
     # A clean clone must install and launch, offline. The fixture provider
     # means this job proves the application, not the runner's network.

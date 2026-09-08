@@ -17,18 +17,66 @@ portfolio/
   web/       Static single-page application (Preact + htm + ECharts, vendored,
              zero build step). Renders JSON from api/. Computes nothing beyond
              formatting and client-side sorting/filtering.
+  agents/    Decision policies and the trading cost model. Pure: numpy +
+             pandas + core. Defines both its input type (MarketView) and its
+             output type (Proposal). May NOT import eval/.
+  eval/      The walk-forward harness, track-record statistics, the
+             pre-registration log, the controls that calibrate the harness and
+             the look-ahead detector. Pure; imports core and agents.
+  broker/    Paper trading only, and does not exist yet -- see the build
+             order. A test fails if a live endpoint string appears anywhere.
   tests/     No network (sockets are blocked), no UI framework required for
              core tests. API tests use FastAPI's TestClient + FixtureProvider.
 ```
 
-Dependency arrows point inward: `web -> api -> data -> core`. `core` never
-imports from `data` or `api`; `api` never imports numpy or scipy (the layering
-tests enforce both with `ast`).
+Dependency arrows point inward: `web -> api -> data -> core` and
+`eval -> agents -> core`. `core` never imports from `data` or `api`; `api`
+never imports numpy or scipy; `agents` never imports `eval` (the layering
+tests enforce all of it with `ast`).
+
+That last arrow is the one that is easy to get backwards and expensive to get
+wrong. A policy must not be able to tell that it is being backtested, because
+a policy that can tell could behave differently under evaluation than in
+production -- and then the backtest measures something that will never
+happen. So the evaluation layer knows about policies; policies know nothing
+about evaluation.
 
 Run it: `pip install -e ".[app,data]"` then `portfolio serve` (opens the
 browser at http://127.0.0.1:8765). `portfolio serve --provider fixture` runs a
 fully offline demo with deterministic synthetic prices. `PORTFOLIO_DATA_MODE`
 selects `seed` (demo) or `user` (your data), default `seed`.
+
+## The evaluation contract
+
+`eval/` exists to answer a different question from the rest of the codebase.
+The tracker answers "what is my portfolio worth and how risky is it". The
+harness answers "would I have been able to tell whether a strategy worked",
+which has different failure modes: it produces a confident number whether or
+not it is measuring anything.
+
+Three rules follow, and each is enforced rather than documented.
+
+**The future is absent, not filtered.** A policy is handed a `MarketView`
+built by slicing the price panel at the decision date. The rest of the panel
+is not in the object, so there is no check to forget. `eval/leakage.py`
+rewrites every price after a date and re-runs; everything decided before it
+must come back bit-identical. It also raises rather than passing when it is
+wired so that it could not fail.
+
+**Costs are an argument, not an option.** `walk_forward` takes a cost model.
+`agents/execution.py` makes every parameter a named field -- commission with
+its minimum, half-spread, slippage, FX, and transaction taxes -- and takes a
+trade side, because some taxes are charged on purchases only. A strategy that
+is profitable gross and unprofitable net is the most common false positive in
+this field, and a harness that cannot produce that finding is not measuring.
+
+**Nothing is reported that the sample cannot support.** `eval/metrics.py`
+carries the standard error, the probabilistic and deflated Sharpe ratios and
+the minimum track record length, all with the third and fourth moments rather
+than a normality assumption. Where the window is too short, the verdict says
+so and gives the window that would suffice. The deflation takes the number of
+attempts from `research/registry.jsonl`, which is append-only for the same
+reason the ledger is.
 
 ## Why not Streamlit any more
 

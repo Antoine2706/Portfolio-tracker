@@ -41,5 +41,10 @@ include = ["portfolio*"]
 portfolio = ["web/**/*", "data_store/seed/*"]
 
 [tool.pytest.ini_options]
-testpaths = ["portfolio/tests", "portfolio/core"]
+# core/, eval/ and agents/ are collected for their doctests as well as their
+# tests: the worked numeric examples in the statistics are the check that the
+# formulae are the ones the papers state, and a doctest nobody runs is a
+# comment.
+testpaths = ["portfolio/tests", "portfolio/core", "portfolio/eval",
+             "portfolio/agents"]
 addopts = "-q --doctest-modules --doctest-ignore-import-errors"

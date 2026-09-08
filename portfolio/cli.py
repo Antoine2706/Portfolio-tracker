@@ -4,6 +4,7 @@
     portfolio serve --mode user          # your own data
     portfolio serve --provider fixture   # fully offline demo, synthetic prices
     portfolio check                      # run the core test suite
+    portfolio controls                   # calibrate the backtest harness
 
 Deliberately thin: argument parsing and process startup only. Every decision
 about data lives in `api.services`.
@@ -59,6 +60,83 @@ def _check(_: argparse.Namespace) -> int:
     return int(pytest.main(["-q"]))
 
 
+# Written here rather than generated, because a pre-registration is a
+# statement of what was expected *before* the run, and text derived from the
+# result is not that.
+CONTROL_HYPOTHESES = {
+    "negative control": (
+        "A policy that ignores every price, trading at the same turnover as a "
+        "real one, has no edge; the harness should say so."),
+    "positive control": (
+        "A policy given a known probability of foreseeing the next period has "
+        "a Sharpe ratio available in closed form; the harness should recover "
+        "it within sampling error."),
+    "look-ahead canary": (
+        "A policy that decides using tomorrow's close should produce a Sharpe "
+        "ratio far outside anything achievable, and be flagged as implausible."),
+    "leak detector": (
+        "Rewriting every price after a date should leave every decision taken "
+        "before it unchanged, and should not leave them unchanged for a policy "
+        "that reads ahead."),
+}
+
+CONTROL_EXPECTATIONS = {
+    "negative control": (
+        "No significant edge, a rejection rate near the nominal 5%, and "
+        "t-statistics with standard deviation 1. A spread far from 1 would "
+        "mean the standard error formula is wrong."),
+    "positive control": (
+        "Measured Sharpe within roughly two standard errors of the injected "
+        "one at every skill level, including zero."),
+    "look-ahead canary": (
+        "An annualised Sharpe above 10, flagged suspicious. Anything quieter "
+        "means the future is not reaching the strategy and the test proves "
+        "nothing."),
+    "leak detector": (
+        "Silent on a clean policy, loud on a peeking one, and refusing to run "
+        "when wired so that it could not fail."),
+}
+
+
+def _controls(args: argparse.Namespace) -> int:
+    """Calibrate the harness and print the result.
+
+    This is the gate on everything else in the evaluation work: until the
+    three controls pass, a backtest result is a number with nothing behind
+    it. Exits non-zero when any control fails, so it can be a CI step.
+    """
+    from .eval.controls import NEGATIVE_CONTROL_SEEDS, run_calibration
+
+    if args.quick:
+        report = run_calibration(seeds=args.seeds or 40, periods=700,
+                                 warmup=126, positive_seeds=6)
+    else:
+        report = run_calibration(seeds=args.seeds or NEGATIVE_CONTROL_SEEDS)
+    print("\n".join(report.lines()))
+
+    if args.register:
+        from .eval.registry import Preregistration, Registry, TrialResult
+        registry = Registry()
+        for outcome in report.outcomes:
+            trial = registry.register(Preregistration(
+                hypothesis=CONTROL_HYPOTHESES[outcome.name.split(" - ")[0]],
+                policy=outcome.name.split(" - ")[0],
+                parameters=outcome.numbers,
+                success_criterion=outcome.name.split(" - ")[-1],
+                expected_outcome=CONTROL_EXPECTATIONS[outcome.name.split(" - ")[0]],
+                is_control=True))
+            registry.record(TrialResult(
+                trial_id=trial.id,
+                sharpe_per_period=outcome.numbers.get("mean_sharpe"),
+                observations=int(outcome.numbers.get("seeds", 0)),
+                independent_observations=int(outcome.numbers.get("seeds", 0)),
+                verdict="passed" if outcome.passed else "FAILED",
+                met_criterion=outcome.passed))
+        print()
+        print(f"Registered in {registry.path}: {registry.summary()}")
+    return 0 if report.passed else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="portfolio",
                                      description="Portfolio risk tracker")
@@ -80,6 +158,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     check = sub.add_parser("check", help="run the test suite")
     check.set_defaults(func=_check)
+
+    controls = sub.add_parser(
+        "controls",
+        help="run the three harness controls and report whether it discriminates")
+    controls.add_argument("--seeds", type=int, default=None,
+                          help="negative-control runs (default 200; see the "
+                               "note on the upper bound in eval/controls.py)")
+    controls.add_argument("--quick", action="store_true",
+                          help="a smaller, faster version for a sanity check")
+    controls.add_argument("--register", action="store_true",
+                          help="append the controls to the pre-registration log")
+    controls.set_defaults(func=_controls)
     return parser
 
 
