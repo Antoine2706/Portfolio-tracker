@@ -1,7 +1,8 @@
 /* Hash router.
    Routes (docs/ARCHITECTURE.md, web contract):
      #/overview (default) · #/holdings · #/holdings/:isin (drawer over holdings)
-     #/performance · #/risk · #/simulator · #/instruments · #/transactions · #/settings
+     #/performance · #/risk · #/simulator · #/allocate · #/instruments · #/transactions
+     #/settings
    plus #/kitchensink (component gallery for developers). */
 
 import { useStore, app } from "/static/lib/store.js";
@@ -12,6 +13,7 @@ export const ROUTES = [
   { page: "performance",  path: "/performance",  label: "Performance",  key: "p" },
   { page: "risk",         path: "/risk",         label: "Risk",         key: "r" },
   { page: "simulator",    path: "/simulator",    label: "Simulator",    key: "s" },
+  { page: "allocate",     path: "/allocate",     label: "Allocate",     key: "a" },
   { page: "instruments",  path: "/instruments",  label: "Instruments",  key: "i" },
   { page: "transactions", path: "/transactions", label: "Transactions", key: "t" },
   { page: "settings",     path: "/settings",     label: "Settings",     key: "," },

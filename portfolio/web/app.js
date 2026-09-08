@@ -90,6 +90,7 @@ const PALETTE_ACTIONS = [
   { id: "act:refresh", label: "Refresh prices", sub: "bypass the 15-minute quote cache", group: "Actions", icon: "refresh", keywords: "reload fetch quotes", run: doRefresh },
   { id: "act:theme", label: "Toggle theme", sub: "dark / light", group: "Actions", icon: "sun", keywords: "dark light mode appearance", run: () => toggleTheme() },
   { id: "act:mode", label: "Switch to demo / live data", sub: "seed ↔ user", group: "Actions", icon: "layers", keywords: "seed user demo live mode data", run: switchMode },
+  { id: "act:allocate", label: "Direct new money", sub: "where should a purchase go", group: "Actions", icon: "wallet", keywords: "allocate buy purchase contribute cash new money", run: () => navigate("/allocate") },
   { id: "act:add-tx", label: "Add transaction", group: "Actions", icon: "plus", keywords: "buy sell dividend fee ledger new", run: () => navigate("/transactions?new=1") },
   { id: "act:add-instr", label: "Add instrument", group: "Actions", icon: "plus", keywords: "isin resolve new universe", run: () => navigate("/instruments?new=1") },
   { id: "act:sidebar", label: "Toggle sidebar", group: "Actions", icon: "sidebar", hint: ["["], keywords: "collapse expand nav", run: () => setSidebarCollapsed(!app.get().sidebarCollapsed) },

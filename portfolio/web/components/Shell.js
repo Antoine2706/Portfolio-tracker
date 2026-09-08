@@ -15,7 +15,7 @@ import { toggleTheme } from "/static/lib/theme.js";
 import { refreshPrices, errorMessage } from "/static/lib/api.js";
 import * as fmt from "/static/lib/format.js";
 
-const ICONS = { overview: "overview", holdings: "holdings", performance: "performance", risk: "risk", simulator: "simulator", instruments: "instruments", transactions: "transactions", settings: "settings" };
+const ICONS = { overview: "overview", holdings: "holdings", performance: "performance", risk: "risk", simulator: "simulator", allocate: "wallet", instruments: "instruments", transactions: "transactions", settings: "settings" };
 
 function BrandMark() {
   return html`<svg width="16" height="16" viewBox="0 0 16 16" fill="none" aria-hidden="true">

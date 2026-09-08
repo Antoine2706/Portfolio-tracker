@@ -659,14 +659,61 @@ class TestWhatItReports:
         assert "what selling could reach" in text
         assert "of the gap between the book as it stands" in text
 
-    def test_it_says_when_the_destination_hardly_matters(self):
+    def test_it_says_when_a_purchase_hardly_moves_the_book(self):
         cov, values, prices = book(6, 3)
         tiny = allocate_buy_only(values=values, prices=prices, cov=cov,
                                  cash=25.0, costs=free_costs(cov.columns),
                                  buyable=set(cov.columns))
-        text = "\n".join(tiny.lines())
-        assert ("does not much matter where this goes" in text
-                or "Where this goes matters" in text)
+        assert "hardly moves the book" in "\n".join(tiny.lines())
+
+    def test_and_says_it_when_one_does(self):
+        text = "\n".join(allocate(n=6, seed=3, cash=20_000.0).lines())
+        assert "This moves the book" in text
+        assert "of the gap to equal risk contribution" in text
+
+    def test_how_much_the_choice_is_worth_is_a_separate_sentence(self):
+        """Merging the two once printed "where this goes matters" directly
+        above "closes 2.3% of the gap". A purchase too small to move the book
+        can still have a destination worth avoiding, and the reverse."""
+        for cash in (25.0, 5000.0):
+            text = "\n".join(allocate(n=6, seed=3, cash=cash).lines())
+            assert "Best and worst destinations differ by" in text
+            assert "so the choice is worth" in text
+
+    def test_the_threshold_is_a_share_of_the_gap_not_an_absolute(self):
+        """A book at a dispersion of 15 and one at 1.5 must be asked the same
+        question. As an absolute 0.05 the threshold asked for a third of the
+        whole gap on the second and 0.3% of it on the first, and duly called
+        197 EUR "meaningful" on a book that purchase moved by 2%.
+        """
+        cov, values, _ = book(6, 3)
+        keys = [str(c) for c in cov.columns]
+        costs, buyable = free_costs(keys), set(keys)
+        held = np.array([values[k] for k in keys])
+        threshold = smallest_meaningful_cash(values=values, cov=cov,
+                                             costs=costs, buyable=buyable)
+        assert threshold is not None
+        # Scale every variance by 100: dispersion is homogeneous of degree
+        # zero in the covariance, so the book is *identical* in the units that
+        # matter and the answer must not move.
+        scaled = cov * 100.0
+        assert dispersion_of(held, scaled) == pytest.approx(
+            dispersion_of(held, cov))
+        assert smallest_meaningful_cash(
+            values=values, cov=scaled, costs=costs,
+            buyable=buyable) == pytest.approx(threshold, rel=1e-9)
+
+    def test_a_book_already_at_equal_risk_has_no_threshold(self):
+        """There is no gap to close, so no purchase closes a share of it and
+        the honest answer is that the destination never matters."""
+        from portfolio.agents.risk import equal_risk_weights
+        cov, _, _ = book(5, 3)
+        keys = [str(c) for c in cov.columns]
+        weights = equal_risk_weights(cov)
+        values = {k: 10_000.0 * float(weights[k]) for k in keys}
+        assert smallest_meaningful_cash(values=values, cov=cov,
+                                        costs=free_costs(keys),
+                                        buyable=set(keys)) is None
 
     def _hedged_allocation(self, cash=5000.0, names=None):
         """An allocation on a book with a hedge in it, optionally with two

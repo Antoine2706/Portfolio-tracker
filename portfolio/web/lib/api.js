@@ -157,10 +157,13 @@ export const voidTransaction = (id, reason = "") => api.post(`/transactions/${en
 export const previewImport = (text, mapping) => api.post("/transactions/import/preview", mapping ? { text, mapping } : { text });
 export const runImport = (text, mapping) => api.post("/transactions/import", mapping ? { text, mapping } : { text });
 
-/* ---------------- simulator, benchmarks, exports ---------------- */
+/* ---------------- simulator, allocator, benchmarks, exports ---------------- */
 
 /** simulate({changes} | {targets} | {preset}, include?, min_trade?) */
 export const simulate = (body) => api.post("/simulate", body);
+/** allocate({amount, target?}) — where a purchase of `amount` should go, buy-only. */
+export const allocate = (body) => api.post("/allocate", body);
+
 export const listBenchmarks = () => api.get("/benchmarks");
 
 export const exportTransactionsCsv = () => api.download("/export/transactions.csv", "transactions.csv");

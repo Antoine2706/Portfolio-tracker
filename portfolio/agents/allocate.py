@@ -815,20 +815,29 @@ class BuyOnlyAllocation:
     def lines(self) -> list[str]:
         names = self._labels([*self.purchases, *self.destinations])
         out = [f"Directing {self.cash:,.0f} EUR of new money", "=" * 64, ""]
+        # Two different questions, kept apart because merging them once
+        # printed "where this goes matters" beside "closes 2.3% of the gap".
+        # How much the purchase MOVES the book is the threshold below; how
+        # much the CHOICE is worth is the best-worst spread, and a purchase
+        # too small to matter can still have a destination worth avoiding.
         if self.meaningful_cash is None:
             out.append("No purchase of any size meaningfully changes the risk "
                        "shares of this book.")
         elif self.cash < self.meaningful_cash:
             out.append(
-                f"At {self.cash:,.0f} EUR it does not much matter where this "
-                f"goes: the best and worst destinations differ by "
-                f"{self.best_worst_gap:.3f} of dispersion. The smallest "
-                f"purchase that moves it meaningfully is about "
+                f"At {self.cash:,.0f} EUR this hardly moves the book: the best "
+                f"any purchase this size reaches is {self.floor_at_cash:.4f} "
+                f"against {self.dispersion_now:.4f} now. The smallest purchase "
+                f"that closes a worthwhile share of the gap is about "
                 f"{self.meaningful_cash:,.0f} EUR.")
         else:
             out.append(
-                f"Where this goes matters: best and worst destinations differ "
-                f"by {self.best_worst_gap:.3f} of dispersion.")
+                f"This moves the book: {self.cash:,.0f} EUR closes "
+                f"{self.closable:.1%} of the gap to equal risk contribution.")
+        out.append(
+            f"Best and worst destinations differ by "
+            f"{self.best_worst_gap:.3f} of dispersion, so the choice is worth "
+            f"{'making' if self.best_worst_gap > 0.01 else 'almost nothing'}.")
         out += ["", "Order", "-" * 64]
         if not self.purchases:
             out.append("  nothing to buy")
@@ -1154,15 +1163,32 @@ def smallest_meaningful_cash(*, values: "dict[str, float]", cov: pd.DataFrame,
                              costs, buyable: "set[str] | frozenset[str]",
                              among=None, improvement: float = 0.05
                              ) -> "float | None":
-    """The purchase below which the destination hardly matters.
+    """The purchase below which this hardly moves the book.
 
-    Defined as the smallest amount whose best reachable dispersion is
-    `improvement` better than the book as it stands, in the units the metric
-    is reported in. Answering "if I type 200 EUR, does it matter where it
-    goes" with a number rather than a shrug.
+    The smallest amount whose best reachable dispersion closes `improvement`
+    of the gap between the book as it stands and what selling could reach.
+    Answering "if I type 200 EUR, does this do anything" with a number rather
+    than a shrug.
+
+    `improvement` is a *fraction of that gap*, not an absolute number of
+    dispersion units, and the difference is not pedantry. As an absolute
+    threshold of 0.05 it read as scale-free and was not: on a book sitting at
+    a dispersion of 1.5 it asked for a third of the whole gap, while on the
+    demo book at 15.07 it asked for 0.3% of it and duly reported that 197 EUR
+    "meaningfully changes" a book that purchase moves by 2%. A threshold whose
+    meaning depends on how bad the book already is answers a different
+    question on every book it is applied to.
+
+    None when there is no gap to close -- the book is already at equal risk
+    contribution, so no purchase improves it and the honest answer is that
+    the destination does not matter at any size.
     """
     now = dispersion_of(
         np.array([float(values.get(str(c), 0.0)) for c in cov.columns]),
         cov, among)
-    return cash_for_dispersion(now - improvement, values=values, cov=cov,
-                               costs=costs, buyable=buyable, among=among)
+    room = now - unconstrained_floor(cov, among)
+    if not (room > 0):                    # also catches a nan from a bad cov
+        return None
+    return cash_for_dispersion(now - improvement * room, values=values,
+                               cov=cov, costs=costs, buyable=buyable,
+                               among=among)

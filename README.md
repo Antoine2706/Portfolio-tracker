@@ -35,6 +35,7 @@ deterministic synthetic prices.
 | **Performance** | Time-weighted and money-weighted (XIRR) returns, benchmark comparison, drawdown, monthly and calendar-year returns, contribution by holding, rolling volatility and beta, Sharpe / Sortino / Calmar. |
 | **Risk** | Capital share against risk share (component contribution to volatility), effective number of holdings, diversification ratio, beta against a named benchmark, value at risk (historical, parametric, Cornish-Fisher) and expected shortfall, worst periods, stress scenarios, the correlation grid, and correlation **clusters** — the group a pairwise grid cannot see. |
 | **Simulator** | Add or remove money from any holding or watchlist instrument, set target weights, or apply equal-weight / risk-parity / minimum-variance presets, and see volatility, effective holdings and every risk share move before you trade. Produces the trade list. |
+| **Allocate** | Where a purchase should go, buy-only. Type an amount; get whole shares per holding with the risk shares before and after, what it costs split into tax, spread and commission, and — first, before any table of destinations — whether the amount moves the book at all. |
 | **Instruments** | Add by ISIN: resolved via OpenFIGI, every listing probed, US ticker collisions refused outright, thin and stale series flagged. Nothing is saved until you confirm the listing you saw. |
 | **Transactions** | Append-only ledger. Corrections are voids, never edits. CSV import with column detection (European decimal commas and semicolons included) and duplicate detection. CSV and Excel export. |
 
@@ -153,9 +154,21 @@ book of 17,000* — and when the answer is that nothing reaches it, it says
 what the best reachable is and at what amount, because "no" on its own is
 not a decision. And it says when the destination hardly matters:
 
-> At 500 EUR it does not much matter where this goes: the best and worst
-> destinations differ by 0.115 of dispersion. The smallest purchase that
-> moves it meaningfully is about 647 EUR.
+> At 200 EUR this hardly moves the book: the best any purchase this size
+> reaches is 24.4355 against 25.1094 now. The smallest purchase that closes a
+> worthwhile share of the gap is about 390 EUR.
+>
+> Best and worst destinations differ by 1.824 of dispersion, so the choice is
+> worth making.
+
+Two sentences, because they answer different questions and merging them once
+printed *where this goes matters* directly above *closes 2.3% of the gap*: how
+much the purchase moves the book, and how much the choice of destination is
+worth. A purchase too small to matter can still have a destination worth
+avoiding. The threshold is a **share of the gap** to equal risk contribution
+rather than an absolute number of dispersion units — as an absolute 0.05 it
+asked for a third of the whole gap on a book sitting at 1.5 and 0.3% of it on a
+book at 15, which is a different question on every book it is applied to.
 
 Whole shares only, with the rounding penalty shown against the continuous
 optimum; per-broker minimum trade sizes derived from each fee schedule; and a

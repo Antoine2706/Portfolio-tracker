@@ -610,6 +610,7 @@ and that file is the source of truth for field names. Errors are
 | POST | /transactions/import | `{text, mapping?}` -> `{imported}` |
 | GET | /export/transactions.csv, /export/holdings.csv, /export/workbook.xlsx | downloads |
 | POST | /simulate | `{changes}` or `{targets}` or `{preset}` -> SimulationResult + trades |
+| POST | /allocate | `{amount, target?}` -> buy-only order, four floors, destinations, refusals |
 | GET | /benchmarks | list |
 
 `GET /` and any non-API path serve `web/index.html`; `/static/*` serves `web/`.
@@ -617,10 +618,21 @@ and that file is the source of truth for field names. Errors are
 ## web contract
 
 Hash routes: `#/overview` (default), `#/holdings`, `#/holdings/{isin}`,
-`#/performance`, `#/risk`, `#/simulator`, `#/instruments`, `#/transactions`,
-`#/settings`. Files: `web/index.html`, `web/app.js` (shell + router),
+`#/performance`, `#/risk`, `#/simulator`, `#/allocate`, `#/instruments`,
+`#/transactions`, `#/settings`. Files: `web/index.html`, `web/app.js` (shell + router),
 `web/pages/*.js`, `web/components/*.js`, `web/lib/{api,format,charts,theme,store}.js`,
 `web/styles/*.css`, `web/vendor/*` (ECharts 5.6, Preact+htm standalone, Inter).
+
+`#/allocate` is the one page that answers a decision rather than describing a
+state, and its order is the argument. The headline says whether the amount moves
+the book at all — if 200 EUR does not, that sentence comes *before* any table of
+destinations, since a table printed first implies the choice is worth making.
+Beside it, and deliberately separate, is what the choice itself is worth: the two
+were once merged and printed "where this goes matters" directly above "closes
+2.3% of the gap". Then four floors rather than one, the whole-share order, what
+each destination costs against what it buys, and what was refused. It computes
+nothing: every figure is one POST to `/allocate`, which runs the same
+`agents.allocate` the CLI runs and the replay evaluates.
 
 Design principles carried over from the Streamlit version, because they were
 right: colour is reserved for state (green = gain, red = loss, amber = warning)

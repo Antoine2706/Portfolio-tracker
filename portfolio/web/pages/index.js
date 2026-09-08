@@ -7,6 +7,7 @@ import HoldingsPage from "/static/pages/holdings.js";
 import PerformancePage from "/static/pages/performance.js";
 import RiskPage from "/static/pages/risk.js";
 import SimulatorPage from "/static/pages/simulator.js";
+import AllocatePage from "/static/pages/allocate.js";
 import InstrumentsPage from "/static/pages/instruments.js";
 import TransactionsPage from "/static/pages/transactions.js";
 import SettingsPage from "/static/pages/settings.js";
@@ -19,6 +20,7 @@ export const pages = {
   performance: PerformancePage,
   risk: RiskPage,
   simulator: SimulatorPage,
+  allocate: AllocatePage,
   instruments: InstrumentsPage,
   transactions: TransactionsPage,
   settings: SettingsPage,
