@@ -178,6 +178,57 @@ that is what makes the test possible at all. Normality is assumed there and
 declared, since the robust version needs a HAC estimator; the formula is
 checked against 20,000 Monte Carlo draws per correlation in the suite.
 
+## The buy-only allocator
+
+`agents/allocate.py`. Given new cash C and the book, choose `b ≥ 0` with
+`sum(b) = C` minimising the dispersion of the risk shares of `v + b`. Risk
+shares are homogeneous of degree zero, so the normalisation by `V + C` never
+has to appear.
+
+**It never proposes a sale.** `b ≥ 0` is a constraint of the problem, not a
+preference, and both the search and the order assert it. Both assertions
+caught real bugs on their first run: an affordability check hoisted out of the
+inner loop went stale the moment a move succeeded, drove one holding to
+−2,500 EUR of a 5,000 EUR purchase, and reached the order as a plausible 148
+shares of something the money could not buy.
+
+**The objective is not convex,** and saying so matters. The reported metric is
+`risk_contribution_spread` — a maximum minus a minimum — which is neither
+smooth nor convex; nor is the least-squares alternative, since risk shares are
+ratios of quadratics. The solve is therefore projected gradient descent on the
+smooth surrogate to *generate candidates*, and a multi-resolution pattern
+search on the reported metric to *choose between them*. Descending on the
+surrogate and calling its answer the floor was measurably beaten by a coarse
+brute-force grid: least squares equalises four holdings and abandons the
+fifth, while a range prefers lifting the laggards. The result is labelled
+"best found", and `test_allocate.py` checks it against a dense grid.
+
+**The floor is monotone in the cash**, because every lower bound `v_i/(V+C)`
+falls as C rises, so the reachable sets nest. That is what makes
+`cash_for_dispersion` bisectable — and it is checked on the solver rather than
+assumed of it, since a search that stuck at one amount and not another would
+break the bisection while the mathematics stayed true.
+
+**Whole shares, then the report.** Solve continuously; drop any holding whose
+allocation falls below its own broker's minimum economic trade, or above the
+largest order that broker has a published fee for, and solve again without it;
+only then round down and spend the remainder greedily. Every reported figure
+is recomputed on the executable order, and the continuous optimum appears once
+as the floor so the rounding penalty is visible rather than absorbed.
+
+`Instrument.buyable` is separate from `Instrument.tradeable`. The gold ETC
+forces them apart: it cannot be rebalanced against the rest of the book, and a
+fresh purchase at its broker is an ordinary order.
+
+`eval/replay.py` evaluates it by re-running the real ledger with only the
+destination changed — same dates, same amounts, so neither arm pays extra
+turnover. Dispersion is computed and carries no sampling error; volatility is
+estimated and carries its own. The whole-share remainder is carried to the
+next purchase, because over a ledger it compounded to 6.5% of the money and
+would otherwise leave one arm quietly part in cash. The replay is checked for
+look-ahead the same way the harness is: rewrite every price after a date and
+require every earlier decision back unchanged.
+
 ## Why not Streamlit any more
 
 Every widget interaction re-ran the whole script, re-derived every position and

@@ -8,6 +8,7 @@
     portfolio instruments set ISIN ...   # record a broker, a tax band, a freeze
     portfolio controls                   # calibrate the backtest harness
     portfolio backtest erc               # equal risk contribution vs buy-and-hold
+    portfolio allocate 5000              # where new money should go
 
 Deliberately thin: argument parsing and process startup only. Every decision
 about data lives in `api.services`.
@@ -150,7 +151,8 @@ def _backtest(args: argparse.Namespace) -> int:
     on no contract note.
     """
     from .eval.registry import Preregistration, Registry, TrialResult
-    from .research import load_book, run_equal_risk_contribution
+    from .research import (load_book, replay_the_ledger,
+                           run_equal_risk_contribution)
 
     try:
         book = load_book(mode=args.mode, data_root=args.data_root,
@@ -159,6 +161,21 @@ def _backtest(args: argparse.Namespace) -> int:
     except Exception as exc:                       # noqa: BLE001 - reported, not raised
         print(f"Could not load the book: {exc}", file=sys.stderr)
         return 2
+
+    if args.policy == "allocator":
+        # Not registered as a trial: the allocator makes no claim about
+        # returns, so it consumes none of the deflation budget that exists to
+        # keep return claims honest. Its claim is about risk structure, and
+        # that is computed rather than estimated.
+        try:
+            replay = replay_the_ledger(book, mode=args.mode,
+                                       data_root=args.data_root,
+                                       lookback=args.lookback)
+        except ValueError as exc:
+            print(f"Could not replay the ledger: {exc}", file=sys.stderr)
+            return 2
+        print("\n".join(replay.lines()))
+        return 0
 
     if args.register and args.provider == "fixture":
         print("Refusing to register a run on synthetic prices. The trial count "
@@ -373,6 +390,50 @@ def _instruments(args: argparse.Namespace) -> int:
     return 0
 
 
+def _allocate(args: argparse.Namespace) -> int:
+    """Where a purchase of new money should go.
+
+    No sale is ever proposed, so this is the only rebalancing channel in an
+    account with no regular contribution and no leverage: the purchase was
+    going to happen anyway, and choosing its destination costs nothing extra.
+    """
+    from .research import allocate_new_money, load_book
+
+    try:
+        book = load_book(mode=args.mode, data_root=args.data_root,
+                         provider=args.provider, lookback=args.history,
+                         account_value=args.account_value)
+    except Exception as exc:                       # noqa: BLE001 - reported, not raised
+        print(f"Could not load the book: {exc}", file=sys.stderr)
+        return 2
+    if args.amount <= 0:
+        print("an amount to invest is needed, and it has to be positive",
+              file=sys.stderr)
+        return 2
+
+    allocation = allocate_new_money(book, args.amount, lookback=args.lookback)
+    print("\n".join(allocation.lines()))
+    if args.target is not None:
+        from .agents.allocate import cash_for_dispersion
+        from .core.returns import simple_returns
+        from .core.risk import covariance_matrix
+        window = simple_returns(book.panel.closes).dropna().iloc[-args.lookback:]
+        needed = cash_for_dispersion(
+            args.target, values=book.values, cov=covariance_matrix(window),
+            costs=book.costs, buyable=book.buyable)
+        print()
+        if needed is None:
+            print(f"No purchase reaches a dispersion of {args.target:.2f} "
+                  f"buy-only, at any size this tool will consider. The "
+                  f"structure cannot be fixed by contributions; the real "
+                  f"choice is whether to sell.")
+        else:
+            print(f"Reaching a dispersion of {args.target:.2f} buy-only would "
+                  f"take about {needed:,.0f} EUR of new money, against a book "
+                  f"of {sum(book.values.values()):,.0f} EUR.")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="portfolio",
                                      description="Portfolio risk tracker")
@@ -459,8 +520,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     backtest = sub.add_parser(
         "backtest", help="evaluate a policy against buy-and-hold on your book")
-    backtest.add_argument("policy", choices=["erc"],
-                          help="erc = equal risk contribution")
+    backtest.add_argument("policy", choices=["erc", "allocator"],
+                          help="erc = equal risk contribution; allocator = "
+                               "replay your real purchases with only the "
+                               "destination changed")
     backtest.add_argument("--mode", choices=["seed", "user"], default="user")
     backtest.add_argument("--provider", choices=["yfinance", "fixture"],
                           default="yfinance",
@@ -484,6 +547,25 @@ def build_parser() -> argparse.ArgumentParser:
     backtest.add_argument("--register", action="store_true",
                           help="append this attempt to the pre-registration log")
     backtest.set_defaults(func=_backtest)
+
+    allocate = sub.add_parser(
+        "allocate",
+        help="where a purchase of new money should go, so risk shares even out")
+    allocate.add_argument("amount", type=float,
+                          help="how much new money there is, in EUR")
+    allocate.add_argument("--mode", choices=["seed", "user"], default="user")
+    allocate.add_argument("--provider", choices=["yfinance", "fixture"],
+                          default="yfinance")
+    allocate.add_argument("--data-root", default=None)
+    allocate.add_argument("--lookback", type=int, default=252,
+                          help="covariance window, in trading days")
+    allocate.add_argument("--history", type=int, default=750,
+                          help="price history to load, in rows")
+    allocate.add_argument("--account-value", type=float, default=None)
+    allocate.add_argument("--target", type=float, default=None,
+                          help="also answer: how much would reaching this "
+                               "dispersion take, buy-only?")
+    allocate.set_defaults(func=_allocate)
     return parser
 
 

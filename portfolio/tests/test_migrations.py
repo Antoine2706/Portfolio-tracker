@@ -360,8 +360,9 @@ class TestTheNoticeClaimsOnlyWhatApplies:
             self, tmp_path):
         text = OLD_SCHEMA.replace(
             "note\n", "note,tradeable,tob_rate,tob_observed,half_spread_bps,"
-                      "spread_observed,buy_tax_rate\n")
-        text = text.replace(",true,,\n", ",true,,,true,0.0012,true,,false,0\n")
+                      "spread_observed,buy_tax_rate,buyable\n")
+        text = text.replace(",true,,\n",
+                            ",true,,,true,0.0012,true,,false,0,true\n")
         store = store_with(tmp_path, text)
         store.load_instruments()
         printed = "\n".join(store.last_migration.lines())

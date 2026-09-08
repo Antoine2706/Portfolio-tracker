@@ -290,6 +290,16 @@ class Instrument:
     # something that looks like a measurement.
     broker: str = ""                         # "" = not recorded
     tradeable: bool = True                   # False = weight is exogenous
+    # Whether NEW money may go into it, which is a different question from
+    # whether its weight can be rebalanced against the rest of the book.
+    # The gold ETC at the second broker is the case that forces them apart:
+    # moving weight between it and the others means a cash transfer between
+    # institutions taking about a week, so `tradeable` is False -- but a fresh
+    # purchase there is an ordinary order at that broker, so `buyable` is
+    # True. Reading one flag as the other gets the constraint wrong in one
+    # direction or the other: either the allocator proposes a rebalance that
+    # cannot settle, or it refuses a purchase that is perfectly available.
+    buyable: bool = True                     # False = new money may not go in
     tob_rate: float | None = None            # transaction tax, each way
     tob_observed: bool = False               # read off a contract note?
     half_spread_bps: float | None = None     # paid inside the execution price

@@ -130,6 +130,48 @@ refused to.
 portfolio backtest erc      # equal risk contribution against buy-and-hold
 ```
 
+### Directing new money
+
+```bash
+portfolio allocate 5000                 # where a purchase should go
+portfolio allocate 5000 --target 1.0    # and: what would reaching 1.0 take?
+portfolio backtest allocator            # replay your real purchases
+```
+
+In an account with no regular contribution and no leverage, a scheduled
+rebalance is a sell plus a buy — tax and spread twice, for every unit of
+drift removed. New money is the one rebalancing channel that costs nothing
+extra, because the purchase was going to happen anyway. So the allocator
+chooses **where** it goes, subject to `b ≥ 0`: it never proposes a sale.
+
+Buy-only can only reduce an overweight risk share by dilution, so the output
+carries three numbers rather than one — where the book is now, the best
+reachable *with this much money*, and the best reachable if selling were
+allowed. It answers the inverted question too, which is usually the
+decision-relevant one: *no purchase of any size reaches that, so the choice
+is whether to sell*. And it says when the destination hardly matters:
+
+> At 500 EUR it does not much matter where this goes: the best and worst
+> destinations differ by 0.115 of dispersion. The smallest purchase that
+> moves it meaningfully is about 647 EUR.
+
+Whole shares only, with the rounding penalty shown against the continuous
+optimum; per-broker minimum trade sizes derived from each fee schedule; and a
+table of what each destination would cost against what it would buy, so a
+wide-spread holding cannot quietly consume the improvement it delivers.
+
+`buyable` is a separate flag from `tradeable`. A holding at a second broker
+cannot be rebalanced against the rest of the book but can be bought with new
+money perfectly well; reading one flag as the other gets the constraint wrong
+in one direction or the other.
+
+The allocator is evaluated by **replaying the real ledger** — same dates,
+same amounts, destination changed — because its claim is about risk
+structure, not return. Dispersion is computed rather than estimated, so that
+comparison carries no sampling error; realised volatility is estimated and
+carries its standard error, and with eight purchases the report says plainly
+that it is not a ranking.
+
 reports the policy gross, net and against the benchmark, then the **breakeven
 turnover** — the level at which the gross edge is entirely consumed by the
 trading it takes to capture it. That is the decision criterion, and it

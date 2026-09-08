@@ -70,7 +70,10 @@ INSTRUMENT_COLUMNS = ["isin", "name", "short_name", "issuer", "asset_class",
                       # where it is held and what trading it costs; appended
                       # so a CSV written by an older build still loads
                       "broker", "tradeable", "tob_rate", "tob_observed",
-                      "half_spread_bps", "spread_observed", "buy_tax_rate"]
+                      "half_spread_bps", "spread_observed", "buy_tax_rate",
+                      # whether NEW money may go in, which is not the same
+                      # question as whether the weight can be rebalanced
+                      "buyable"]
 
 
 def _opt_float(raw: str | None) -> float | None:
@@ -180,6 +183,7 @@ class DataStore:
                     note=row.get("note", ""),
                     broker=row.get("broker", "") or "",
                     tradeable=_bool(row.get("tradeable"), default=True),
+                    buyable=_bool(row.get("buyable"), default=True),
                     tob_rate=_opt_float(row.get("tob_rate")),
                     tob_observed=_bool(row.get("tob_observed")),
                     half_spread_bps=_opt_float(row.get("half_spread_bps")),
@@ -246,6 +250,7 @@ class DataStore:
                     "note": inst.note.replace("\n", "; "),
                     "broker": inst.broker,
                     "tradeable": "true" if inst.tradeable else "false",
+                    "buyable": "true" if inst.buyable else "false",
                     "tob_rate": "" if inst.tob_rate is None else inst.tob_rate,
                     "tob_observed": "true" if inst.tob_observed else "false",
                     "half_spread_bps": ("" if inst.half_spread_bps is None

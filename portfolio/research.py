@@ -54,7 +54,8 @@ from .data.store import DataMode, DataStore
 from .eval.harness import Execution, Panel, buy_and_hold, walk_forward
 from .eval.report import Comparison, compare
 
-__all__ = ["Book", "load_book", "run_equal_risk_contribution"]
+__all__ = ["Book", "load_book", "run_equal_risk_contribution",
+           "allocate_new_money", "replay_the_ledger"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -67,6 +68,13 @@ class Book:
     frozen: dict[str, float]             # non-tradeable holdings at held weight
     instruments: dict
     notes: tuple[str, ...]
+    # For the buy-only allocator, which works in euros rather than weights: a
+    # purchase is a number of shares at a price, and the whole point of it is
+    # that it cannot be expressed as a weight change without also saying how
+    # much money there is.
+    values: dict[str, float] = dataclasses.field(default_factory=dict)
+    prices: dict[str, float] = dataclasses.field(default_factory=dict)
+    buyable: frozenset = frozenset()
 
     @property
     def account_value(self) -> float:
@@ -180,9 +188,38 @@ def load_book(*, mode: str = "user", data_root: "pathlib.Path | None" = None,
     if unpriced:
         notes.append(f"not in the panel (too little price history): "
                      f"{', '.join(sorted(unpriced))}")
+    # Euro values and share prices, for the allocator. Values come from the
+    # same positions the weights did; prices from the last close in the panel,
+    # so a purchase is priced off the same series the risk model is estimated
+    # from rather than off a quote that arrived at a different moment.
+    values = {isin: float(w) * (value or 0.0) for isin, w in held.items()}
+    prices = {str(c): float(closes[c].dropna().iloc[-1])
+              for c in closes.columns if closes[c].notna().any()}
+    buyable = frozenset(isin for isin in closes.columns
+                        if instruments[isin].buyable)
+
     return Book(panel=Panel(closes=closes), weights=held, costs=costs,
                 tradeable=tradeable, frozen=frozen, instruments=instruments,
-                notes=tuple(notes))
+                notes=tuple(notes), values=values, prices=prices,
+                buyable=buyable)
+
+
+def allocate_new_money(book: Book, cash: float, *, lookback: int = 252):
+    """Where a purchase of `cash` should go, on this book.
+
+    The covariance comes through the same estimator and window the equal risk
+    policy uses, because this is the same claim about the same quantity: it
+    forecasts nothing and reads only the covariance matrix. A second estimator
+    for the same purpose would be a second answer to defend.
+    """
+    from .agents.allocate import allocate_buy_only
+    from .core.returns import simple_returns
+    from .core.risk import covariance_matrix
+
+    window = simple_returns(book.panel.closes).dropna().iloc[-lookback:]
+    cov = covariance_matrix(window)
+    return allocate_buy_only(values=book.values, prices=book.prices, cov=cov,
+                             cash=cash, costs=book.costs, buyable=book.buyable)
 
 
 def run_equal_risk_contribution(book: Book, *, lookback: int = 252,
@@ -244,3 +281,30 @@ def run_equal_risk_contribution(book: Book, *, lookback: int = 252,
     return compare(result, benchmark, cost_model=book.costs, trials=trials,
                    trial_sharpe_sd=trial_sharpe_sd, overlap=rebalance_every,
                    weights=book.weights, constraint_notes=tuple(notes))
+
+
+def replay_the_ledger(book: Book, *, mode: str = "user",
+                      data_root: "pathlib.Path | None" = None,
+                      lookback: int = 252, warmup: int = 60):
+    """Re-run the real purchases with only the destination changed.
+
+    The dates and the amounts are the ledger's, so both arms spend the same
+    money on the same days and neither pays extra turnover. What differs is
+    where it went, which is the only thing the allocator chooses.
+    """
+    from .core.models import TransactionType
+    from .eval.replay import replay_purchases
+
+    root = pathlib.Path(data_root) if data_root else None
+    store = DataStore.open(DataMode(mode), root=root)
+    buys = [(t.date, t.isin, float(t.quantity))
+            for t in store.load_transactions()
+            if t.type is TransactionType.BUY
+            and t.isin in book.panel.closes.columns]
+    if not buys:
+        raise ValueError(
+            "the ledger has no purchases in instruments the panel covers, so "
+            "there is nothing to replay.")
+    return replay_purchases(book.panel.closes, sorted(buys),
+                            costs=book.costs, buyable=book.buyable,
+                            lookback=lookback, warmup=warmup)

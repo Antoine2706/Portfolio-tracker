@@ -438,37 +438,70 @@ class CostModel:
         """
         return self.broker_for(isin).minimum_economic_trade(self.max_trade_cost_bps)
 
-    def instrument_cost(self, isin: str, value: float, side: str = "buy") -> float:
-        """Cost of trading `value` euros of one instrument, in euros."""
+    def cost_breakdown(self, isin: str, value: float,
+                       side: str = "buy") -> "dict[str, float]":
+        """The same charge, split into what a reader can act on.
+
+        Commission is a fact about the broker, tax about the instrument's
+        band, and spread is the estimate. Anything choosing *between*
+        instruments needs them apart: a wide-spread holding and a
+        high-tax one are expensive for different reasons and only one of
+        the two is negotiable by trading differently.
+
+        >>> m = CostModel(per_instrument={"X": InstrumentCost()})
+        >>> {k: round(v, 4) for k, v in m.cost_breakdown("X", 1000.0).items()}
+        {'commission': 0.0, 'tax': 1.2, 'spread': 0.8, 'slippage': 0.2, 'fx': 0.0}
+        """
+        parts = self._components(isin, value, side)
+        return {k: float(v) for k, v in parts.items()}
+
+    def _components(self, isin: str, value: float,
+                    side: str) -> "dict[str, float]":
         if value <= 0:
-            return 0.0
+            return {"commission": 0.0, "tax": 0.0, "spread": 0.0,
+                    "slippage": 0.0, "fx": 0.0}
         if side not in ("buy", "sell"):
             raise ValueError(f"side must be 'buy' or 'sell', got {side!r}")
         facts = self.facts(isin)
-
         if facts.tob_rate is None:
-            # Say what is known and nothing more. The ETC clause is attached
-            # only when the instrument actually is one; asserting it about
-            # every unpriced holding was how a missing rate on a property ETF
-            # came to be reported as a fact about debt securities.
-            why = ""
-            if (facts.asset_class or "").strip().upper() == "ETC":
-                why = (" It is an ETC, a debt security rather than a fund, so "
-                       "it does not automatically take a fund's band.")
-            raise UnknownCost(
-                f"no transaction tax rate is recorded for "
-                f"{facts.describe(isin)}, so a trade in it cannot be priced."
-                f"{why} Read the rate off a contract note for this instrument "
-                f"and record it with: portfolio instruments set {isin} "
-                f"--tob-rate <rate> --observed")
-
-        commission = self.broker_for(isin).commission(value)
-        spread = value * (facts.half_spread_bps + self.slippage_bps) / 10_000.0
-        fx = value * self.fx_spread_bps / 10_000.0 if facts.needs_fx else 0.0
+            self._refuse(isin, facts)
         tax = min(value * facts.tob_rate, self.tob_cap)
         if side == "buy":
             tax += value * facts.buy_tax_rate
-        return float(commission + spread + fx + tax)
+        return {
+            "commission": float(self.broker_for(isin).commission(value)),
+            "tax": float(tax),
+            "spread": float(value * facts.half_spread_bps / 10_000.0),
+            "slippage": float(value * self.slippage_bps / 10_000.0),
+            "fx": float(value * self.fx_spread_bps / 10_000.0
+                        if facts.needs_fx else 0.0),
+        }
+
+    def _refuse(self, isin: str, facts) -> None:
+        # Say what is known and nothing more. The ETC clause is attached
+        # only when the instrument actually is one; asserting it about
+        # every unpriced holding was how a missing rate on a property ETF
+        # came to be reported as a fact about debt securities.
+        why = ""
+        if (facts.asset_class or "").strip().upper() == "ETC":
+            why = (" It is an ETC, a debt security rather than a fund, so "
+                   "it does not automatically take a fund's band.")
+        raise UnknownCost(
+            f"no transaction tax rate is recorded for "
+            f"{facts.describe(isin)}, so a trade in it cannot be priced."
+            f"{why} Read the rate off a contract note for this instrument "
+            f"and record it with: portfolio instruments set {isin} "
+            f"--tob-rate <rate> --observed")
+
+    def instrument_cost(self, isin: str, value: float, side: str = "buy") -> float:
+        """Cost of trading `value` euros of one instrument, in euros.
+
+        The total of `cost_breakdown`, and computed through it rather than
+        beside it: two implementations of one charge is how the headline
+        figure and the itemised one come to disagree by a basis point that
+        nobody can explain.
+        """
+        return float(sum(self._components(isin, value, side).values()))
 
     def cost(self, turnover: float, before: dict[str, float],
              after: dict[str, float]) -> float:

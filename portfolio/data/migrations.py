@@ -71,7 +71,8 @@ __all__ = ["TRADING_COLUMNS", "OBSERVED_CONTRACT_NOTES", "Backfill",
 # The columns added after the first release. A file whose header lacks any of
 # them predates them and needs backfilling.
 TRADING_COLUMNS = ("broker", "tradeable", "tob_rate", "tob_observed",
-                   "half_spread_bps", "spread_observed", "buy_tax_rate")
+                   "half_spread_bps", "spread_observed", "buy_tax_rate",
+                   "buyable")
 
 
 @dataclasses.dataclass(frozen=True)
