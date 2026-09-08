@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from portfolio.agents.allocate import (allocate_buy_only,
+from portfolio.agents.allocate import (RESOLVED, allocate_buy_only,
                                        best_reachable_dispersion,
                                        cash_for_dispersion, dispersion_of,
                                        metric_on_arrays,
@@ -32,7 +32,8 @@ from portfolio.agents.allocate import (allocate_buy_only,
                                        pattern_search, pinned_holdings,
                                        project_onto_simplex,
                                        reachable_floor, risk_shares,
-                                       smallest_meaningful_cash)
+                                       smallest_meaningful_cash,
+                                       unconstrained_floor)
 from portfolio.agents.execution import CostModel, InstrumentCost
 
 BANKS, PROPERTY, SEMIS, SCHNEIDER, GOLD = (
@@ -703,17 +704,46 @@ class TestWhatItReports:
             values=values, cov=scaled, costs=costs,
             buyable=buyable) == pytest.approx(threshold, rel=1e-9)
 
-    def test_a_book_already_at_equal_risk_has_no_threshold(self):
-        """There is no gap to close, so no purchase closes a share of it and
-        the honest answer is that the destination never matters."""
+    def _at_equal_risk(self, nudge=0.0):
+        """A book sitting on the equal-risk weights, optionally pushed off."""
         from portfolio.agents.risk import equal_risk_weights
         cov, _, _ = book(5, 3)
         keys = [str(c) for c in cov.columns]
         weights = equal_risk_weights(cov)
         values = {k: 10_000.0 * float(weights[k]) for k in keys}
+        values[keys[0]] *= 1.0 + nudge
+        return cov, keys, values
+
+    def test_a_book_already_at_equal_risk_has_no_threshold(self):
+        """There is no gap to close, so no purchase closes a share of it and
+        the honest answer is that the destination never matters."""
+        cov, keys, values = self._at_equal_risk()
         assert smallest_meaningful_cash(values=values, cov=cov,
                                         costs=free_costs(keys),
                                         buyable=set(keys)) is None
+
+    def test_and_a_gap_the_solver_invented_is_not_a_gap(self):
+        """Both ends of the gap come out of the same iterative solver, so on a
+        book that IS at equal risk they differ by whatever the last bisection
+        left behind: exactly 0.0 on one machine and 1e-17 on another. Tested
+        against zero, the second machine reported that 100 EUR would close a
+        fifth of a gap seventeen orders of magnitude below anything real."""
+        cov, keys, values = self._at_equal_risk(nudge=1e-9)
+        held = np.array([values[k] for k in keys])
+        room = dispersion_of(held, cov) - unconstrained_floor(cov)
+        assert 0 < room < RESOLVED, (
+            "this fixture no longer sits inside the resolution, so it is not "
+            "exercising the guard")
+        assert smallest_meaningful_cash(values=values, cov=cov,
+                                        costs=free_costs(keys),
+                                        buyable=set(keys)) is None
+
+    def test_but_a_gap_above_the_resolution_is_answered(self):
+        """Otherwise the guard could swallow every book."""
+        cov, keys, values = self._at_equal_risk(nudge=1e-3)
+        assert smallest_meaningful_cash(values=values, cov=cov,
+                                        costs=free_costs(keys),
+                                        buyable=set(keys)) is not None
 
     def _hedged_allocation(self, cash=5000.0, names=None):
         """An allocation on a book with a hedge in it, optionally with two

@@ -134,6 +134,15 @@ __all__ = ["project_onto_simplex", "risk_shares", "dispersion_of",
            "best_reachable_dispersion", "smallest_meaningful_cash"]
 
 
+# Below this, a difference of two dispersions is the solver's residual rather
+# than a fact about the book. Dispersion is a dimensionless ratio and a real
+# one runs from about 0.01 to 25 on the books here, so 1e-6 is far under
+# anything meaningful and far over the 1e-17 that float arithmetic leaves
+# behind. It exists because a gap tested against exact zero answered
+# differently on two machines.
+RESOLVED = 1e-6
+
+
 def project_onto_simplex(y: np.ndarray, total: float) -> np.ndarray:
     """Euclidean projection onto { b : b >= 0, sum(b) = total }.
 
@@ -1182,12 +1191,21 @@ def smallest_meaningful_cash(*, values: "dict[str, float]", cov: pd.DataFrame,
     None when there is no gap to close -- the book is already at equal risk
     contribution, so no purchase improves it and the honest answer is that
     the destination does not matter at any size.
+
+    "No gap" is `RESOLVED`, not zero, and the difference is not cosmetic. Both
+    ends of the gap come out of the same iterative solver, so on a book that
+    *is* at equal risk they differ by whatever the last bisection left behind:
+    exactly 0.0 here, and 1e-17 on the CI runner's BLAS. Tested against zero,
+    that machine took a gap seventeen orders of magnitude below anything
+    measurable as real structure and reported that 100 EUR would close a fifth
+    of it. A guard that gives different answers on two machines is not
+    measuring the book.
     """
     now = dispersion_of(
         np.array([float(values.get(str(c), 0.0)) for c in cov.columns]),
         cov, among)
     room = now - unconstrained_floor(cov, among)
-    if not (room > 0):                    # also catches a nan from a bad cov
+    if not (room > RESOLVED):             # also catches a nan from a bad cov
         return None
     return cash_for_dispersion(now - improvement * room, values=values,
                                cov=cov, costs=costs, buyable=buyable,
