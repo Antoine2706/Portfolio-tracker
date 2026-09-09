@@ -150,22 +150,27 @@ class TestTheCheckBites:
 
 
 class TestTheServedDirectoryMatchesTheClone:
-    """The stale-install failure mode, caught before a browser is opened."""
+    """The stale-install failure mode, caught before a browser is opened.
+
+    Delegated to `portfolio.diagnostics`, which asks the question in the one
+    way that does not answer itself. `portfolio.__file__` reports the checkout
+    whenever it is consulted from the checkout, and so does a naive
+    `importlib.metadata` lookup, which finds the `*.egg-info` sitting there.
+    Both were used as evidence before either was tested; see Group A of the
+    architecture note.
+    """
 
     def test_every_page_in_the_repo_is_in_the_served_directory(self):
-        """`WEB_DIR` resolves through the imported package. If that is a copy
-        in site-packages rather than this clone, a page added since the last
-        `pip install .` is missing and nothing says so until a page is blank.
-        """
-        here = pathlib.Path(__file__).resolve().parents[2] / "web"
-        if here.resolve() == WEB_DIR.resolve():
-            pytest.skip("editable install: the served directory is the clone, "
-                        "so this comparison has nothing to say")
-        missing = sorted(
-            p.relative_to(here) for p in here.rglob("*.js")
-            if not (WEB_DIR / p.relative_to(here)).exists())
-        assert not missing, (
-            f"{len(missing)} file(s) in the repo are absent from the "
-            f"directory the app serves ({WEB_DIR}): {missing[:5]}. "
-            f"Reinstalling fixes today's; the failure mode returns with the "
-            f"next page added.")
+        from portfolio.diagnostics import inspect_installation
+        report = inspect_installation(web_dir=WEB_DIR)
+        if not report.served_is_a_snapshot:
+            pytest.skip("editable install: the served directory is the "
+                        "checkout, so this comparison has nothing to say")
+        assert report.healthy, "\n".join(report.lines())
+
+    def test_the_report_can_say_which_copy_is_running(self):
+        """Runs in both cases, because the value of the diagnostic is that it
+        answers at all -- the previous ones answered wrongly and silently."""
+        from portfolio.diagnostics import inspect_installation
+        text = "\n".join(inspect_installation(web_dir=WEB_DIR).lines())
+        assert "web client served" in text and str(WEB_DIR) in text

@@ -4,6 +4,7 @@
     portfolio serve --mode user          # your own data
     portfolio serve --provider fixture   # fully offline demo, synthetic prices
     portfolio check                      # run the core test suite
+    portfolio doctor                     # which copy is running, and what it serves
     portfolio instruments list           # where each holding is held, and its costs
     portfolio instruments set ISIN ...   # record a broker, a tax band, a freeze
     portfolio controls                   # calibrate the backtest harness
@@ -48,6 +49,24 @@ def _serve(args: argparse.Namespace) -> int:
     if args.data_root:
         os.environ["PORTFOLIO_DATA_ROOT"] = args.data_root
 
+    # Say which client is about to be served, before anything renders. A page
+    # whose module is missing from the served directory does not error: the
+    # browser gets the single-page shell back, fails on the MIME type, and
+    # shows nothing. One line here is the difference between that and a
+    # two-hour hunt through the browser cache.
+    from .diagnostics import inspect_installation
+    installed = inspect_installation()
+    if not installed.healthy:
+        print("", file=sys.stderr)
+        for line in installed.lines():
+            print(line, file=sys.stderr)
+        print("", file=sys.stderr)
+        print("Serving anyway. Pages listed above will render blank.",
+              file=sys.stderr)
+    elif installed.served_is_a_snapshot:
+        print(f"Client served from {installed.web_dir} (a copy, not this "
+              f"checkout).")
+
     url = f"http://{args.host}:{args.port}/"
     if not args.no_browser:
         # Open once the server is listening rather than racing it.
@@ -56,6 +75,20 @@ def _serve(args: argparse.Namespace) -> int:
     uvicorn.run("portfolio.api.app:create_app", factory=True, host=args.host,
                 port=args.port, reload=args.reload, log_level=args.log_level)
     return 0
+
+
+def _doctor(_: argparse.Namespace) -> int:
+    """Which copy of this package is running, and does it serve every page.
+
+    Exists because the obvious way to ask that question cannot answer it:
+    `python -c "import portfolio"` run from a checkout reports the checkout
+    whatever is installed, because `sys.path[0]` is the current directory.
+    The console script has no such problem, so run this rather than that.
+    """
+    from .diagnostics import inspect_installation
+    report = inspect_installation()
+    print("\n".join(report.lines()))
+    return 0 if report.healthy else 1
 
 
 def _check(_: argparse.Namespace) -> int:
@@ -644,6 +677,12 @@ def build_parser() -> argparse.ArgumentParser:
                         help="the label used on charts and in dense tables")
     setter.add_argument("--note", default=None)
     setter.set_defaults(func=_instruments)
+
+    doctor = sub.add_parser(
+        "doctor",
+        help="which copy of this package is running, and does it serve every "
+             "page")
+    doctor.set_defaults(func=_doctor)
 
     controls = sub.add_parser(
         "controls",
