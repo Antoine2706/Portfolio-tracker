@@ -275,8 +275,8 @@ function VarCard({ risk, base, total }) {
   return html`<${Card} class="col-6 risk-table" title="Value at risk" caption=${`Loss thresholds read from ${fmt.int(obs)} daily returns${total ? `, on ${fmt.money(total, base)} of priced holdings` : ""}. Ten-day figures scale the one-day ones by √10.`} flush>
     <${DataTable} columns=${columns} rows=${rows} rowKey="id" density="compact" caption="Value at risk by method, confidence and horizon" empty="No value at risk" />
     <div class="risk-note">
-      <strong>Historical</strong> is what the worst days of the window actually were: no distribution assumed, so it cannot see a loss the window never contained.
-      <strong>Parametric</strong> fits a normal distribution to the window's mean and volatility — smooth, and known to understate fat tails.
+      <strong>Historical</strong> is what the worst days of the window actually were: no distribution assumed, so it cannot see a loss the window never contained.${" "}
+      <strong>Parametric</strong> fits a normal distribution to the window's mean and volatility — smooth, and known to understate fat tails.${" "}
       <strong>Cornish-Fisher</strong> is parametric adjusted for the window's skew and kurtosis, so a fat left tail widens the loss. When the three disagree, the disagreement is the information.
     </div>
   <//>`;

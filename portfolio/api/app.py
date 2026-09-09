@@ -97,8 +97,28 @@ def create_app(config: Config | None = None) -> FastAPI:
 
         @app.get("/{path:path}", include_in_schema=False)
         async def spa(path: str):
+            """The client router owns every path that is not a file.
+
+            "Not a file" is load-bearing. This used to return `index.html` for
+            anything outside `/api/`, which meant a request for a missing
+            asset came back **200 with HTML**: a browser importing a module
+            and receiving `text/html` fails on the MIME type, so a file that
+            was simply absent presented as a blank page with no 404 anywhere
+            to find. `curl /pages/allocate.js` answered 200 whether or not the
+            file existed, which is a diagnostic that cannot fail.
+
+            A last segment with an extension is a request for a file. If the
+            static mount did not serve it, it is not there, and saying so is
+            the whole job.
+            """
             if path.startswith("api/"):
                 raise HTTPException(status_code=404, detail=f"no such endpoint: /{path}")
+            if "." in path.rsplit("/", 1)[-1]:
+                raise HTTPException(
+                    status_code=404,
+                    detail=(f"no such file: /{path}. If the client imports it, "
+                            f"it is missing from the directory this server "
+                            f"serves ({WEB_DIR})."))
             return FileResponse(WEB_DIR / "index.html")
 
     return app
