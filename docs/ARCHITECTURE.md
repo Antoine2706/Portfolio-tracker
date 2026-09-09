@@ -379,17 +379,35 @@ before rendering anything.
 | 10 | a Newey-West correction absorbing the per-bar series' overlap | nothing — the autocorrelation is −0.003 ± 0.002 — while adding up to 15% of noise to a single sample's error bar |
 | 11 | an instrument's bid-ask spread, on the fixture | a discontinuity the fixture's own bar generator left at the close-to-open boundary, which is exactly where the estimator reads its bounce |
 | 12 | an amount of new money, "10.000" | ten euros. The English convention hard-coded in a client-side parser, in a book kept in Belgium, while `data/importers.py` had the rule right all along |
+| 13 | *"the series has been adjusted for distributions"*, refusing all 7 holdings | float32. Yahoo sends prices as float32 and `100.06` arrives as `100.05999755859375`, so an exact-divisibility test against a tick fails on nearly every price. Four of the seven are accumulating ETFs that have never made a distribution, and the one that pays a dividend had the *highest* fit rate — the explanation was not merely unproven, its ordering was backwards |
 
 Three of Group B were false sentences rather than false numbers (5, 7, and the
 "the structure cannot be fixed by contributions" that overclaimed what a search
 had established). Prose is not exempt from the standard and gets no review by
 default, which is why it is where they survive.
 
-#12 is the only entry a user found rather than a control, and it is in Group B
-rather than Group A because the parser was never claimed to be a check. It
-shipped because nothing compared the client's arithmetic against the CSV
-importer's, which is a missing check of the ordinary kind rather than a dead
-one.
+#12 and #13 are the entries a user found rather than a control, and both are
+in Group B rather than Group A because neither artefact was claimed to be a
+check. #12 shipped because nothing compared the client's arithmetic against
+the CSV importer's.
+
+#13 is #5 again — *"an ETC is a debt security"* said of a property fund — and
+worth noting as a repeat: a confident, specific, untested cause attached to a
+**correct** refusal. The refusal was right; the reason sent the reader to look
+at dividends for an hour. The fix is not a better guess but a measurement: the
+residual distance from the grid separates the causes by three orders of
+magnitude (float32 leaves 2e-4 of a tick, a rescaling leaves 0.25), so
+`TickSize.why_not_a_grid` reports that number and names candidates rather than
+picking one. It also distinguishes a whole rescaled series from a partly
+rescaled one, which is what a split looks like.
+
+The near-miss is worth recording too. The first fix rounded prices to
+float32's seven significant figures, which produced values like `98.37599`
+that sit on the 0.0001 grid by construction: a dividend-adjusted series then
+"fitted" at 93.5% and the inference manufactured the grid it claimed to find.
+The real constraint is epistemic — **a grid finer than the data's own
+precision cannot be established from it** — so those candidates are now
+excluded rather than fitted.
 
 #9 and #10 are the same lesson from opposite sides. Both came from arguments
 that were sound in form: consecutive terms share a bar, *therefore* correlate;

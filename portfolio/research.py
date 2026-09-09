@@ -615,11 +615,18 @@ def survey_spreads(book: Book, *, mode: str = "user",
             # adjusted series is the wrong input to the estimator too, not
             # merely to the tick inference. Refuse rather than charge a number
             # derived from prices that never traded.
+            # The reason is whatever the residuals support, and no more. The
+            # previous version asserted "the series has been adjusted for
+            # distributions" on every miss. On a real book that fired on four
+            # accumulating ETFs, which have never made a distribution, while
+            # the one dividend-paying holding had the HIGHEST fit of the seven
+            # -- the ordering was backwards and it sent the reader to look at
+            # dividends. Same defect as the refusal that explained a property
+            # fund as a debt security: a confident, specific, untested cause
+            # attached to a real refusal.
             refused[isin] = (
                 f"the last {min(len(prices), TICK_WINDOW)} bars do not sit on "
-                f"any venue tick grid ({tick.agreement:.0%} of prices fit the "
-                f"best candidate). That means the series has been adjusted "
-                f"for distributions, and an adjusted price never traded")
+                f"any tick grid this can establish. {tick.why_not_a_grid()}")
             continue
         # An already-recorded observed spread wins, and the estimate is
         # reported beside it rather than discarded: two independent readings

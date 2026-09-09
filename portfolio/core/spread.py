@@ -539,10 +539,57 @@ class TickSize:
     size: float | None
     agreement: float
     prices: int
+    # Median distance from the best-fitting grid, in ticks. It is what tells
+    # the causes of a miss apart, and it is reported rather than interpreted
+    # into a sentence: see `why_not_a_grid`.
+    residual: float | None = None
 
     @property
     def usable(self) -> bool:
         return self.size is not None and self.agreement >= 0.98
+
+    def why_not_a_grid(self) -> str:
+        """What is known about a failed inference, and what is not.
+
+        The previous version of this message asserted "the series has been
+        adjusted for distributions" whenever the fit failed. On a real book
+        that fired on four accumulating ETFs, which have never made a
+        distribution and for which the explanation is impossible, while the
+        one genuinely dividend-paying holding had the *highest* fit rate of
+        the seven. The ordering was backwards and the explanation sent the
+        reader to look at dividends.
+
+        The residual is what distinguishes the candidates, and it does so by
+        three orders of magnitude, so this reports it and names only what it
+        supports. A multiplicative rescaling -- a dividend adjustment, a split
+        applied to part of the history, a currency conversion -- leaves prices
+        scattered uniformly across the grid, a median residual near a quarter
+        of a tick. A venue quoting finer than any candidate leaves a residual
+        that is small but structured. Neither is asserted without the number.
+        """
+        if self.usable:
+            return ""
+        fit = f"{self.agreement:.0%} of prices fit the closest candidate grid"
+        if self.residual is None:
+            return f"{fit}; too few prices to say more"
+        if self.residual > 0.1:
+            where = ("part of the series" if self.agreement > 0.4
+                     else "the series")
+            return (f"{fit}, and the rest miss it by a median of "
+                    f"{self.residual:.2f} of a tick -- scattered, not offset. "
+                    f"That is what a multiplicative rescaling does to "
+                    f"{where}: a dividend adjustment, a split applied to part "
+                    f"of the history, or a currency conversion. Which one is "
+                    f"not established here.")
+        if self.residual > 1e-3:
+            return (f"{fit}, missing by a median of {self.residual:.1e} of a "
+                    f"tick. Too small for a rescaling and too large for "
+                    f"floating point; the venue may quote finer than any "
+                    f"candidate in CANDIDATE_TICKS.")
+        return (f"{fit}, missing by a median of {self.residual:.1e} of a tick "
+                f"-- the scale of floating-point representation rather than of "
+                f"anything about the prices. Suspect the reader before the "
+                f"data.")
 
     def floor_bps(self, price: float) -> float | None:
         """The narrowest half-spread this tick permits, at `price`, in bps.
@@ -557,6 +604,32 @@ class TickSize:
         if not self.usable or price <= 0:
             return None
         return float(self.size / 2.0 * 10_000.0 / price)
+
+
+# Yahoo returns prices as float32 and pandas upcasts them, so 100.06 arrives
+# as 100.05999755859375. An exact-divisibility test against a tick then fails
+# on essentially every price: on a real book of seven holdings it produced fit
+# rates of 0, 1, 3, 3, 6, 8 and 25 per cent and refused all of them.
+FLOAT32_EPSILON = float(np.finfo(np.float32).eps)      # 1.19e-07
+
+# How much slack to allow for that, as a multiple of the representation error.
+# Four rather than one because the error compounds through the upcast and the
+# division, and because the thing this must NOT accept -- a multiplicative
+# rescaling -- misses by a quarter of a tick, three orders of magnitude away.
+FLOAT32_SLACK = 4.0
+
+# A grid finer than the data's own precision cannot be established from it.
+# At a price of 100 the float32 error is about 1.2e-5, so a 0.0001 grid is
+# unknowable: every price sits within a tenth of a tick of it whatever the
+# venue actually quotes. Candidates below this multiple of the representation
+# error are not tested, because "fits" there means only "the data is too
+# coarse to say otherwise".
+#
+# This was found the wrong way round first. Rounding prices to float32's seven
+# significant figures instead produced values like 98.37599, which sit on the
+# 0.0001 grid by construction: a dividend-adjusted series then "fitted" at
+# 93.5% and the inference manufactured the grid it claimed to find.
+MIN_RESOLVABLE_TICKS = 20.0
 
 
 def infer_tick_size(prices: np.ndarray, *,
@@ -589,25 +662,41 @@ def infer_tick_size(prices: np.ndarray, *,
     clean = np.asarray(prices, dtype=float)
     clean = clean[np.isfinite(clean) & (clean > 0)]
     if clean.size < 10:
-        return TickSize(None, 0.0, int(clean.size))
+        return TickSize(None, 0.0, int(clean.size), residual=None)
 
-    best: tuple[float, float] | None = None
+    # The absolute uncertainty float32 leaves on each price.
+    precision = clean * FLOAT32_EPSILON
+    floor = float(np.median(precision)) * MIN_RESOLVABLE_TICKS
+
+    best: tuple[float, float, float] | None = None
     for tick in sorted(candidates, reverse=True):
-        # A price is on the grid if it is within a millionth of a multiple.
-        # The slack absorbs binary floating point, not a genuine mismatch:
-        # 0.1 + 0.2 is not 0.3 in any of this.
+        if tick < floor:
+            break                 # finer than the data can establish
         residual = np.abs(clean / tick - np.round(clean / tick))
-        agreement = float(np.mean(residual < 1e-6))
+        # Slack is the representation error expressed in ticks, per price:
+        # coarse grids barely need it, fine ones need more, and a rescaling
+        # misses by a quarter of a tick and is refused at every scale.
+        allowed = precision * FLOAT32_SLACK / tick
+        fits = residual <= allowed
+        agreement = float(np.mean(fits))
+        # Median over the prices that did NOT fit. Over all of them it is the
+        # wrong statistic for a series only partly off-grid: a split applied
+        # to the older third leaves two thirds fitting exactly, so the overall
+        # median is zero and the message reads "floating point" for a series
+        # that has plainly been rescaled.
+        missed = residual[~fits]
+        typical = float(np.median(missed)) if missed.size else 0.0
         if agreement >= 0.98:
-            best = (tick, agreement)
+            best = (tick, agreement, typical)
             break
         if best is None or agreement > best[1]:
-            best = (tick, agreement)
+            best = (tick, agreement, typical)
 
-    assert best is not None
-    size, agreement = best
+    if best is None:              # every candidate was below the floor
+        return TickSize(None, 0.0, int(clean.size), residual=None)
+    size, agreement, typical = best
     return TickSize(size if agreement >= 0.98 else None, agreement,
-                    int(clean.size))
+                    int(clean.size), residual=typical)
 
 
 # --------------------------------------------------------------------------

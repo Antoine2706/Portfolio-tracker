@@ -469,3 +469,99 @@ class TestAnAdjustedSeriesIsDetected:
         frame[:, :500] /= 3.0                       # a 3:1 split, 300 bars ago
         assert not infer_tick_size(frame.ravel()).usable
         assert infer_tick_size(frame[:, -250:].ravel()).usable
+
+
+class TestTheTickSurvivesTheWireFormat:
+    """Yahoo returns float32. The first version of the inference did not.
+
+    On a real seven-holding book it rejected every instrument with fit rates
+    of 0, 1, 3, 3, 6, 8 and 25 per cent, and told the reader the series had
+    been adjusted for distributions. Four of the seven are accumulating ETFs
+    that have never made one, and the single dividend-paying holding had the
+    *highest* fit rate of the seven -- the explanation was not merely
+    unproven, its ordering was backwards.
+
+    The cause was the wire format. `100.06` stored as float32 and upcast to
+    float64 is `100.05999755859375`, and an exact-divisibility test against a
+    tick fails on essentially every price.
+    """
+
+    @pytest.mark.parametrize("tick", [0.001, 0.005, 0.01, 0.05])
+    def test_a_float32_round_trip_still_finds_the_grid(self, tick):
+        """The test that reproduces it, on a series built on a known grid."""
+        o, h, l, c = simulate_bars(0.004, bars=500, seed=3, tick_size=tick)
+        clean = np.concatenate([o, h, l, c])
+        assert infer_tick_size(clean).size == pytest.approx(tick)
+
+        via32 = clean.astype(np.float32).astype(np.float64)
+        assert not np.array_equal(clean, via32), (
+            "the round trip changed nothing, so this proves nothing about "
+            "float32")
+        got = infer_tick_size(via32)
+        assert got.usable and got.size == pytest.approx(tick), (
+            f"{got.agreement:.0%} fit after a float32 round trip; this is the "
+            f"0-8% the real book showed")
+
+    def test_the_old_exact_test_is_what_failed(self):
+        """Pinned so the mechanism cannot be argued about later: an exact
+        divisibility test rejects nearly every float32-carried price."""
+        o, h, l, c = simulate_bars(0.004, bars=500, seed=3, tick_size=0.01)
+        via32 = np.concatenate([o, h, l, c]).astype(np.float32).astype(float)
+        exact = np.mean(np.abs(via32 / 0.01 - np.round(via32 / 0.01)) < 1e-6)
+        assert exact < 0.2, f"exact test fit {exact:.0%}, expected near zero"
+
+    def test_a_grid_finer_than_the_data_is_not_claimed(self):
+        """float32 leaves about 1.2e-5 of uncertainty on a EUR 100 price, so a
+        0.0001 grid cannot be established from it. Claiming one anyway is how
+        an earlier attempt at this fix made a dividend-adjusted series 'fit'
+        at 93%: it manufactured the grid it reported."""
+        o, h, l, c = simulate_bars(0.004, bars=500, seed=3, tick_size=0.01)
+        adjusted = np.concatenate([o, h, l, c]) * 0.98317
+        got = infer_tick_size(adjusted)
+        assert not got.usable
+        assert got.size is None
+
+
+class TestTheRefusalDoesNotAssertACauseItDidNotTest:
+    """The defect this shares with "an ETC is a debt security" about a
+    property fund: a confident, specific, untested explanation attached to a
+    real refusal. The refusal may be right; the reason sends the reader
+    somewhere there is nothing to find."""
+
+    def scattered(self):
+        o, h, l, c = simulate_bars(0.004, bars=500, seed=3, tick_size=0.01)
+        return np.concatenate([o, h, l, c]) * 0.98317
+
+    def part_scattered(self):
+        o, h, l, c = simulate_bars(0.004, bars=500, seed=3, tick_size=0.01)
+        whole = np.concatenate([o, h, l, c])
+        return np.concatenate([whole[:1000] / 3.0, whole[1000:]])
+
+    def test_a_clean_series_says_nothing(self):
+        o, h, l, c = simulate_bars(0.004, bars=500, seed=3, tick_size=0.01)
+        assert infer_tick_size(np.concatenate([o, h, l, c])).why_not_a_grid() == ""
+
+    def test_a_rescaled_series_is_described_by_its_residual(self):
+        got = infer_tick_size(self.scattered())
+        message = got.why_not_a_grid()
+        assert "of a tick" in message and "rescaling" in message
+        # Named as candidates, not asserted as the cause.
+        assert "not established here" in message
+
+    def test_it_distinguishes_a_whole_series_from_part_of_one(self):
+        """A split applied to the older history leaves most prices fitting
+        exactly. Reporting the median over ALL prices called that "floating
+        point" -- the wrong statistic for a bimodal series."""
+        assert "part of the series" in infer_tick_size(
+            self.part_scattered()).why_not_a_grid()
+        assert "part of the series" not in infer_tick_size(
+            self.scattered()).why_not_a_grid()
+
+    def test_it_never_claims_a_distribution_it_cannot_see(self):
+        """The specific false sentence. An accumulating ETF has never made a
+        distribution, so a message that names one is wrong before it is
+        unproven."""
+        for series in (self.scattered(), self.part_scattered()):
+            message = infer_tick_size(series).why_not_a_grid()
+            assert "has been adjusted for distributions" not in message
+            assert "dividend adjustment" in message  # offered, among others
