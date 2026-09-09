@@ -165,7 +165,11 @@ def _installed_search_path() -> list[str]:
             continue                       # "" is the current directory
         try:
             resolved = pathlib.Path(entry).resolve()
-        except OSError:
+        except Exception:
+            # sys.path holds zip paths, and on Windows it can hold strings
+            # pathlib refuses. A diagnostic that raises while diagnosing is
+            # worse than one that skips an entry, and this runs at `serve`
+            # startup where a crash would look like the app being broken.
             continue
         if resolved == here or resolved == pathlib.Path.cwd():
             continue
@@ -247,12 +251,15 @@ def inspect_installation(web_dir: pathlib.Path | None = None) -> Installation:
     repo_web = repo_web if repo_web.exists() else None
 
     missing: tuple[str, ...] = ()
-    if web_dir is not None and repo_web is not None:
-        if web_dir.resolve() != repo_web.resolve():
+    try:
+        if (web_dir is not None and repo_web is not None
+                and web_dir.resolve() != repo_web.resolve()):
             missing = tuple(
                 str(p.relative_to(repo_web))
                 for p in sorted(repo_web.rglob("*"))
                 if p.is_file() and not (web_dir / p.relative_to(repo_web)).exists())
+    except Exception:
+        missing = ()
 
     return Installation(
         imported_from=imported, shadowed_by_cwd=shadowed,

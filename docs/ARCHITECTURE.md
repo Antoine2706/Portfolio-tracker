@@ -338,6 +338,24 @@ about someone else's machine. A4 and A5 are the same question asked twice and
 answered wrongly both times, the second time while fixing the first — which is
 the strongest available argument for ranking this group above the other.
 
+A4 and A5 look like a note about Python packaging and are not. `sys.path` is
+one instance of a wider family: **a diagnostic whose answer is a function of
+the context it is asked from.** The current directory, `PATH`, the active
+virtualenv, git's upward search for a repo root, any environment variable —
+each of them silently parameterises an answer that reads as a fact. Asking
+"which copy is running" from inside the copy is the same error as asking
+"which branch is this" from inside a submodule, or "which python is this" with
+a virtualenv active.
+
+So the operative test is not "run it from two directories" — that is the
+`sys.path`-shaped instance and it generalises badly. It is: **find a context
+where you know the answer should differ, ask from there, and check that it
+does.** For A4 that was a directory containing a decoy `portfolio` package;
+for A5, a directory containing a decoy `.egg-info`. Both are in
+`tests/test_diagnostics.py`, and both say what to delete if the interpreter
+ever stops behaving that way, so the exclusion is not carried forward on a
+belief nobody has re-checked.
+
 `portfolio doctor` now answers it properly: what `import portfolio` resolves to
 *here*, whether the current directory is shadowing an install, what the
 distribution metadata says **with the current directory excluded**, whether the
@@ -397,11 +415,18 @@ The working rules that fall out of it, in the order they pay off:
    verification. The question to ask of every check is not "does it pass" but
    "what would make it fail, and have I seen that happen". Every entry in
    Group A was found the first time somebody asked the second half.
-5. **Apply a significance test on the scale where the sampling distribution is
+5. **A diagnostic's answer may be a function of where it was asked.** The
+   current directory, `sys.path`, `PATH`, the active virtualenv, git's search
+   for a repo root, any environment variable. Rule 4 applied to diagnostics
+   rather than to tests, and the same discipline: find a context where the
+   answer *should* differ, ask from there, and confirm it does. A4 and A5 are
+   both this rule, and A5 is what happens when the fix for one instance is
+   written without applying the rule to the fix.
+6. **Apply a significance test on the scale where the sampling distribution is
    symmetric.** #9 survived because `s` and `s²` carry the same information
    and only one of them can be centred on zero. A transformation that looks
    like relabelling can halve a threshold.
-6. **A generator that produces data for a validated estimator is itself
+7. **A generator that produces data for a validated estimator is itself
    unvalidated.** #11 was found only because the estimator had already been
    calibrated against something else, so a disagreement pointed at the
    fixture. Had both been written together, they would have agreed on the
