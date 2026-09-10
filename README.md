@@ -252,8 +252,11 @@ figure printed beside the band. US tight and Europe wide is the provider's
 European bars; SPY wide is the pipeline. An unresolved rung is judged on its
 ceiling against the ceiling a clean sample of the same length and volatility
 reports, because that is the case the real book presented and the case the
-first version of the verdict passed. Against the fixture the ladder is
-expected to fail — which is how the check is seen to bite.
+first version of the verdict passed. Every rung also prints its per-bar
+autocorrelation beside the estimate — the one number from the real book that
+no simulated contamination reproduces — so that SPY and AAPL say whether the
+path manufactures it or the European lines own it. Against the fixture the
+ladder is expected to fail — which is how the check is seen to bite.
 
 ### Directing new money
 

@@ -409,6 +409,11 @@ def replay_the_ledger(book: Book, *, mode: str = "user",
 # --------------------------------------------------------------------------
 
 
+# Beyond this, the lag-1 autocorrelation of the per-bar series is called
+# large: the standard error assumes zero, simulated bars give -0.003, and
+# the first real book gave -0.14 to -0.40 on four of seven instruments.
+AUTOCORRELATION_LARGE = 0.10
+
 # How many recent bars the tick grid is read off. Long enough that the
 # candidate grids are distinguishable, short enough to sit inside the period
 # since the instrument's last split -- splits are applied by the provider
@@ -631,8 +636,11 @@ class SpreadSurvey:
                 # large enough to make the error bar optimistic. Reported
                 # rather than corrected: raising `lags` on this evidence would
                 # be fitting the standard error to one sample of one series.
-                loud = " -- LARGE; the error bar above is optimistic" \
-                    if abs(rho) > 0.10 else ""
+                threshold = rho_threshold(d.estimate.usable_bars)
+                loud = (f" -- LARGE, beyond {threshold:.2f} (three standard "
+                        f"errors off {d.estimate.usable_bars} bars); the "
+                        f"error bar above is optimistic"
+                        if abs(rho) > threshold else "")
                 out.append(f"           per-bar autocorrelation {rho:+.3f} "
                            f"(the error bar assumes ~0){loud}")
             allowed = self.null_ceiling.get(isin)
@@ -1361,6 +1369,16 @@ class RungResult:
     lower_bps: float | None = None
     upper_bps: float | None = None
 
+    @property
+    def estimate(self):
+        """The estimate the verdict was reached on, or None."""
+        return None if self.sweep is None else self.sweep.chosen
+
+    @property
+    def autocorrelation(self) -> float | None:
+        e = self.estimate
+        return None if e is None else e.autocorrelation
+
     def lines(self) -> list[str]:
         mark = {"consistent": "ok  ", "too wide": "WIDE", "too narrow": "NARR",
                 "no estimate": "----", "unavailable": "----",
@@ -1368,18 +1386,52 @@ class RungResult:
         stated = f" (stated: {self.rung.stated})" if self.rung.stated else ""
         out = [f"[{mark}] {self.rung.symbol:<9} {self.rung.label}",
                f"       band {self.rung.band}{stated}: {self.detail}"]
-        if self.sweep is not None and self.sweep.rungs:
-            e = self.sweep.chosen
+        e = self.estimate
+        if e is not None and self.sweep.rungs:
             out.append(f"       {e.usable_bars} usable bars in the window "
                        f"taken, of {self.sweep.available_bars} available")
+        if e is not None and e.autocorrelation is not None:
+            out.append(f"       per-bar autocorrelation "
+                       f"{_rho_text(e.autocorrelation, e.usable_bars)}")
         if self.sweep is not None and len(self.sweep.rungs) > 1:
             out.extend(f"       {line}" for line in self.sweep.lines())
         if self.quality is not None:
             out.extend(f"       {line}" for line in self.quality.lines())
             if self.quality.excluded_count and self.clean is not None:
+                rho = self.clean.autocorrelation
                 out.append(f"       with those set aside: {self.clean_detail} "
-                           f"-> {self.clean_status}")
+                           f"-> {self.clean_status}"
+                           + (f"; per-bar autocorrelation "
+                              f"{_rho_text(rho, self.clean.usable_bars)}"
+                              if rho is not None else ""))
         return out
+
+
+def rho_threshold(usable_bars: int) -> float:
+    """Beyond this, a per-bar autocorrelation is more than sampling noise.
+
+    A lag-1 autocorrelation estimated from ``n`` terms has standard error
+    about ``1/sqrt(n)`` under the null, so the flat `AUTOCORRELATION_LARGE`
+    is raised to three standard errors where the sample is short. Off 500
+    bars that is 0.13: the fixture's AAPL read -0.104 there, two sigma of
+    nothing, and a flat threshold would have called the path guilty on it.
+    The book's -0.40 on a similar count is nine.
+
+    >>> round(rho_threshold(5000), 3), round(rho_threshold(500), 3)
+    (0.1, 0.134)
+    """
+    if usable_bars <= 0:
+        return AUTOCORRELATION_LARGE
+    return max(AUTOCORRELATION_LARGE, 3.0 / math.sqrt(usable_bars))
+
+
+def _rho_text(rho: float, usable_bars: int) -> str:
+    """The autocorrelation with its verdict, the same words the survey uses."""
+    threshold = rho_threshold(usable_bars)
+    loud = (f" -- LARGE, beyond {threshold:.2f} (three standard errors off "
+            f"{usable_bars} bars); the error bar assumes ~0"
+            if abs(rho) > threshold else "")
+    return f"{rho:+.3f}{loud}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1397,6 +1449,9 @@ class PairResult:
         out = [f"{a} against {b}, the same fund on two venues:"]
         for symbol, e, q in zip(self.symbols, self.estimates, self.qualities):
             described = "no bars" if e is None else e.describe()
+            if e is not None and e.autocorrelation is not None:
+                described += (f"; per-bar autocorrelation "
+                              f"{_rho_text(e.autocorrelation, e.usable_bars)}")
             out.append(f"       {symbol:<9} {described}")
             if q is not None:
                 out.append(f"                 {q.lines()[0]}")
@@ -1434,17 +1489,56 @@ class LadderReport:
         for p in self.pairs:
             out.extend(p.lines())
             out.append("")
+        out.extend(self.table())
+        out.append("")
         out.append("-" * 74)
         out.extend(self.verdict.splitlines())
+        note = _autocorrelation_note(self.rungs)
+        if note:
+            out.append("")
+            out.extend(note.splitlines())
+        return out
+
+    def table(self) -> list[str]:
+        """One row per rung: the estimate and, beside it, what the survey
+        could not reproduce on any simulated bars -- the per-bar
+        autocorrelation. SPY and AAPL are the rows that decide whether the
+        path manufactures it."""
+        out = [f"  {'rung':<9} {'estimate':>9} {'t':>6} {'ceiling':>8} "
+               f"{'per-bar rho':>11} {'set aside':>9}  status"]
+        for r in self.rungs:
+            e = r.estimate
+            if e is None or e.spread is None:
+                out.append(f"  {r.rung.symbol:<9} {'-':>9} {'-':>6} {'-':>8} "
+                           f"{'-':>11} {'-':>9}  {r.status}")
+                continue
+            ceiling = "-" if r.upper_bps is None else f"{r.upper_bps:.1f}"
+            rho = "-" if e.autocorrelation is None else f"{e.autocorrelation:+.3f}"
+            aside = ("-" if r.quality is None
+                     else f"{r.quality.excluded_count / max(r.quality.bars, 1):.1%}")
+            out.append(f"  {r.rung.symbol:<9} {e.half_spread_bps:7.1f} bps "
+                       f"{e.t_statistic:+6.2f} {ceiling:>8} {rho:>11} "
+                       f"{aside:>9}  {r.status}")
         return out
 
     def record(self) -> dict:
+        def estimate(e) -> dict | None:
+            if e is None or e.spread is None:
+                return None
+            return {"half_spread_bps": e.half_spread_bps,
+                    "error_bps": e.half_spread_error_bps, "t": e.t_statistic,
+                    "usable_bars": e.usable_bars,
+                    "autocorrelation": e.autocorrelation}
+
         return {"provider": self.provider, "passed": self.passed,
                 "verdict": self.verdict,
+                "autocorrelation_note": _autocorrelation_note(self.rungs),
                 "rungs": [{"symbol": r.rung.symbol, "band": [r.rung.low_bps,
                                                              r.rung.high_bps],
                            "region": r.rung.region, "status": r.status,
                            "detail": r.detail,
+                           "estimate": estimate(r.estimate),
+                           "clean_estimate": estimate(r.clean),
                            "lower_bps": r.lower_bps, "upper_bps": r.upper_bps,
                            "bars_set_aside": (None if r.quality is None
                                               else r.quality.counts()),
@@ -1452,7 +1546,100 @@ class LadderReport:
                           for r in self.rungs],
                 "pairs": [{"symbols": list(p.symbols), "z": p.z,
                            "ratio": p.ratio, "consistent": p.consistent,
+                           "estimates": [estimate(e) for e in p.estimates],
                            "detail": p.detail} for p in self.pairs]}
+
+
+def _autocorrelation_note(rungs) -> str:
+    """What the per-bar autocorrelation on the ladder says, US rungs first.
+
+    The one number from the real book that no simulated contamination
+    reproduces is a per-bar autocorrelation of -0.40. The ladder runs the
+    same estimator on SPY and AAPL, whose bars are not in doubt, so their
+    rows decide where it comes from: large there means the path
+    manufactures it and it has nothing to do with European listings; near
+    zero there and large on the European rungs means it is a property of
+    those lines, and the next question is thin trading on the specific
+    listing rather than the fund. Neither branch changes the ladder's
+    verdict; this is a measurement printed beside it.
+
+    "Large" is judged against the sampling error of the number, three
+    standard errors at ``1/sqrt(n)``, not against a flat 0.10: the fixture's
+    AAPL read -0.104 off 505 bars, which is two sigma of nothing, and a flat
+    threshold called the path guilty on it.
+
+    >>> from portfolio.core.spread import SpreadEstimate, WindowSweep
+    >>> def rung(symbol, region, rho, bars=999):
+    ...     e = SpreadEstimate(0.0004, 1.6e-7, 0.0001, bars + 1, bars,
+    ...                        square_standard_error=1e-7, autocorrelation=rho)
+    ...     return RungResult(Rung(symbol, "", 0.1, 2.0, region), "consistent",
+    ...                       "", sweep=WindowSweep((), (), e, bars + 1, "all"))
+    >>> note = _autocorrelation_note((rung("SPY", "US", -0.31),
+    ...                               rung("SU.PA", "EU", -0.28)))
+    >>> "SPY -0.310" in note and "the path manufactures it" in note
+    True
+    >>> note = _autocorrelation_note((rung("SPY", "US", -0.004),
+    ...                               rung("SU.PA", "EU", -0.28)))
+    >>> "a property of those lines" in note and "SU.PA" in note.split("beyond")[1]
+    True
+
+    Two sigma off 500 bars is not a finding about the path:
+
+    >>> note = _autocorrelation_note((rung("AAPL", "US", -0.104, bars=504),
+    ...                               rung("SU.PA", "EU", -0.02, bars=504)))
+    >>> "Near zero on every rung" in note
+    True
+    """
+    def each(items) -> str:
+        return ", ".join(f"{r.rung.symbol} {r.autocorrelation:+.3f}"
+                         for r in items)
+
+    def large(r) -> bool:
+        return abs(r.autocorrelation) > rho_threshold(r.estimate.usable_bars)
+
+    measured = [r for r in rungs if r.autocorrelation is not None]
+    if not measured:
+        return ""
+    us = [r for r in measured if r.rung.region == "US"]
+    eu = [r for r in measured if r.rung.region != "US"]
+    head = "Per-bar autocorrelation: "
+    parts = []
+    if us:
+        parts.append(f"{each(us)} on the US rungs")
+    if eu:
+        parts.append(f"{each(eu)} on the European ones")
+    head += "; ".join(parts) + "."
+    large_us = [r for r in us if large(r)]
+    large_eu = [r for r in eu if large(r)]
+
+    def limits(items) -> str:
+        return ", ".join(f"{rho_threshold(r.estimate.usable_bars):.2f} for "
+                         f"{r.rung.symbol}" for r in items)
+
+    if large_us:
+        tail = (f"Beyond three standard errors of zero ({limits(large_us)}) "
+                f"on bars whose data is not in doubt, so the path "
+                f"manufactures it and it says nothing about European "
+                f"listings.")
+    elif us and large_eu:
+        tail = (f"Within sampling error of zero where the data is not in "
+                f"doubt and beyond three standard errors ({limits(large_eu)}) "
+                f"on the European rungs, so it is a property of those lines "
+                f"rather than of the path. The next question is thin trading "
+                f"on the specific listing, not the fund.")
+    elif us:
+        tail = ("Near zero on every rung, within three standard errors of "
+                "zero at each sample; the book's -0.40 is not reproduced on "
+                "any of these lines.")
+    else:
+        tail = ("No US rung was available to say whether the path "
+                "manufactures it.")
+    return _wrap(head + " " + tail)
+
+
+def _wrap(text: str, width: int = 74) -> str:
+    import textwrap
+    return "\n".join(textwrap.wrap(text, width=width))
 
 
 def _ladder_verdict(rungs: "tuple[RungResult, ...]",

@@ -369,3 +369,95 @@ class TestAnUncheckableCeilingIsSaidNotPassed:
         text = "\n".join(report.lines())
         assert "band 0.3 to 4 bps (stated: 1 to 2 bps)" in text
         assert "usable bars in the window taken" in text
+
+
+class TestTheAutocorrelationColumn:
+    """The one number from the real book nothing simulated reproduces,
+    printed beside every rung's estimate -- SPY and AAPL included, because
+    those rows decide whether the path manufactures it."""
+
+    def test_every_rung_carries_it_including_the_us_ones(self, tmp_path):
+        report = ladder(tmp_path, CONSISTENT)
+        text = "\n".join(report.lines())
+        for r in report.rungs:
+            assert r.autocorrelation is not None, r.rung.symbol
+            block = "\n".join(r.lines())
+            assert "per-bar autocorrelation" in block, r.rung.symbol
+        table = report.table()
+        assert table[0].split()[:3] == ["rung", "estimate", "t"]
+        assert "per-bar rho" in table[0]
+        rows = {line.split()[0]: line for line in table[1:]}
+        for symbol in ("SPY", "AAPL", "SU.PA", "MEUD.PA", "IPRP.AS"):
+            assert symbol in rows, symbol
+            assert any(tok.startswith(("+0.", "-0.")) for tok in rows[symbol].split()), rows[symbol]
+        assert "Per-bar autocorrelation:" in text
+        assert "SPY" in text.split("Per-bar autocorrelation:")[1]
+        record = report.record()
+        assert all(r["estimate"]["autocorrelation"] is not None
+                   for r in record["rungs"])
+        assert record["autocorrelation_note"]
+        # And the pair lines carry it too.
+        assert "per-bar autocorrelation" in "\n".join(report.pairs[0].lines())
+
+    def test_clean_simulated_bars_read_near_zero(self, tmp_path):
+        """Which is what makes SPY and AAPL the decisive rows: on bars that
+        are what the estimator assumes, the number sits near zero."""
+        report = ladder(tmp_path, CONSISTENT)
+        for r in report.rungs:
+            assert abs(r.autocorrelation) < 0.10, (r.rung.symbol, r.autocorrelation)
+        note = report.record()["autocorrelation_note"].replace("\n", " ")
+        assert "Near zero on every rung" in note
+
+    def test_the_note_reads_the_us_rungs_first(self):
+        from portfolio.core.spread import WindowSweep
+        from portfolio.research import RungResult, _autocorrelation_note
+
+        def rung(symbol, region, rho):
+            e = SpreadEstimate(0.0004, 1.6e-7, 0.0001, 1000, 999,
+                               square_standard_error=1e-7, autocorrelation=rho)
+            return RungResult(Rung(symbol, "", 0.1, 2.0, region), "consistent",
+                              "", sweep=WindowSweep((), (), e, 1000, "all"))
+
+        # The note is wrapped for the terminal; compare it unwrapped.
+        def note(*rungs) -> str:
+            return _autocorrelation_note(rungs).replace("\n", " ")
+
+        manufactured = note(rung("SPY", "US", -0.31), rung("AAPL", "US", -0.22),
+                            rung("SU.PA", "EU", -0.28))
+        assert "the path manufactures it" in manufactured
+        assert "SPY -0.310" in manufactured and "AAPL -0.220" in manufactured
+
+        genuine = note(rung("SPY", "US", -0.004), rung("AAPL", "US", +0.006),
+                       rung("SU.PA", "EU", -0.28), rung("MEUD.PA", "EU", -0.01))
+        assert "a property of those lines" in genuine
+        assert "for SU.PA" in genuine and "for MEUD.PA" not in genuine
+        assert "thin trading on the specific listing" in genuine
+
+        quiet = note(rung("SPY", "US", 0.01), rung("SU.PA", "EU", -0.02))
+        assert "not reproduced on any of these lines" in quiet
+
+        blind = note(rung("SU.PA", "EU", -0.28))
+        assert "No US rung" in blind
+        assert _autocorrelation_note(()) == ""
+
+    def test_large_is_judged_against_the_sampling_error(self):
+        """Off 505 fixture bars AAPL read -0.104: two sigma of nothing, and
+        a flat 0.10 called the pipeline guilty on it. Three standard errors
+        at 1/sqrt(n) is 0.134 there and 0.10 only from 900 bars up."""
+        from portfolio.core.spread import WindowSweep
+        from portfolio.research import RungResult, _autocorrelation_note, rho_threshold
+        assert rho_threshold(504) == pytest.approx(3 / 504 ** 0.5)
+        assert rho_threshold(5000) == pytest.approx(0.10)
+
+        def rung(symbol, region, rho, bars):
+            e = SpreadEstimate(0.0004, 1.6e-7, 0.0001, bars + 1, bars,
+                               square_standard_error=1e-7, autocorrelation=rho)
+            return RungResult(Rung(symbol, "", 0.1, 2.0, region), "consistent",
+                              "", sweep=WindowSweep((), (), e, bars + 1, "all"))
+
+        short = _autocorrelation_note((rung("AAPL", "US", -0.104, 504),
+                                       rung("SU.PA", "EU", -0.02, 504)))
+        assert "Near zero on every rung" in short.replace("\n", " ")
+        long = _autocorrelation_note((rung("AAPL", "US", -0.104, 5000),
+                                      rung("SU.PA", "EU", -0.02, 5000)))
+        assert "the path manufactures it" in long.replace("\n", " ")

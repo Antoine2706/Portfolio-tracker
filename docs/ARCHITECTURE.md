@@ -561,7 +561,12 @@ What is and is not established:
   is the one thing tried that pushes it negative, and inflates the estimate
   by 120% at −0.15, but reaches only −0.03 against the book's −0.40. Seven
   negatives with four beyond −0.10 remain a signature of something not yet
-  simulated, and are left as an observation rather than attributed.
+  simulated, and are left as an observation rather than attributed. The
+  ladder prints the same number beside every rung's estimate, SPY and AAPL
+  included, which turns it into a measurement: −0.2 to −0.4 on bars whose
+  data is not in doubt means the path manufactures it; near zero there and
+  large on the European rungs means it belongs to those lines, and the next
+  question is thin trading on the specific listing rather than the fund.
 * Whether Yahoo's European bars carry closes, or revert overnight, at a rate
   that explains a factor of twenty is not established from here. It is
   exactly what the two-column survey now counts and what the ladder decides:
