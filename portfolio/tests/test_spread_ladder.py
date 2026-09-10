@@ -64,10 +64,17 @@ class KnownSpreads(MarketDataProvider):
                                         replace=False))
             for i in picked:
                 o[i], h[i], l[i], c[i] = o[i - 1], h[i - 1], l[i - 1], c[i - 1]
-        index = pd.bdate_range("2015-01-01", periods=self.bars_count)
-        return pd.DataFrame({"open": o, "high": h, "low": l, "close": c,
-                             "volume": np.full(self.bars_count, 1e5)},
-                            index=index)
+        # Ending today, so the survey's staleness rule does not top it up;
+        # a top-up would be the same rows again, but a control on the
+        # verdict logic should not also be exercising the cache.
+        index = pd.bdate_range(end=pd.Timestamp.today().normalize(),
+                               periods=self.bars_count)
+        frame = pd.DataFrame({"open": o, "high": h, "low": l, "close": c,
+                              "volume": np.full(self.bars_count, 1e5)},
+                             index=index)
+        if start is not None:
+            frame = frame[frame.index >= pd.Timestamp(start)]
+        return frame
 
 
 def ladder(tmp_path, spreads, **kw):
@@ -83,7 +90,8 @@ class TestTheVerdictOnOneRung:
         interval is zero, which is inside."""
         e = SpreadEstimate(0.0003, 9e-8, 0.0002, 3000, 2999,
                            square_standard_error=1.2e-7)
-        status, detail, lower, upper = rung_verdict(e, BY_SYMBOL["SPY"])
+        status, detail, lower, upper = rung_verdict(e, BY_SYMBOL["SPY"],
+                                                    sigma_day=0.01)
         assert status == "consistent" and lower == 0.0
         assert "not resolved" in detail
 
@@ -105,7 +113,7 @@ class TestTheVerdictOnOneRung:
         assert e.half_spread_bps == pytest.approx(42.0)
         assert e.t_statistic < 2.0                 # a ceiling, not a reading
         blind = rung_verdict(e, BY_SYMBOL["SU.PA"])
-        assert blind[0] == "consistent"            # the dead check, kept visible
+        assert blind[0] == "unchecked"             # no volatility: says so, does not pass
         status, detail, lower, upper = rung_verdict(e, BY_SYMBOL["SU.PA"],
                                                     sigma_day=0.015)
         assert status == "too wide", detail
@@ -227,7 +235,9 @@ class TestTheCommandLine:
             == ("VWCE.DE", 1.0, 6.0, "EU")
         assert _parse_rung("QQQ=0.2-3").region == "US"
         assert _parse_rung("X.MI=10-50:thin").region == "thin"
-        for bad in ("VWCE.DE", "VWCE.DE=6-1", "VWCE.DE=a-b", "X=1-2:MARS"):
+        assert _parse_rung("EURUSD=X=1-5").symbol == "EURUSD=X"   # Yahoo's own '='
+        for bad in ("VWCE.DE", "VWCE.DE=6-1", "VWCE.DE=a-b", "X=1-2:MARS",
+                    "X=1-inf", "X=nan-1"):
             with pytest.raises(argparse.ArgumentTypeError):
                 _parse_rung(bad)
         assert _parse_pair("A.DE, B.L") == ("A.DE", "B.L")
@@ -270,3 +280,92 @@ class TestTheCommandLine:
                   "--replace-ladder"])
         assert [r.symbol for r in seen["rungs"]] == ["VWCE.DE"]
         assert seen["pairs"] == PAIRS
+
+
+class TestThePairRuleIsNotDeadWhenNothingResolves:
+    """Found by the review of the first version, which compared two lines on
+    s^2 whatever their resolution. When the wider line is unresolved,
+    |z| <= t < 2 whatever the ratio, so two listings a factor of thirteen
+    apart were 'agreeing within error'. The real book resolved nothing."""
+
+    REAL = SpreadEstimate(0.0084, 7.0e-5, 0.0004, 5000, 4999,
+                          square_standard_error=3.6e-5)      # 42 bps, t = 1.9
+    TIGHT = SpreadEstimate(0.00064, 4.1e-7, 0.0004, 5000, 4999,
+                           square_standard_error=2.7e-7)     # 3.2 bps, t = 1.5
+
+    def test_the_real_book_pair_is_not_called_consistent(self):
+        from portfolio.research import _compare_pair
+        pair = _compare_pair(("A.DE", "B.L"), (self.REAL, self.TIGHT),
+                             (None, None), ("", ""), sigmas=(0.015, 0.015))
+        assert pair.consistent is False, pair.detail
+        assert "A.DE is the inconsistent line" in pair.detail
+        assert "cannot explain" in pair.detail
+
+    def test_without_volatility_it_says_not_comparable_rather_than_passing(self):
+        from portfolio.research import _compare_pair
+        pair = _compare_pair(("A.DE", "B.L"), (self.REAL, self.TIGHT),
+                             (None, None), ("", ""))
+        assert pair.consistent is None
+        assert "not comparable" in pair.detail
+
+    def test_an_honest_unresolved_line_does_not_contradict_a_resolved_one(self):
+        """Simulated at 12 bps, one line resolves and the other is cut to
+        too few bars to resolve; the pair must pass."""
+        from portfolio.core.spread import edge
+        from portfolio.research import _compare_pair
+        o, h, l, c = simulate_bars(2.0 * 12.0 / 10_000.0, bars=3000, sigma=0.012,
+                                   seed=21)
+        resolved = edge(o, h, l, c)
+        assert resolved.resolved()
+        # The first short clean sample that does not resolve; which seed
+        # that is does not matter, and a fixed one would be a coin toss.
+        for seed in range(22, 60):
+            o2, h2, l2, c2 = simulate_bars(2.0 * 12.0 / 10_000.0, bars=70,
+                                           sigma=0.012, seed=seed)
+            short = edge(o2, h2, l2, c2)
+            if not short.resolved():
+                break
+        assert not short.resolved()
+        pair = _compare_pair(("A", "B"), (resolved, short), (None, None),
+                             ("", ""), sigmas=(0.012, 0.012))
+        assert pair.consistent is True, pair.detail
+
+    def test_the_ladder_reaches_the_listing_verdict_through_an_unresolved_line(self, tmp_path):
+        """End to end, through the unresolved branch. Nothing simulated
+        produces the real book's shape -- an unresolved line whose ceiling
+        far exceeds what its sample allows -- so this reaches the branch
+        the other way round: VVSM.DE simulated at 1 bp over 400 bars does
+        not resolve, and its ceiling sits below the floor of SMH.L resolved
+        at 12 bps. One fund cannot be both. The old rule compared them on
+        s^2 and, with the short line's t under 2, called them agreeing."""
+        class Mixed(KnownSpreads):
+            def bars(self, symbol, start=None, *, period="2y"):
+                if symbol == "VVSM.DE":
+                    self.bars_count, saved = 400, self.bars_count
+                    try:
+                        return super().bars(symbol, start, period=period)
+                    finally:
+                        self.bars_count = saved
+                return super().bars(symbol, start, period=period)
+
+        provider = Mixed(dict(CONSISTENT, **{"VVSM.DE": 1.0, "SMH.L": 12.0}))
+        report = run_ladder(provider=provider, data_root=tmp_path)
+        pair = report.pairs[0]
+        assert not pair.estimates[0].resolved() and pair.estimates[1].resolved()
+        assert pair.consistent is False, pair.detail
+        assert "below the other line's floor" in pair.detail
+        assert report.verdict.startswith("THE DATA FOR ONE LISTING"), report.verdict
+
+
+class TestAnUncheckableCeilingIsSaidNotPassed:
+    def test_a_rung_without_volatility_is_unchecked(self):
+        e = SpreadEstimate(0.0003, 9e-8, 0.0002, 3000, 2999,
+                           square_standard_error=1.2e-7)
+        status, detail, _, _ = rung_verdict(e, BY_SYMBOL["SPY"])
+        assert status == "unchecked" and "could not be checked" in detail
+
+    def test_the_stated_figure_is_printed_beside_the_band(self, tmp_path):
+        report = ladder(tmp_path, CONSISTENT)
+        text = "\n".join(report.lines())
+        assert "band 0.3 to 4 bps (stated: 1 to 2 bps)" in text
+        assert "usable bars in the window taken" in text

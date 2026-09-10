@@ -549,7 +549,11 @@ class CarriesBarsForward(FixtureProvider):
         self.carry = carry
 
     def bars(self, symbol, start=None, *, period="2y"):
-        frame = super().bars(symbol, start, period=period).copy()
+        # Contaminate the whole series and slice afterwards, so that a
+        # fetch of the tail returns the same rows the full fetch did. The
+        # survey tops up a history whose last bar is older than a few days,
+        # and the fixture's last bar always is.
+        frame = super().bars(symbol, None, period=period).copy()
         fraction = self.carry.get(symbol, 0.0)
         if fraction:
             rng = np.random.default_rng(len(symbol) * 7919)
@@ -561,6 +565,8 @@ class CarriesBarsForward(FixtureProvider):
             for i in picked:
                 values[i] = values[i - 1]
             frame[cols] = values
+        if start is not None:
+            frame = frame[frame.index >= pd.Timestamp(start)]
         return frame
 
 
@@ -690,8 +696,163 @@ class TestTheRunIsRecorded:
         assert "Recorded as run 1" in captured.out
         assert "did not pass" in captured.err
         assert "spread-ladder" in captured.err
-        assert (root / "spread-runs.jsonl").exists()
+        # Under the mode's directory, beside the instruments it describes.
+        assert (root / "user" / "spread-runs.jsonl").exists()
+        assert not (root / "spread-runs.jsonl").exists()
         # And nothing was written to the instruments.
         store = DataStore(mode=DataMode.USER, root=root)
         assert all(not i.spread_observed and i.spread_source != "bounded"
                    for i in store.load_instruments().values())
+
+
+class TestTheBarsCacheCannotLieAboutWhatItHolds:
+    """Three ways the previous `_bars_for` served the wrong rows, each found
+    by a reviewer probing it rather than by a test, and each now a test."""
+
+    def _cache(self, tmp_path):
+        return PriceCache(tmp_path / "bars.sqlite")
+
+    def test_a_short_history_cached_without_a_period_is_refetched_whole(self, tmp_path):
+        """The real-book case: the first wiring fetched two years and set
+        every flag a later version checked, so 'max' was never fetched."""
+        from portfolio.research import _bars_for
+        provider = FixtureProvider()
+        cache = self._cache(tmp_path)
+        whole = provider.bars("IUSA.AS")
+        cache.put_bars("IUSA.AS", whole.tail(120))        # no period recorded
+        assert cache.bars_period("IUSA.AS") is None
+        served = _bars_for("IUSA.AS", provider, cache,
+                           today=whole.index[-1].date())
+        assert len(served) == len(whole), (len(served), len(whole))
+        assert cache.bars_period("IUSA.AS") == "max"
+        cache.close()
+
+    def test_a_whole_history_is_served_from_the_cache_without_a_fetch(self, tmp_path):
+        from portfolio.research import _bars_for
+
+        class Counting(FixtureProvider):
+            calls = 0
+
+            def bars(self, symbol, start=None, *, period="2y"):
+                Counting.calls += 1
+                return super().bars(symbol, start, period=period)
+
+        provider = Counting()
+        cache = self._cache(tmp_path)
+        first = _bars_for("IUSA.AS", provider, cache,
+                          today=provider.bars("IUSA.AS").index[-1].date())
+        calls_after_first = Counting.calls
+        again = _bars_for("IUSA.AS", provider, cache, today=first.index[-1].date())
+        assert Counting.calls == calls_after_first, "a whole, fresh history was refetched"
+        pd.testing.assert_frame_equal(first, again)
+        cache.close()
+
+    def test_a_stale_tail_is_topped_up_and_a_failed_top_up_is_not_fatal(self, tmp_path):
+        from portfolio.research import STALE_BARS_DAYS, _bars_for
+
+        class Tail(FixtureProvider):
+            starts: list = []
+            fail_tail = False
+
+            def bars(self, symbol, start=None, *, period="2y"):
+                if start is not None:
+                    Tail.starts.append(start)
+                    if Tail.fail_tail:
+                        raise ProviderError(self.name, "network down")
+                return super().bars(symbol, start, period=period)
+
+        provider = Tail()
+        cache = self._cache(tmp_path)
+        whole = provider.bars("IUSA.AS")
+        last = whole.index[-1].date()
+        # Fresh enough: no top-up.
+        _bars_for("IUSA.AS", provider, cache, today=last)
+        assert Tail.starts == []
+        # Stale: a top-up from just before the last cached bar.
+        import datetime as dt
+        _bars_for("IUSA.AS", provider, cache,
+                  today=last + dt.timedelta(days=STALE_BARS_DAYS + 1))
+        assert len(Tail.starts) == 1 and Tail.starts[0] < last
+        assert cache.bars_period("IUSA.AS") == "max"     # not demoted by the tail
+        # A top-up that fails still serves the cached rows.
+        Tail.fail_tail = True
+        served = _bars_for("IUSA.AS", provider, cache,
+                           today=last + dt.timedelta(days=STALE_BARS_DAYS + 1))
+        assert len(served) == len(whole)
+        cache.close()
+
+    def test_the_first_run_and_every_later_run_read_the_same_rows(self, tmp_path):
+        """The cache drops a bar with a missing price, so the provider's
+        frame and the cache's copy pair different days. Every run must
+        read the cache's copy."""
+        from portfolio.research import _bars_for
+
+        class Gappy(FixtureProvider):
+            def bars(self, symbol, start=None, *, period="2y"):
+                frame = super().bars(symbol, start, period=period).copy()
+                frame.iloc[10:35, frame.columns.get_loc("high")] = np.nan
+                return frame
+
+        provider = Gappy()
+        cache = self._cache(tmp_path)
+        today = provider.bars("IUSA.AS").index[-1].date()
+        first = _bars_for("IUSA.AS", provider, cache, today=today)
+        second = _bars_for("IUSA.AS", provider, cache, today=today)
+        assert len(first) == len(second) == len(provider.bars("IUSA.AS")) - 25
+        pd.testing.assert_frame_equal(first, second)
+        cache.close()
+
+    def test_the_survey_says_which_bars_it_read(self, clean):
+        text = "\n".join(clean.lines())
+        assert " bars, 20" in text and " to 2026-" in text
+        record = clean.record()
+        first = next(iter(record["instruments"].values()))
+        assert first["bars"]["rows"] > 400 and first["bars"]["last"].startswith("2026")
+
+
+class TestTheRecordIsJson:
+    def test_a_non_finite_number_is_written_as_null_not_nan(self, tmp_path):
+        from portfolio.research import _json_ready
+        import math
+        ready = _json_ready({"a": float("nan"), "b": np.float64("inf"),
+                             "c": np.int64(3), "d": (np.bool_(True), 1.5),
+                             "e": {"f": math.nan}})
+        assert ready == {"a": None, "b": None, "c": 3, "d": [True, 1.5],
+                         "e": {"f": None}}
+        text = json.dumps(ready, allow_nan=False)
+        assert "NaN" not in text and "Infinity" not in text
+
+
+class TestDailyVolatilityIsAnRmsThatSurvivesOneBadBar:
+    def test_it_is_not_disabled_by_a_coarse_grid(self):
+        """More than half the closes unchanged used to make it None, which
+        silently switched the ceiling check off for exactly the thin
+        instruments it exists for."""
+        from portfolio.research import daily_volatility
+        closes = np.r_[np.full(40, 7.5), 8.0, np.full(30, 8.0), 7.9, np.full(20, 7.9)]
+        assert daily_volatility(closes) is not None
+
+    def test_one_impossible_bar_does_not_set_it(self):
+        from portfolio.research import daily_volatility
+        rng = np.random.default_rng(3)
+        closes = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, 800)))
+        clean = daily_volatility(closes)
+        spiked = closes.copy()
+        spiked[400] = closes[400] / 100.0
+        assert daily_volatility(spiked) < 1.3 * clean
+
+    def test_it_tracks_the_second_moment_under_clustering(self):
+        """Half the days at 0.5%, half at 2%: the RMS is what the per-bar
+        series' variance scales with, and a median-based scale sits well
+        under it. The reference ceiling built from the median was too low,
+        and every ratio printed against it too high."""
+        from portfolio.research import daily_volatility
+        rng = np.random.default_rng(4)
+        sig = np.where(rng.random(2000) < 0.5, 0.005, 0.02)
+        returns = rng.normal(0, 1, 2000) * sig
+        closes = 100 * np.exp(np.cumsum(returns))
+        rms = float(np.sqrt(np.mean(returns ** 2)))
+        mad = 1.4826 * float(np.median(np.abs(returns - np.median(returns))))
+        got = daily_volatility(closes)
+        assert abs(got - rms) < 0.15 * rms, (got, rms)
+        assert mad < 0.85 * rms                 # the thing being avoided

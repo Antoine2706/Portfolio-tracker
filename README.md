@@ -201,8 +201,10 @@ error depends on that instrument's own volatility and bar count. So the
 differentiation survives even where nothing resolves, and unlike a constant it
 is falsifiable — a bound below a spread later seen on a quote screen is a bug
 report. What a ceiling is *not* is safe: it is only as good as the bars under
-it, and the first real book this ran on produced seven ceilings that were
-wrong by a factor of ten. That run is recorded in `docs/ARCHITECTURE.md`.
+it, and on the first real book this ran on, the two of seven ceilings that
+could be checked were both wrong — one twenty-fold too wide on the holding
+whose spread is least in doubt, one too tight on a thin fund. That run is
+recorded in `docs/ARCHITECTURE.md`.
 
 The tick is inferred from the prices themselves (the coarsest grid essentially
 every print falls on) rather than from a table of venue rules nobody here
@@ -212,35 +214,46 @@ the tick that applies today is the one today's prices are on. A recent tail
 that is off grid means an adjusted series arrived, and an adjusted price never
 traded — that instrument is refused rather than measured.
 
-Six controls back it, and they are the reason to believe any of the above:
+Seven controls back it, and they are the reason to believe any of the above:
 a positive sweep from 2 to 100 bps reporting bias and dispersion at each rung,
 a negative control measuring the floor and checking it thins as sampling noise
 must, a standard error checked against the dispersion it claims to predict, a
 resolution control, a resolution-by-window control that says what a longer
-history actually buys, and a refusal below a minimum bar count. Plus a ranking
-check on the result as a whole: estimated spread against median daily traded
-value, because an ordering that contradicts liquidity is more likely a wiring
-fault than a market fact, and `--write` refuses when it fails.
+history actually buys, a refusal below a minimum bar count, and a
+contamination control that regenerates the table of what each kind of
+manufactured bar does to the estimate. Plus a ranking check on the result as
+a whole: estimated spread against median daily traded value, because an
+ordering that contradicts liquidity is more likely a wiring fault than a
+market fact, and `--write` refuses when it fails.
 
-Those six validate the estimator on simulated bars. They say nothing about
+Those seven validate the estimator on simulated bars. They say nothing about
 whether a provider's bars are what the estimator assumes, and the first real
 book failed the ranking check at ρ = +0.89 with the most liquid holding
 estimated widest. So the survey now runs **twice** per instrument — on every
-bar the provider sent, and again with the bars a feed manufactures set aside
-— and prints both with the counts: whole bars carried forward, closes carried
-forward, impossible bars, zero-volume bars. Measured on simulated bars, a
-carried close on five per cent of days inflates a 10 bps spread to 18, and
-setting those days aside recovers it; widening the high and low does nothing.
-The liquidity proxy is printed per instrument so a failed ranking can be laid
-at the right number, and every run is appended to `spread-runs.jsonl` whether
-it passed or not.
+bar the provider sent, and again with bars identical to the previous day's,
+closes identical to the previous close, impossible bars and zero-volume bars
+set aside — and prints both with the counts. Measured on simulated bars, a
+whole bar carried forward on five per cent of days inflates a 10 bps spread
+to 18 and a carried close to 16, and setting those days aside recovers it;
+widening the high and low does nothing. What no count of bars can see is a
+**daily reversal in the price itself** — a stale close the market has moved
+past by the morning — which inflates the same spread to 22 at a return
+autocorrelation of −0.15: at the daily frequency a bounce and a reversal are
+the same covariance, and that is the estimator's identification limit. The
+liquidity proxy is printed per instrument so a failed ranking can be laid at
+the right number, and every run is appended to `spread-runs.jsonl` in the
+mode's data directory, whether it passed or not.
 
-`portfolio controls --spread-ladder` is the seventh control and the one that
-decides which end of the path is wrong: the whole survey path on SPY, AAPL,
-SU.PA, MEUD.PA and a thin European fund, each against a band its spread is
-known to sit in. US tight and Europe wide is the provider's European bars;
-SPY wide is the pipeline. It needs the real provider, and against the fixture
-it is expected to fail — which is how the check is seen to bite.
+`portfolio controls --spread-ladder` is the eighth control and the only one
+that needs the real provider. It decides which end of the path is wrong: the
+survey's estimation path on SPY, AAPL, SU.PA, MEUD.PA and a thin European
+fund, each against a band its spread is known to sit in, with the stated
+figure printed beside the band. US tight and Europe wide is the provider's
+European bars; SPY wide is the pipeline. An unresolved rung is judged on its
+ceiling against the ceiling a clean sample of the same length and volatility
+reports, because that is the case the real book presented and the case the
+first version of the verdict passed. Against the fixture the ladder is
+expected to fail — which is how the check is seen to bite.
 
 ### Directing new money
 

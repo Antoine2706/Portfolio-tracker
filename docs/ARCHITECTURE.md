@@ -381,7 +381,7 @@ before rendering anything.
 | 12 | an amount of new money, "10.000" | ten euros. The English convention hard-coded in a client-side parser, in a book kept in Belgium, while `data/importers.py` had the rule right all along |
 | 13 | *"the series has been adjusted for distributions"*, refusing all 7 holdings | float32. Yahoo sends prices as float32 and `100.06` arrives as `100.05999755859375`, so an exact-divisibility test against a tick fails on nearly every price. Four of the seven are accumulating ETFs that have never made a distribution, and the one that pays a dividend had the *highest* fit rate — the explanation was not merely unproven, its ordering was backwards |
 | 14 | *"suspect the symbol mapping or the panel alignment"*, on a ranking check that failed at ρ = +0.89 | a guess. The check compares two numbers per instrument — an estimated spread and a volume-based liquidity proxy — and cannot tell which is wrong; the sentence picked one. The refusal was right. The verdict now prints the pairs it ranked, names the extremes, and says what it cannot tell apart |
-| 15 | a verdict of "consistent" from the ladder control on a 42 bps reading of a one-bp instrument | the interval on s² at t = 1.9 reaches below zero, so its floor is "inside any band". What was wrong was the *ceiling* — 60 bps off 5000 bars, an error bar sixty times what the sample allows — and the first version of the verdict did not look at it. Found by the test written for the real-book case before the control had been run on anything |
+| 15 | a verdict of "consistent" from the ladder control on a 42 bps reading of a one-bp instrument | the interval on s² at t = 1.9 reaches below zero, so its floor is "inside any band". What was wrong was the *ceiling* — 60 bps off 5000 bars, eight times the ceiling a clean sample of that length reports at 1.5% a day — and the first version of the verdict did not look at it. Found by the test written for the real-book case before the control had been run on anything. The same-fund-two-listings check had the identical defect, found by review: when the wider line is unresolved its distance in standard errors is bounded by its own t, so two listings thirteen-fold apart "agreed within error" |
 
 Three of Group B were false sentences rather than false numbers (5, 7, and the
 "the structure cannot be fixed by contributions" that overclaimed what a search
@@ -429,11 +429,23 @@ high/low contamination*. It is not: widening the high and low by 30 bps on 15%
 of bars, symmetrically or on one side, moves the estimate by 0%. What it
 cannot survive is a **carried price** — a close copied from the previous day,
 or a whole bar copied — which turns a day's real price move into a squared
-spread. Five per cent of such bars inflates a 10 bps spread to 18; fifteen per
-cent, to 27. Setting them aside recovers 10.0. Flat bars do nothing, which is
-what the estimator's own `tau` was designed for. The full table is above
-`classify_bars`, and the tests in `test_spread.py` pin all three findings,
-including the negative one.
+spread. A carried whole bar on five per cent of days inflates a 10 bps spread
+to 18 (a carried close, to 16); at fifteen per cent, to 27 (25). Setting them
+aside recovers 10.0. Flat bars do nothing, which is what the estimator's own
+`tau` was designed for. The table is above `classify_bars`,
+`eval.spread_controls.contamination_control` regenerates it, and the tests in
+`test_spread.py` pin all three findings, including the negative one.
+
+What the count cannot see was measured too, after review, and is the more
+important half. A **daily reversal in the price itself** — each day's move
+partly undone overnight, which is what a stale or non-synchronous close looks
+like from outside — inflates the same 10 bps to 15 at a return
+autocorrelation of −0.05 and to 22 at −0.15, and sets aside nothing, because
+every bar is a faithful bar of a price that reverts. At the daily frequency a
+bounce and a reversal are the same negative covariance; that is Roll's
+identification problem and the paper's assumption of uncorrelated increments
+read from the other side. No count of bars reaches it, only an instrument
+whose true spread is known — which is what the ladder is.
 
 #15 is the same family as Group A, found in the same way — by writing the
 test for the case the control existed for before believing the control — and
@@ -492,11 +504,12 @@ The working rules that fall out of it, in the order they pay off:
    that can.
 9. **Conservative is not a substitute for right.** The bounded tier was
    defended as "errs toward overstating cost, which is the safe direction",
-   and that defence would have accepted seven ceilings wrong by a factor of
-   ten. A number that is wrong in a direction one likes is still wrong, and
-   the direction is not even stable: a ceiling built on carried bars is
-   pushed *up*, and the same feed defect on a different estimator could push
-   it down. The direction of an error is not evidence about its size.
+   and that defence would have accepted a ceiling twenty times too wide on
+   the one holding whose spread is least in doubt. A number that is wrong in
+   a direction one likes is still wrong, and the direction is not even
+   stable: a ceiling built on carried bars is pushed *up*, and the same feed
+   defect on a different estimator could push it down. The direction of an
+   error is not evidence about its size.
 
 ## An open result: the first real-book spread survey
 
@@ -506,13 +519,17 @@ subsequent run is appended to `spread-runs.jsonl` in the data root by
 `portfolio spreads`, so this is the last one that has to be written by hand.
 
 The survey was run on a real book of seven holdings against Yahoo's daily
-bars, over each instrument's whole available history. **Nothing resolved.**
-All seven came back `bounded`, with ceilings from **15.2 to 59.7 bps**. Two of
-them are known to be wrong in opposite directions:
+bars. It believed it was reading each instrument's whole available history;
+it was almost certainly reading the two years the first wiring had fetched,
+because the cache served them for ever and nothing recorded what had been
+asked for (found by review afterwards; the period is now recorded and
+anything not recorded as the whole history is refetched). **Nothing
+resolved.** All seven came back `bounded`, with ceilings from **15.2 to 59.7
+bps**. Two of them are known to be wrong in opposite directions:
 
 * Schneider Electric (FR0000121972), a CAC 40 mega-cap whose half-spread on
   Euronext Paris is one or two basis points, came back at **41.85 bps at
-  t = 1.93** — the most nearly resolved of the seven, with a ceiling of 59.7.
+  t = 1.93**, a ceiling of 59.7.
 * The European Property Yield fund, a small sector ETF whose half-spread is
   fifteen to thirty, came back at **3.18 bps**, the tightest of the book.
 
@@ -525,22 +542,32 @@ Semiconductors −0.197, Physical Gold −0.162, Europe Industrials −0.138.
 
 What is and is not established:
 
-* The estimator is not the fault on its own: it passes six controls on
-  simulated bars, and #14's measurement shows that carried bars alone produce
-  exactly this shape — an inflated ceiling with an error bar far wider than
-  the sample allows — with the fault falling on whichever lines the feed
-  carries most.
+* The estimator is not the fault on its own: it passes seven controls on
+  simulated bars. What produced the book's numbers is not established, and
+  the two candidates measured so far each explain half of the shape. Carried
+  bars inflate the point estimate — by 84% at five per cent of days — and
+  the estimate *resolves*, with an error bar in proportion; the book's
+  reading did not resolve, and its ceiling of 59.7 is about eight times the
+  ceiling a clean sample of that length would report at 1.5% a day. That
+  wide error bar is a second signature, like the autocorrelation, that
+  nothing simulated reproduces. The original hypothesis — a contaminated
+  high or low — was measured against it too, on the error bar this time
+  rather than the bias: a high or low displaced by up to 2% of price on up
+  to a tenth of bars leaves the ceiling within 1.1 times what a clean
+  sample reports. It does nothing on either count.
 * Carried bars are **not** what produces the negative autocorrelation. On
-  simulated bars they push it positive (+0.03 at 5%, up to +0.12 at 15%), and
-  nothing tried — carried closes, carried opens, contaminated ranges, flat
-  bars — pushes it negative. Seven negatives with four beyond −0.10 is a
-  signature of something not yet simulated, and it is left as an observation
-  rather than attributed.
-* Whether Yahoo's European bars carry closes at a rate that explains a factor
-  of twenty is not established from here. It is exactly what the two-column
-  survey now counts and what the ladder decides: SPY and AAPL inside their
-  bands with SU.PA and MEUD.PA outside theirs is the provider; SPY outside
-  its band is the pipeline. That run needs the provider and is the user's.
+  simulated bars they push it positive (about +0.02 at 5%, up to +0.11 at
+  15%). A daily reversal in the price itself — the stale-close signature —
+  is the one thing tried that pushes it negative, and inflates the estimate
+  by 120% at −0.15, but reaches only −0.03 against the book's −0.40. Seven
+  negatives with four beyond −0.10 remain a signature of something not yet
+  simulated, and are left as an observation rather than attributed.
+* Whether Yahoo's European bars carry closes, or revert overnight, at a rate
+  that explains a factor of twenty is not established from here. It is
+  exactly what the two-column survey now counts and what the ladder decides:
+  SPY and AAPL inside their bands with SU.PA and MEUD.PA outside theirs is
+  the provider; SPY outside its band is the pipeline. That run needs the
+  provider and is the user's.
 * The book's symbol for Schneider is one thing the ladder and the survey now
   print side by side. SU.PA is Euronext Paris; a symbol resolving to a
   secondary listing would be a wide spread measured correctly on the wrong

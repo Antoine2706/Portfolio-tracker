@@ -60,7 +60,10 @@ LIVE_MARKERS = {
 # Directories with no bearing on what this repository does: vendored
 # third-party code we did not write, build artefacts, and binary assets.
 SKIP_DIRS = {".git", "__pycache__", "node_modules", "vendor", ".pytest_cache",
-             "screenshots", ".ruff_cache", "dist", "build", ".venv"}
+             "screenshots", ".ruff_cache", "dist", "build", ".venv",
+             # A nested worktree the review harness creates under .claude/
+             # is a second copy of the whole repository, this file included.
+             ".claude"}
 TEXT_SUFFIXES = {".py", ".js", ".json", ".toml", ".cfg", ".ini", ".md", ".txt",
                  ".yml", ".yaml", ".css", ".html", ".sh", ".jsonl"}
 

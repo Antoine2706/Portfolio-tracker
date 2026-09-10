@@ -58,13 +58,19 @@ So the upper confidence bound is charged instead:
 
     s_upper = sqrt(max(s^2 + k SE(s^2), 0))
 
-which beats the constant on three counts. It is per instrument, because the
+which beats the constant on two counts. It is per instrument, because the
 standard error depends on that instrument's own volatility and bar count, so
 the differentiation the whole exercise exists for survives even where nothing
-resolves. It errs in the direction that costs least, since overstating the
-spread makes the allocator too reluctant to trade rather than too eager. And
-it is falsifiable: a bound that sits below a spread later observed on a quote
-screen is a bug report, which a constant never could be.
+resolves. And it is falsifiable: a bound that sits below a spread later
+observed on a quote screen is a bug report, which a constant never could be.
+
+An earlier version of this paragraph offered a third count: that a ceiling
+errs in the direction that costs least, since overstating the spread makes
+the allocator too reluctant rather than too eager. That was withdrawn after
+the first real book, where seven ceilings came back with the most liquid
+holding widest. A ceiling is only as good as the bars under it; a carried
+close pushes it up, and a number that is wrong in a direction one likes is
+still wrong. The direction of an error is not evidence about its size.
 
 There is a step at the threshold -- just below it the bound is charged, just
 above it the point estimate -- and at exactly ``s^2 = k SE`` the bound is

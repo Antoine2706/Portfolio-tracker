@@ -714,3 +714,44 @@ class TestBarsThatCannotBeTrusted:
                 o[i], h[i], l[i], c[i] = o[i - 1], h[i - 1], l[i - 1], c[i - 1]
             rhos.append(edge(o, h, l, c).autocorrelation)
         assert np.mean(rhos) > 0.02, rhos
+
+
+class TestTheContaminationControlRegeneratesTheTable:
+    """The table above `classify_bars` lived in a comment until a reviewer
+    had to re-derive it to trust it. Now it is a control."""
+
+    def test_it_passes_and_says_what_it_measured(self):
+        from portfolio.eval.spread_controls import contamination_control
+        report = contamination_control(runs=10, bars=800)
+        assert report.passed, "\n".join(report.lines())
+        text = "\n".join(report.lines())
+        assert "whole bar carried forward" in text
+        assert "daily reversal in the price itself" in text
+        rows = {(r["kind"], r["share"]): r for r in report.numbers["rows"]}
+        base = report.numbers["baseline_bps"]
+        assert rows[("whole bar carried forward", "5%")]["contaminated_bps"] > 1.35 * base
+        assert rows[("high and low widened by 30 bps", "15%")]["set_aside"] == 0.0
+        reversal = rows[("daily reversal in the price itself", "phi -0.15")]
+        assert reversal["contaminated_bps"] > 1.35 * base
+        assert reversal["set_aside"] == 0.0
+
+    def test_it_bites_when_the_mask_stops_catching_carried_bars(self, monkeypatch):
+        """Sabotage: a mask that flags nothing. The control must fail on
+        its recovery claim, or it is a table with a PASS stamp."""
+        from portfolio.eval import spread_controls
+        from portfolio.core import spread as core_spread
+
+        real = core_spread.classify_bars
+
+        def blind(*args, **kwargs):
+            q = real(*args, **kwargs)
+            return type(q)(bars=q.bars, repeated=np.zeros_like(q.repeated),
+                           stale_close=np.zeros_like(q.stale_close),
+                           flat=q.flat, flat_at_previous_close=q.flat_at_previous_close,
+                           impossible=q.impossible, zero_volume=q.zero_volume,
+                           no_volume=q.no_volume)
+
+        monkeypatch.setattr(spread_controls, "classify_bars", blind)
+        report = spread_controls.contamination_control(runs=6, bars=600)
+        assert not report.passed
+        assert "recovers the imposed spread: NO" in "\n".join(report.lines())

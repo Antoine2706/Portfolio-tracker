@@ -916,7 +916,9 @@ def sweep_windows(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
 # A feed can be wrong in several ways, and it matters which, because the
 # estimator is indifferent to most of them and enormously sensitive to one.
 # Measured, 60 runs of 1500 bars at 10 bps imposed, contaminating 5% and 15%
-# of bars, with the contaminated bars then set aside and the estimate re-run:
+# of bars, with the contaminated bars then set aside and the estimate re-run.
+# `eval.spread_controls.contamination_control` regenerates this table, so
+# that a doubted row is re-run rather than argued about:
 #
 #     contamination                    5% of bars   15% of bars   set aside
 #     whole bar carried forward          +84%         +171%        10.0 bps
@@ -936,15 +938,25 @@ def sweep_windows(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
 # ``r4 = c_{t-1} - eta_{t-1}`` and ``r3 = eta_t - c_{t-1}`` read a day's real
 # price move as a bounce, and ``-(4/p_c) d3 r4`` turns that into a squared
 # spread. A carried whole bar does the same on both edges. Five per cent of
-# such bars nearly doubles the estimate, and daily feeds for European venues
-# are known to fill non-trading days with exactly that.
+# such bars nearly doubles the estimate. Whether a given provider's bars
+# carry closes, and at what rate, is not known here; it is what the survey
+# counts per instrument.
+#
+# Two limits of the count. Exact equality catches a copy and nothing else:
+# a close that is stale without being a copy -- the last print hours before
+# the close, or a carried close nudged by a rounding -- inflates the estimate
+# by the same mechanism and is invisible to four prices, so two columns that
+# agree say only that the exact repeats did not matter. And a carried bar
+# inflates the *estimate* while leaving its error bar in proportion: on
+# simulated bars it produces a resolved wide reading, not an unresolved one.
 #
 # The autocorrelation of the per-bar series is measured on the same runs and
 # is worth recording because it did NOT behave as expected: carried bars push
-# it *positive* (+0.03 at 5%, +0.06 to +0.12 at 15%), and nothing in the table
-# pushes it negative. The real book showed it negative on all seven
-# instruments, four of them beyond -0.10. That is therefore not explained by
-# anything here, and it is left as an open observation rather than attributed.
+# it *positive* (about +0.02 at 5%, two standard errors from zero; +0.06 to
+# +0.11 at 15%), and nothing in the table pushes it negative. The real book
+# showed it negative on all seven instruments, four of them beyond -0.10.
+# That is therefore not explained by anything in the table, and it is left as
+# an open observation rather than attributed.
 #
 # So this classifies every bar, counts each kind separately, and hands back a
 # mask of the ones whose effect was measured to bias the estimate, so that

@@ -162,8 +162,16 @@ class PriceCache:
     # `get_bars` maps NULL to NaN, and every consumer treats NaN as "this was
     # never fetched". Nothing is invented; the row simply says less than a
     # freshly fetched one, which is true.
+    # `period` records what the provider was asked for when the rows were
+    # written -- "2y", "max" -- because the rows themselves cannot say. The
+    # first wiring of the spread survey fetched two years and wrote
+    # `had_volume`, so nothing ever refetched, and a survey that believed
+    # it was reading the whole history was reading two years for ever. NULL
+    # means "written before this was recorded", which the caller treats as
+    # "not known to be the whole history" and refetches.
     _ADDED_COLUMNS = {"bars": {"volume": "REAL"},
-                      "bars_meta": {"had_volume": "INTEGER"}}
+                      "bars_meta": {"had_volume": "INTEGER",
+                                    "period": "TEXT"}}
 
     def _add_missing_columns(self) -> None:
         for table, columns in self._ADDED_COLUMNS.items():
@@ -277,6 +285,19 @@ class PriceCache:
                 (symbol,)).fetchone()
         return row is not None and row[0] is None
 
+    def bars_period(self, symbol: str) -> str | None:
+        """What the provider was asked for when these rows were written.
+
+        None for rows written before the period was recorded, and for a
+        symbol with no rows at all: both mean the cache cannot vouch for the
+        rows being the whole history.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT period FROM bars_meta WHERE symbol = ?",
+                (symbol,)).fetchone()
+        return None if row is None else row[0]
+
     def get_bars(self, symbol: str) -> tuple[pd.DataFrame, dt.datetime] | None:
         """Cached unadjusted OHLC and when it was fetched, or None."""
         with self._lock:
@@ -302,7 +323,8 @@ class PriceCache:
             index=index, dtype=float)
         return frame, _unstamp(meta[0])
 
-    def put_bars(self, symbol: str, frame: pd.DataFrame) -> None:
+    def put_bars(self, symbol: str, frame: pd.DataFrame, *,
+                 period: str | None = None) -> None:
         """Upsert bars; existing dates are overwritten, others are kept.
 
         A bar is stored only when all four prices are present. A day with a
@@ -311,6 +333,10 @@ class PriceCache:
         would manufacture a zero-range day, which the spread estimator reads
         as "this instrument did not trade" and drops. Same answer, arrived at
         by inventing data, which is worse than not having it.
+
+        `period` is what the provider was asked for. Given, it is recorded;
+        omitted, whatever was recorded before is kept, so that an incremental
+        fetch of the tail does not demote a "max" history to "unknown".
         """
         needed = ["open", "high", "low", "close"]
         missing = [c for c in needed if c not in frame.columns]
@@ -334,6 +360,20 @@ class PriceCache:
                     index, clean["open"], clean["high"], clean["low"],
                     clean["close"], volume)]
         with self._transaction() as conn:
+            if period is None:
+                kept = conn.execute(
+                    "SELECT period FROM bars_meta WHERE symbol = ?",
+                    (symbol,)).fetchone()
+                period = None if kept is None else kept[0]
+            # Volume the same way: a tail that happens to carry none must
+            # not make a history that had it look volume-less.
+            had_volume = int(bool(volume.notna().any()))
+            if not had_volume:
+                earlier = conn.execute(
+                    "SELECT had_volume FROM bars_meta WHERE symbol = ?",
+                    (symbol,)).fetchone()
+                if earlier is not None and earlier[0]:
+                    had_volume = 1
             conn.executemany(
                 "INSERT OR REPLACE INTO bars (symbol, date, open, high, low, "
                 "close, volume) VALUES (?, ?, ?, ?, ?, ?, ?)", rows)
@@ -342,10 +382,10 @@ class PriceCache:
                 "WHERE symbol = ?", (symbol,)).fetchone()
             conn.execute(
                 "INSERT OR REPLACE INTO bars_meta "
-                "(symbol, fetched_at, first_date, last_date, rows, had_volume) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
-                (symbol, _stamp(_now()), first, last, count,
-                 int(bool(volume.notna().any()))))
+                "(symbol, fetched_at, first_date, last_date, rows, had_volume, "
+                "period) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (symbol, _stamp(_now()), first, last, count, had_volume,
+                 period))
 
     # -- quotes ------------------------------------------------------------
 

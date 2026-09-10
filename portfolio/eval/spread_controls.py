@@ -29,8 +29,8 @@ almost surely, and any of the classical estimators would do; at 4 trades a bar
 the open is frequently itself the extreme, which is the case EDGE's `p_o` and
 `p_c` corrections exist for and the case its predecessors are biased in.
 
-Five controls
--------------
+Seven controls
+--------------
 **Positive.** Sweep the imposed spread from 2 to 100 bps and report the bias
 and the dispersion at each rung, over many independent runs. Not a pass or a
 fail on one draw: the question is whether the estimator is centred on the
@@ -59,6 +59,32 @@ steps.
 rather than return a number. This checks that the refusal fires, and -- the
 part that matters -- that the region just above the threshold is not itself
 producing garbage that the threshold was set too low to catch.
+
+**Resolution by window.** What a longer history buys, at each spread: the
+measurement that moved the survey from the holding period to the whole
+available history, and the one that says the tight end is not rescued.
+
+**Contamination.** What each kind of bar a daily feed manufactures does to
+the estimate, and whether `core.spread.classify_bars` sets aside the kinds
+that matter. This is the table above `classify_bars`, regenerated: a carried
+close or a carried whole bar on five per cent of days must inflate the
+estimate by more than a third and setting them aside must recover it; a
+flat bar, a carried open, and a widened high or low must move it by less
+than a tenth. The control exists because the table first lived in a comment
+and a reviewer had to re-derive it to trust it, which is the "scrolled off a
+terminal" failure the run log was added to prevent.
+
+It also carries the finding that no count of bars reaches. A **daily
+reversal in the price itself** -- each day's move partly undone overnight,
+which is what a stale or non-synchronous close looks like from outside --
+inflates the estimate by 50% at a return autocorrelation of -0.05 and by
+120% at -0.15, and sets aside nothing, because every bar is a faithful bar
+of a price that reverts. At the daily frequency a bounce and a reversal are
+the same negative covariance; that is Roll's identification problem and the
+paper's assumption of uncorrelated efficient-price increments, read from the
+other side. It is the one contamination tried that also pushes the per-bar
+autocorrelation negative, as the real book's was, though only to -0.03
+against the book's -0.40.
 
 What these controls found
 -------------------------
@@ -184,13 +210,15 @@ import math
 
 import numpy as np
 
-from ..core.spread import MINIMUM_BARS, edge
+from ..core.spread import MINIMUM_BARS, classify_bars, edge, exclude_bars
 
 __all__ = [
     "simulate_bars", "SweepRung", "SpreadControlReport", "positive_control",
     "negative_control", "standard_error_control", "resolution_control",
-    "resolution_by_window_control", "refusal_control", "run_spread_controls",
-    "SWEEP_BPS",
+    "resolution_by_window_control", "refusal_control",
+    "contamination_control", "contaminate", "CONTAMINATIONS",
+    "simulate_reversal_bars", "REVERSALS", "ContaminationRow",
+    "run_spread_controls", "SWEEP_BPS",
 ]
 
 
@@ -759,8 +787,261 @@ def resolution_by_window_control(
                  "unreachable": unreachable})
 
 
+# The kinds of bar a daily feed manufactures, each written forwards as a
+# change to clean bars. The names are the ones `classify_bars` counts under,
+# where it counts them at all: the last three it does not, because they
+# were measured to do nothing, and this control is what keeps that claim
+# honest.
+CONTAMINATIONS: tuple[str, ...] = (
+    "whole bar carried forward", "close carried forward",
+    "open carried (= previous close)", "high and low widened by 30 bps",
+    "high alone widened by 30 bps", "high == low (one price all day)",
+    "open == high == low == close")
+
+# Kinds the mask must set aside, and that must move the estimate by more
+# than this fraction at 5% of bars before exclusion.
+BIASING: frozenset[str] = frozenset(CONTAMINATIONS[:2])
+BIAS_AT_LEAST = 0.35
+# Kinds that must move it by less than this at 15% of bars.
+HARMLESS_WITHIN = 0.10
+
+
+def contaminate(kind: str, open_: np.ndarray, high: np.ndarray,
+                low: np.ndarray, close: np.ndarray, picked: np.ndarray
+                ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Copies of the four series with `kind` imposed on the `picked` bars.
+
+    `picked` must be sorted ascending and exclude bar 0, so that a carried
+    bar copies from a bar that has itself already been settled.
+
+    >>> o = np.array([1.0, 2.0, 3.0]); h = o + 0.1; l = o - 0.1; c = o.copy()
+    >>> o2, h2, l2, c2 = contaminate("close carried forward", o, h, l, c,
+    ...                              np.array([2]))
+    >>> float(c2[2]), float(c[2])
+    (2.0, 3.0)
+    """
+    o, h, l, c = (np.array(x, dtype=float, copy=True)
+                  for x in (open_, high, low, close))
+    for i in picked:
+        if kind == "whole bar carried forward":
+            o[i], h[i], l[i], c[i] = o[i - 1], h[i - 1], l[i - 1], c[i - 1]
+        elif kind == "close carried forward":
+            c[i] = c[i - 1]
+            h[i], l[i] = max(h[i], c[i]), min(l[i], c[i])
+        elif kind == "open carried (= previous close)":
+            o[i] = c[i - 1]
+            h[i], l[i] = max(h[i], o[i]), min(l[i], o[i])
+        elif kind == "high and low widened by 30 bps":
+            h[i] *= 1.003
+            l[i] /= 1.003
+        elif kind == "high alone widened by 30 bps":
+            h[i] *= 1.003
+        elif kind == "high == low (one price all day)":
+            h[i] = l[i] = c[i]
+            o[i] = c[i]
+        elif kind == "open == high == low == close":
+            o[i] = h[i] = l[i] = c[i]
+        else:
+            raise ValueError(f"unknown contamination {kind!r}")
+    return o, h, l, c
+
+
+def simulate_reversal_bars(spread: float, *, bars: int = 500, ticks: int = 60,
+                           sigma: float = 0.01, phi: float = -0.15,
+                           seed: int = 0) -> tuple[np.ndarray, ...]:
+    """`simulate_bars`, with part of each day's move reversed overnight.
+
+    The efficient price is no longer a random walk at the daily horizon:
+    the first tick of day t carries `phi` times the previous day's total
+    move, so daily returns have autocorrelation close to `phi`. That is
+    what a stale or non-synchronous close looks like from outside -- a
+    print that has not caught up, followed by a morning that catches up --
+    and it is not a property of any single bar, so no bar of it can be
+    set aside.
+
+    >>> o, h, l, c = simulate_reversal_bars(0.002, bars=2000, phi=-0.3, seed=1)
+    >>> r = np.diff(np.log(c))
+    >>> bool(np.corrcoef(r[1:], r[:-1])[0, 1] < -0.2)
+    True
+    """
+    if spread < 0:
+        raise ValueError("spread must be non-negative")
+    rng = np.random.default_rng(seed)
+    steps = rng.normal(0.0, sigma / math.sqrt(ticks), (bars, ticks))
+    day = steps.sum(axis=1)
+    carry = np.zeros(bars)
+    for t in range(1, bars):
+        carry[t] = phi * (day[t - 1] + carry[t - 1])
+    steps[:, 0] += carry
+    mid = np.exp(np.cumsum(steps.ravel())).reshape(bars, ticks) * 100.0
+    side = rng.choice((-1.0, 1.0), size=(bars, ticks))
+    prints = mid * (1.0 + side * spread / 2.0)
+    return (prints[:, 0].copy(), prints.max(axis=1), prints.min(axis=1),
+            prints[:, -1].copy())
+
+
+# Daily return autocorrelations the reversal rows are run at. -0.15 is a
+# stale-price signature of ordinary size; -0.05 is barely visible in a
+# return series and still doubles the estimate's error.
+REVERSALS: tuple[float, ...] = (-0.05, -0.15)
+
+
+@dataclasses.dataclass(frozen=True)
+class ContaminationRow:
+    kind: str
+    share: str                           # "5%" or "phi -0.15"
+    contaminated_bps: float
+    contaminated_se_bps: float
+    excluded_bps: float
+    excluded_se_bps: float
+    autocorrelation: float
+    set_aside: float                     # mean count of bars the mask flagged
+
+
+def contamination_control(*, runs: int = 60, bars: int = 1500, ticks: int = 60,
+                          sigma: float = 0.01, seed0: int = 40_000,
+                          imposed_bps: float = 10.0,
+                          fractions: tuple[float, ...] = (0.05, 0.15),
+                          reversals: tuple[float, ...] = REVERSALS
+                          ) -> SpreadControlReport:
+    """What each kind of manufactured bar does, and whether the mask catches it.
+
+    Four claims, each checked:
+
+      * a carried close or a carried whole bar on the smaller fraction of
+        days inflates the estimate by at least `BIAS_AT_LEAST`;
+      * setting aside the bars `classify_bars` flags recovers the imposed
+        spread, to within three standard errors of the mean over runs;
+      * the other kinds of bar move the estimate by less than
+        `HARMLESS_WITHIN`, or less than their own sampling error, even at
+        the larger fraction -- which is why they are counted and not
+        excluded;
+      * a daily reversal in the price itself inflates the estimate by at
+        least `BIAS_AT_LEAST` at the stronger `reversals` setting while the
+        mask sets aside nothing, because nothing is wrong with any bar.
+
+    The last is a limit of the method, pinned so it is not forgotten: at
+    the daily frequency the estimator cannot tell a bounce from a
+    reversal, which is Roll's identification problem and the paper's
+    assumption of uncorrelated efficient-price increments read backwards.
+    A feed whose close is a print the market has moved past by the morning
+    produces exactly that, and no count of bars will find it.
+
+    The per-bar autocorrelation is reported alongside, with no pass
+    criterion: on the real book it was negative on every instrument, and
+    this is the place to see that carried bars push it one way and a
+    reversal the other.
+
+    >>> r = contamination_control(runs=8, bars=800)
+    >>> r.passed
+    True
+    """
+    def summary(values) -> tuple[float, float]:
+        arr = np.array(values, dtype=float)
+        return float(arr.mean()), float(arr.std(ddof=1) / math.sqrt(arr.size))
+
+    baseline = []
+    for i in range(runs):
+        o, h, l, c = simulate_bars(2.0 * imposed_bps / 10_000.0, bars=bars,
+                                   ticks=ticks, sigma=sigma, seed=seed0 + i)
+        baseline.append(edge(o, h, l, c).half_spread_bps)
+    base, base_se = summary(baseline)
+
+    def measure(kind: str, share: str, make) -> ContaminationRow:
+        got, cleaned, rhos, flagged = [], [], [], []
+        for i in range(runs):
+            oc, hc, lc, cc = make(i)
+            e = edge(oc, hc, lc, cc)
+            got.append(e.half_spread_bps)
+            rhos.append(e.autocorrelation)
+            mask = classify_bars(oc, hc, lc, cc).excluded
+            flagged.append(int(mask.sum()))
+            cleaned.append(edge(*exclude_bars(oc, hc, lc, cc, mask))
+                           .half_spread_bps)
+        c_mean, c_se = summary(got)
+        x_mean, x_se = summary(cleaned)
+        return ContaminationRow(
+            kind, share, c_mean, c_se, x_mean, x_se,
+            float(np.nanmean([r for r in rhos if r is not None])),
+            float(np.mean(flagged)))
+
+    rows: list[ContaminationRow] = []
+    for kind in CONTAMINATIONS:
+        for fraction in fractions:
+            def make(i, kind=kind, fraction=fraction):
+                o, h, l, c = simulate_bars(2.0 * imposed_bps / 10_000.0,
+                                           bars=bars, ticks=ticks, sigma=sigma,
+                                           seed=seed0 + i)
+                rng = np.random.default_rng(seed0 + 7 * i + 1)
+                picked = np.sort(rng.choice(np.arange(1, bars),
+                                            int(fraction * bars), replace=False))
+                return contaminate(kind, o, h, l, c, picked)
+            rows.append(measure(kind, f"{fraction:.0%}", make))
+    for phi in reversals:
+        def make(i, phi=phi):
+            return simulate_reversal_bars(2.0 * imposed_bps / 10_000.0,
+                                          bars=bars, ticks=ticks, sigma=sigma,
+                                          phi=phi, seed=seed0 + i)
+        rows.append(measure("daily reversal in the price itself",
+                            f"phi {phi:+.2f}", make))
+
+    def bias(row: ContaminationRow) -> float:
+        return (row.contaminated_bps - base) / base
+
+    small, large = f"{min(fractions):.0%}", f"{max(fractions):.0%}"
+    biasing = [r for r in rows if r.kind in BIASING]
+    harmless_rows = [r for r in rows
+                     if r.kind in CONTAMINATIONS and r.kind not in BIASING]
+    reversal_rows = [r for r in rows if r.kind not in CONTAMINATIONS]
+    inflates = all(bias(r) >= BIAS_AT_LEAST for r in biasing if r.share == small)
+    recovers = all(abs(r.excluded_bps - base)
+                   <= 3.0 * math.hypot(r.excluded_se_bps, base_se)
+                   for r in biasing)
+    # Within a tenth, or within its own sampling error: at a handful of
+    # runs a tenth is under one standard error and the control would fail
+    # on noise, which is a control failing for the wrong reason.
+    harmless = all(abs(r.contaminated_bps - base)
+                   <= max(HARMLESS_WITHIN * base,
+                          3.0 * math.hypot(r.contaminated_se_bps, base_se))
+                   for r in harmless_rows if r.share == large)
+    strongest = (min(reversals) if reversals else None)
+    reversal_bites = all(bias(r) >= BIAS_AT_LEAST and r.set_aside == 0.0
+                         for r in reversal_rows
+                         if strongest is not None
+                         and r.share == f"phi {strongest:+.2f}")
+    passed = inflates and recovers and harmless and reversal_bites
+
+    detail = "\n".join(
+        [f"{runs} runs of {bars} bars at {imposed_bps:.0f} bps imposed; "
+         f"clean baseline {base:.2f} +/- {base_se:.2f} bps",
+         f"  {'contamination':<34} {'share':>9}  {'estimate':>8}  "
+         f"{'bias':>6}  {'set aside':>9}  {'flagged':>7}  per-bar rho"]
+        + [f"  {r.kind:<34} {r.share:>9}  {r.contaminated_bps:8.2f}  "
+           f"{bias(r):+6.0%}  {r.excluded_bps:9.2f}  {r.set_aside:7.0f}  "
+           f"{r.autocorrelation:+.3f}" for r in rows]
+        + [f"carried close and carried bar inflate by at least "
+           f"{BIAS_AT_LEAST:.0%} at {small}: {'yes' if inflates else 'NO'}",
+           f"setting aside what classify_bars flags recovers the imposed "
+           f"spread: {'yes' if recovers else 'NO'}",
+           f"the other kinds of bar move it by under {HARMLESS_WITHIN:.0%} "
+           f"(or their own sampling error) at {large}: "
+           f"{'yes' if harmless else 'NO'}",
+           f"a daily reversal inflates it by at least {BIAS_AT_LEAST:.0%} "
+           f"with nothing to set aside: {'yes' if reversal_bites else 'NO'}",
+           "the (h+l)/2 hypothesis -- that a widened high or low is what "
+           "breaks the estimator -- is the widened rows, and they are the "
+           "reason the survey counts carried bars rather than ranges. The "
+           "reversal rows are the limit no count reaches: at the daily "
+           "frequency a bounce and a reversal are the same covariance."])
+    return SpreadControlReport(
+        name="Contamination: what a manufactured bar does, and what is set aside",
+        passed=passed, detail=detail,
+        numbers={"baseline_bps": base, "baseline_se_bps": base_se,
+                 "rows": [dataclasses.asdict(r) for r in rows]})
+
+
 def run_spread_controls(*, quick: bool = False) -> list[SpreadControlReport]:
-    """All five. This is what `portfolio controls --spread` prints."""
+    """All seven. This is what `portfolio controls --spread` prints."""
     if quick:
         return [
             positive_control(runs=20, bars=400, sweep=(2.0, 20.0, 100.0)),
@@ -772,7 +1053,8 @@ def run_spread_controls(*, quick: bool = False) -> list[SpreadControlReport]:
             resolution_by_window_control(runs=30, spreads=(4.0, 8.0, 10.0),
                                          lengths=(250, 1000)),
             refusal_control(runs=20),
+            contamination_control(runs=12, bars=800),
         ]
     return [positive_control(), negative_control(), standard_error_control(),
             resolution_control(), resolution_by_window_control(),
-            refusal_control()]
+            refusal_control(), contamination_control()]

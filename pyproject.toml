@@ -47,6 +47,10 @@ portfolio = ["web/**/*", "data_store/seed/*"]
 # runs is a comment. data/ is here for the schema migration's derivation
 # table, and cli.py for the rate parser, both of which turn a written value
 # into a stored one and so are exactly where a plausible wrong number enters.
+# research.py for the ladder verdict and the null ceiling, whose doctests
+# were written and then found never to be collected -- the rule above, broken
+# in the same file that states it.
 testpaths = ["portfolio/tests", "portfolio/core", "portfolio/eval",
-             "portfolio/agents", "portfolio/data", "portfolio/cli.py"]
+             "portfolio/agents", "portfolio/data", "portfolio/cli.py",
+             "portfolio/research.py"]
 addopts = "-q --doctest-modules --doctest-ignore-import-errors"

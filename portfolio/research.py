@@ -442,24 +442,67 @@ def tick_for(prices: "pd.DataFrame") -> "object":
     return infer_tick_size(prices.tail(TICK_WINDOW).to_numpy().ravel())
 
 
-def _bars_for(symbol: str, provider, cache) -> "pd.DataFrame":
+# A cached history whose last bar is older than this is topped up from the
+# provider before it is used. Days, not trading days: a week covers any
+# holiday run, and a survey that reads bars ending a fortnight ago is
+# measuring a fortnight-old market without saying so.
+STALE_BARS_DAYS = 5
+# The incremental fetch starts this far before the last cached bar, so that
+# a provider that revises its most recent rows overwrites them.
+BARS_OVERLAP = dt.timedelta(days=7)
+
+
+def _bars_for(symbol: str, provider, cache, *,
+              today: "dt.date | None" = None) -> "pd.DataFrame":
     """Unadjusted OHLCV for `symbol`, through the cache, whole history.
 
     "max", not the two years the price loader takes. A spread is a property
     of the instrument and its market makers rather than of the holding
     period, and the noise floor thins as the fourth root of the sample: on
     250 bars nothing under about 9 bps resolves, which is most of a European
-    ETF book. Raises whatever the provider raises; the caller decides whether
-    that is a refusal or a failure.
+    ETF book. Raises whatever the provider raises on a fresh fetch; the
+    caller decides whether that is a refusal or a failure.
+
+    Three things a cache must not do here, each found by a reviewer probing
+    the previous version rather than by a test:
+
+    * Serve a short history for ever. The first wiring fetched two years and
+      wrote every flag a later version checked, so "max" was never fetched
+      and the survey believed it was reading the whole history. The period
+      the rows were fetched with is now recorded, and anything not recorded
+      as "max" is refetched as "max".
+    * Never advance. A cached history with no refresh reads the same bars in
+      March as in January, and the run log's purpose -- comparing two runs
+      months apart -- would compare a feed against itself. The tail is
+      topped up when the last bar is more than `STALE_BARS_DAYS` old. If the
+      top-up fails, the cached rows are used and the survey prints the dates
+      they span, so the staleness is visible rather than silent.
+    * Return the provider's frame on the first run and the cache's copy on
+      every later one. The cache drops rows with a missing price, so the
+      two frames pair different days and the first run's estimate differs
+      from every subsequent one. The cache's view is returned every time.
     """
+    today = today or dt.date.today()
     cached = cache.get_bars(symbol)
-    if cached is not None and not cache.bars_predate_volume(symbol):
-        frame = cached[0]
-        if frame is not None and not frame.empty:
-            return frame
-    frame = provider.bars(symbol, period="max")
-    cache.put_bars(symbol, frame)
-    return frame
+    whole = (cached is not None and not cache.bars_predate_volume(symbol)
+             and cache.bars_period(symbol) == "max")
+    if not whole:
+        cache.put_bars(symbol, provider.bars(symbol, period="max"),
+                       period="max")
+    else:
+        last = cached[0].index[-1].date()
+        if (today - last).days > STALE_BARS_DAYS:
+            try:
+                tail = provider.bars(symbol, start=last - BARS_OVERLAP)
+            except Exception:                    # noqa: BLE001 - stale is visible, absent is not
+                tail = None
+            if tail is not None and not tail.empty:
+                cache.put_bars(symbol, tail)
+    stored = cache.get_bars(symbol)
+    if stored is None or stored[0].empty:
+        raise ValueError(f"no bars for {symbol} survived the cache: the "
+                         f"provider returned rows without all four prices")
+    return stored[0]
 
 
 def _liquidity_proxy(frame: "pd.DataFrame") -> tuple[float | None, int]:
@@ -475,8 +518,9 @@ def _liquidity_proxy(frame: "pd.DataFrame") -> tuple[float | None, int]:
     does not have.
 
     None when the provider reported no volume, or fewer than 20 bars of it,
-    or a median of zero -- which for a European ETF on a consolidated feed is
-    common, and means the proxy is missing rather than that nothing trades.
+    or a median of zero. A zero median means the proxy is missing rather
+    than that nothing trades; how often a provider reports it for a line
+    that does trade is not measured here.
     """
     if "volume" not in frame.columns:
         return None, 0
@@ -500,15 +544,20 @@ class SpreadSurvey:
     The decision that would be written is still the one on every bar. The
     exclusion is a hypothesis about the feed, measured on simulated bars and
     not yet on this provider's, and the survey is where that hypothesis is
-    tested rather than assumed: if the two columns agree the bars set aside
-    did not matter, and if they disagree the difference is attributable to a
-    named count of named bars.
+    tested rather than assumed: if the two columns disagree the difference
+    is attributable to a named count of named bars. If they agree, the
+    bars that are exact repeats did not matter -- and no more than that. A
+    close that is stale without being a copy (the last print hours before
+    the close, or a carried close nudged by a rounding) inflates the
+    estimate by the same mechanism and is not counted, because from four
+    prices alone it cannot be told from a genuine close.
 
     No significance is attached to the difference between the two columns.
     They are nested samples -- the clean bars are a subset of all of them --
-    so neither the sum of their variances nor either alone is the variance
-    of the difference, and a z-score printed from either would be wrong in
-    a known direction. Both estimates carry their own error bars; read the
+    so the sum of their variances overstates the variance of the difference,
+    and a single error bar can understate it by several times once the bars
+    set aside are the ones that carried the bias. Neither is a z-score, so
+    none is printed. Both estimates carry their own error bars; read the
     difference against those.
     """
     decisions: dict                      # isin -> agents.spreads.SpreadDecision
@@ -530,6 +579,9 @@ class SpreadSurvey:
     # instruments whose estimate did not resolve, because for those the
     # ceiling IS the claim and this is what says whether it is plausible.
     null_ceiling: dict = dataclasses.field(default_factory=dict)
+    # isin -> (first date, last date, rows): which bars the estimate rests
+    # on, printed so that a stale or short history is visible.
+    spans: dict = dataclasses.field(default_factory=dict)
 
     @property
     def bars_set_aside(self) -> int:
@@ -543,15 +595,25 @@ class SpreadSurvey:
                "appears on no",
                "document. Estimated from each instrument's own open, high, "
                "low and close,",
-               "twice: on every bar the provider sent, and again with the "
-               "bars a feed",
-               "manufactures set aside. Where the two disagree, the bars set "
-               "aside are why.", ""]
+               "twice: on every bar the provider sent, and again with these "
+               "set aside: bars",
+               "identical to the previous day's, closes identical to the "
+               "previous close,",
+               "bars whose open or close lies outside their own range, and "
+               "bars with zero",
+               "volume. Flat bars are counted and kept; the estimator already "
+               "treats them",
+               "as untraded, and setting them aside was measured to change "
+               "nothing.", ""]
         for isin, d in sorted(self.decisions.items(),
                               key=lambda kv: -kv[1].half_spread_bps):
             label = self.names.get(isin, "")
             symbol = self.symbols.get(isin, "")
             out.append(f"{isin}  {label}{'  (' + symbol + ')' if symbol else ''}")
+            span = self.spans.get(isin)
+            if span is not None:
+                first, last, rows = span
+                out.append(f"    {rows} bars, {first} to {last}")
             out.append(f"    {d.half_spread_bps:6.1f} bps  [{d.source}]"
                        f"{'  CLAMPED TO TICK' if d.clamped_to_tick else ''}"
                        f"   on every bar")
@@ -581,10 +643,14 @@ class SpreadSurvey:
                 upper = _upper_bound_bps(d.estimate, 2.0)
                 if upper is not None and ceiling_bps > 0:
                     times = upper / ceiling_bps
+                    # The ratio, and no cause. Carried bars were measured
+                    # to inflate the estimate and RESOLVE it, not to widen
+                    # the error bar; what widens it this much has not been
+                    # simulated, so nothing here says what did.
                     loud = (" -- the error bar, not the spread, is what is "
-                            "large; the per-bar series has\n           "
-                            "variance the model does not produce, which is "
-                            "what bars that are not trades do"
+                            "large: the per-bar series has\n           "
+                            "variance the model does not produce, and this "
+                            "survey has not measured what did"
                             if times > CEILING_SLACK else "")
                     out.append(f"           the ceiling is {times:.1f}x the "
                                f"{ceiling_bps:.1f} bps a clean sample of "
@@ -688,12 +754,13 @@ class SpreadSurvey:
         out.append("")
         out.append("The liquidity proxy is the provider's own volume times "
                    "the close, median over")
-        out.append("the history, unconverted between currencies. For a "
-                   "European ETF the volume")
-        out.append("Yahoo reports is often another listing's, or none; it is "
-                   "printed per instrument")
-        out.append("above so that a failed ranking can be laid at the right "
-                   "number.")
+        out.append("the history, unconverted between currencies. A "
+                   "provider's volume for one")
+        out.append("listing of a fund may be another listing's, or absent; "
+                   "nothing here checks it,")
+        out.append("which is why it is printed per instrument above, so that "
+                   "a failed ranking can")
+        out.append("be laid at the right number.")
         out.append("")
         out.append("On every bar the provider sent:")
         out.extend(self.ranking.line(self.names).splitlines())
@@ -745,9 +812,13 @@ class SpreadSurvey:
         for isin, d in self.decisions.items():
             q = self.quality.get(isin)
             allowed = self.null_ceiling.get(isin)
+            span = self.spans.get(isin)
             instruments[isin] = {
                 "name": self.names.get(isin, ""),
                 "symbol": self.symbols.get(isin),
+                "bars": None if span is None else {
+                    "first": str(span[0]), "last": str(span[1]),
+                    "rows": span[2]},
                 "every_bar": decision(d, self.sweeps.get(isin)),
                 "bars_set_aside": None if q is None else q.counts(),
                 "clean": decision(self.clean.get(isin),
@@ -781,22 +852,30 @@ def record_survey(survey: SpreadSurvey, path: "pathlib.Path") -> int:
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(entry, default=_json_default) + "\n")
+        # allow_nan=False: json would otherwise write a bare `NaN` token,
+        # which is not JSON and which a reader in another language rejects.
+        # `_json_ready` has already turned every non-finite float into null
+        # and every numpy scalar into a Python one, so this is a tripwire.
+        fh.write(json.dumps(_json_ready(entry), allow_nan=False) + "\n")
     with path.open("r", encoding="utf-8") as fh:
         return sum(1 for line in fh if line.strip())
 
 
-def _json_default(value):
-    """numpy scalars and anything else json cannot serialise on its own."""
-    import numpy as np
-    if isinstance(value, (np.integer,)):
-        return int(value)
-    if isinstance(value, (np.floating,)):
-        return float(value)
-    if isinstance(value, (np.bool_,)):
+def _json_ready(value):
+    """The record with numpy scalars unwrapped and non-finite floats as null."""
+    if isinstance(value, dict):
+        return {str(k): _json_ready(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, (bool, np.bool_)):
         return bool(value)
-    if isinstance(value, float) and value != value:
-        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        as_float = float(value)
+        return as_float if math.isfinite(as_float) else None
+    if value is None or isinstance(value, str):
+        return value
     return str(value)
 
 
@@ -840,6 +919,7 @@ def survey_spreads(book: Book, *, mode: str = "user",
     liquidity_bars: dict = {}
     symbols: dict = {}
     null_ceiling: dict = {}
+    spans: dict = {}
 
     for isin, inst in book.instruments.items():
         names[isin] = getattr(inst, "name", "") or ""
@@ -857,6 +937,8 @@ def survey_spreads(book: Book, *, mode: str = "user",
         prices = frame[["open", "high", "low", "close"]]
         o, h, l, c = (prices[k].to_numpy() for k in ("open", "high", "low",
                                                      "close"))
+        spans[isin] = (frame.index[0].date(), frame.index[-1].date(),
+                       int(len(frame)))
         sweep = sweep_windows(o, h, l, c)
         estimate = sweep.chosen
         tick = tick_for(prices)
@@ -897,10 +979,14 @@ def survey_spreads(book: Book, *, mode: str = "user",
         # For an estimate that did not resolve, the ceiling is the claim,
         # and a ceiling can be wrong: a sample of this length and
         # volatility can only report so wide an error bar under the model.
-        # What it can report is simulated and printed beside it.
+        # What it can report is simulated and printed beside it. The
+        # volatility is measured on the window the sweep chose, not on the
+        # whole history: the sweep truncates exactly when the tail differs
+        # from the history, and a reference at the history's volatility
+        # would then be a sample of the right length from the wrong market.
         if (estimate.spread is not None and not estimate.resolved()
                 and estimate.usable_bars > 0):
-            sigma = daily_volatility(c)
+            sigma = daily_volatility(c[-sweep.chosen_bars:])
             if sigma:
                 null_ceiling[isin] = (
                     null_ceiling_bps(estimate.usable_bars, sigma), sigma)
@@ -944,7 +1030,7 @@ def survey_spreads(book: Book, *, mode: str = "user",
                                                            liquidity),
                         liquidity=liquidity, liquidity_bars=liquidity_bars,
                         symbols=symbols, provider=market_provider.name,
-                        null_ceiling=null_ceiling)
+                        null_ceiling=null_ceiling, spans=spans)
 
 
 def _provider_named(provider):
@@ -1007,12 +1093,20 @@ def _provider_named(provider):
 
 @dataclasses.dataclass(frozen=True)
 class Rung:
-    """One instrument whose half-spread is known well enough to check against."""
+    """One instrument whose half-spread is known well enough to check against.
+
+    `low_bps` and `high_bps` are the band the verdict tests against, wider
+    than the figure stated for the instrument so that only a gross
+    disagreement fails. `stated` is that figure, as given, printed beside
+    the band so that a reading inside the band but outside what was stated
+    is seen for what it is.
+    """
     symbol: str
     label: str
     low_bps: float
     high_bps: float
     region: str                          # "US", "EU" or "thin"
+    stated: str = ""
 
     @property
     def band(self) -> str:
@@ -1020,52 +1114,63 @@ class Rung:
 
 
 LADDER: tuple[Rung, ...] = (
-    Rung("SPY", "SPDR S&P 500, NYSE Arca", 0.1, 2.0, "US"),
-    Rung("AAPL", "Apple, Nasdaq", 0.2, 3.0, "US"),
-    Rung("SU.PA", "Schneider Electric, Euronext Paris", 0.3, 4.0, "EU"),
-    Rung("MEUD.PA", "Amundi Stoxx Europe 600, Euronext Paris", 0.5, 8.0, "EU"),
+    Rung("SPY", "SPDR S&P 500, NYSE Arca", 0.1, 2.0, "US", "about 1 bp"),
+    Rung("AAPL", "Apple, Nasdaq", 0.2, 3.0, "US", "1 to 2 bps"),
+    Rung("SU.PA", "Schneider Electric, Euronext Paris", 0.3, 4.0, "EU",
+         "1 to 2 bps"),
+    Rung("MEUD.PA", "Amundi Stoxx Europe 600, Euronext Paris", 0.5, 8.0, "EU",
+         "a few bps"),
     # The fund the book holds, on its Amsterdam line. The band is the user's
     # own figure for it, 15 to 30 bps, with room either side. The symbol is
     # the one the book records for the fund and has not been verified from
     # the machine this was written on; `--rung` overrides it.
     Rung("IPRP.AS", "iShares European Property Yield, Euronext Amsterdam",
-         8.0, 40.0, "thin"),
+         8.0, 40.0, "thin", "15 to 30 bps"),
 )
 
-# The same fund on two venues. The estimate is per line and the venue is a
-# real reason for two lines to differ by tens of per cent -- different market
-# makers, different tick, different session -- so agreement within error
-# bars is not required. A factor of several is not a venue difference.
+# The same fund on two venues: IE00BMC38736, the VanEck Semiconductor UCITS
+# ETF, on Xetra and on the London Stock Exchange's USD line. The estimate is
+# per line and the venue is a real reason for two lines to differ --
+# different market makers, different tick, different session -- so
+# agreement within error bars is not required. Two resolved lines more
+# than `PAIR_RATIO` apart at more than `PAIR_SIGMA` are called inconsistent;
+# both thresholds are choices, printed with the result, and what two venues
+# legitimately differ by for this fund is not measured here.
 PAIRS: tuple[tuple[str, str], ...] = (("VVSM.DE", "SMH.L"),)
 
-# Beyond this many standard errors apart, AND this ratio between them, two
-# listings of the same fund are called inconsistent. Both, because a ratio
-# of 1.3 at ten sigma is a venue difference measured precisely, and a ratio
-# of 4 at one sigma is noise.
+# Both, because a ratio of 1.3 at ten sigma is a venue difference measured
+# precisely, and a ratio of 4 at one sigma is noise.
 PAIR_SIGMA = 3.0
 PAIR_RATIO = 3.0
 
 
 def null_ceiling_bps(bars: int, sigma_day: float, spread_bps: float = 0.0, *,
-                     runs: int = 3, seed: int = 0,
+                     runs: int = 60, seed: int = 0,
                      significance: float = 2.0) -> float:
     """The ceiling a sample of this length and volatility puts on a spread.
 
     Simulated rather than looked up: the noise floor was measured at 3.97
     bps for 500 bars at 1% daily volatility, and it scales with both, but a
     formula fitted to that table would be one more constant to keep right.
-    Three runs of the same market the controls use, at `spread_bps` true
-    half-spread, and the median of the ceilings they report.
+    `runs` draws of the same market the controls use, at `spread_bps` true
+    half-spread, and the median of the ceilings they report. Sixty draws
+    rather than three because the reference gates a verdict at a factor of
+    three: at three draws it sat up to a third from its converged value on
+    a fixed seed, which is enough to turn a two-fold ratio into the
+    three-fold one that fails a rung. Sixty draws cost half a second at
+    5000 bars.
 
     What it is for: an estimate that fails to resolve is a ceiling, and a
     ceiling can be wrong too. Off 5000 bars at 1.5% a day, a one-bp
-    instrument reports a ceiling of a few bps. One that reports 42 has an
-    error bar sixty times what its sample allows, which is not a wide
-    spread but a per-bar series with variance the model does not produce
-    -- the signature of bars that are not trades. This is the number that
-    makes that visible.
+    instrument reports a ceiling of about 7 bps. The real book reported 60
+    on such an instrument, eight times that, which is not a wide spread but
+    a per-bar series with variance the model does not produce. What
+    produces such a series has not been simulated -- carried bars were
+    tried and inflate the estimate without widening its error bar -- so
+    this number says how far the ceiling is from what the sample allows,
+    and nothing about why.
 
-    >>> round(null_ceiling_bps(500, 0.01), 0) in (5.0, 6.0)
+    >>> round(null_ceiling_bps(500, 0.01), 0) in (5.0, 6.0, 7.0)
     True
     >>> null_ceiling_bps(4000, 0.01) < null_ceiling_bps(500, 0.01)
     True
@@ -1087,8 +1192,14 @@ def null_ceiling_bps(bars: int, sigma_day: float, spread_bps: float = 0.0, *,
 
 # An unresolved rung's ceiling may exceed the ceiling its sample allows by
 # this factor before it is called wide. Real bars have volatility clustering
-# the simulation does not, which widens a real error bar by some tens of
-# per cent; the failure this exists to catch was a factor of ten to sixty.
+# the reference simulation does not, and a clean clustered sample's ceiling
+# sits above the reference: measured with a log-AR(1) volatility path at
+# 0.97 persistence and a log-volatility spread of 0.35 to 0.7, the median
+# ratio runs 1.1 to 1.7 and the largest of a dozen draws 2.4 at the
+# heaviest clustering, once the volatility is measured as a winsorised RMS.
+# With a median-based volatility the reference sat lower and the largest
+# ratio reached 3.7, which is why the RMS. The failure this exists to catch
+# was a factor of eight on the ceiling.
 CEILING_SLACK = 3.0
 
 
@@ -1115,12 +1226,19 @@ def rung_verdict(estimate, rung: Rung, *, sigma_day: float | None = None,
 
     Returns ``(status, detail, lower_bps, upper_bps)``.
 
+    Without `sigma_day` an unresolved estimate cannot have its ceiling
+    checked, and the status says so -- `unchecked` -- rather than passing,
+    because a pass that was never able to fail is the thing this project
+    keeps finding.
+
     >>> from portfolio.core.spread import SpreadEstimate
     >>> spy = Rung("SPY", "", 0.1, 2.0, "US")
     >>> tight = SpreadEstimate(0.00012, 1.4e-8, 0.00004, 5000, 4999,
     ...                        square_standard_error=1.0e-8)
-    >>> rung_verdict(tight, spy)[0]
+    >>> rung_verdict(tight, spy, sigma_day=0.01)[0]
     'consistent'
+    >>> rung_verdict(tight, spy)[0]
+    'unchecked'
     >>> wide = SpreadEstimate(0.0080, 6.4e-5, 0.0004, 5000, 4999,
     ...                       square_standard_error=6.0e-6)
     >>> rung_verdict(wide, spy)[0]
@@ -1174,18 +1292,47 @@ def rung_verdict(estimate, rung: Rung, *, sigma_day: float | None = None,
                 f"not resolved; at most {upper:.1f} bps, against the "
                 f"{allowed:.1f} a clean sample this size would report at "
                 f"the top of the band {rung.band}", lower, upper)
-    return ("consistent",
+    return ("unchecked",
             f"not resolved; at most {upper:.1f} bps, inside the band "
-            f"{rung.band}", lower, upper)
+            f"{rung.band}, but the ceiling could not be checked against "
+            f"what the sample allows because the daily volatility is not "
+            f"estimable", lower, upper)
+
+
+# Returns beyond this many scale units are clipped before the volatility is
+# taken, so that one impossible bar does not set it for the whole series.
+VOLATILITY_CLIP = 5.0
 
 
 def daily_volatility(close: np.ndarray) -> float | None:
     """Close-to-close log volatility, robust to the odd impossible bar.
 
-    Median absolute deviation scaled to a standard deviation, because a
-    feed that produced one bar at a hundredth of the price would otherwise
-    set the volatility for the whole series from that one bar, and the
-    whole point of measuring it is to judge a feed that may do that.
+    A winsorised root mean square: returns are clipped at `VOLATILITY_CLIP`
+    times a median-based scale and the RMS of what remains is taken. The
+    clip is what keeps a feed that produced one bar at a hundredth of the
+    price from setting the volatility for the whole series. The RMS, rather
+    than the median-based scale on its own, is because the per-bar series
+    the ceiling is built from has variance scaling with the fourth moment
+    of returns: under volatility clustering the median-based scale sits at
+    0.6 to 0.8 of the RMS, the reference ceiling built from it sits as far
+    below where it should, and every ratio printed against it is inflated
+    in the direction that fails a rung.
+
+    Where the median scale is zero -- more than half the closes repeat the
+    previous close, which a thin line on a coarse grid does -- the RMS of
+    all returns is the scale, so the check is not silently disabled on the
+    instruments it most exists for. None only when there are too few closes
+    or no movement at all.
+
+    >>> rng = np.random.default_rng(0)
+    >>> closes = 100 * np.exp(np.cumsum(rng.normal(0, 0.01, 1000)))
+    >>> 0.009 < daily_volatility(closes) < 0.011
+    True
+    >>> spiked = closes.copy(); spiked[500] = 1.0     # one impossible bar
+    >>> 0.009 < daily_volatility(spiked) < 0.012
+    True
+    >>> daily_volatility(np.full(50, 7.5)) is None
+    True
     """
     c = np.asarray(close, dtype=float)
     c = c[np.isfinite(c) & (c > 0)]
@@ -1193,7 +1340,12 @@ def daily_volatility(close: np.ndarray) -> float | None:
         return None
     returns = np.diff(np.log(c))
     mad = float(np.median(np.abs(returns - np.median(returns))))
-    return 1.4826 * mad if mad > 0 else None
+    scale = 1.4826 * mad if mad > 0 else float(np.sqrt(np.mean(returns ** 2)))
+    if scale <= 0:
+        return None
+    clipped = np.clip(returns, -VOLATILITY_CLIP * scale, VOLATILITY_CLIP * scale)
+    rms = float(np.sqrt(np.mean(clipped ** 2)))
+    return rms if rms > 0 else None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1211,9 +1363,15 @@ class RungResult:
 
     def lines(self) -> list[str]:
         mark = {"consistent": "ok  ", "too wide": "WIDE", "too narrow": "NARR",
-                "no estimate": "----", "unavailable": "----"}[self.status]
+                "no estimate": "----", "unavailable": "----",
+                "unchecked": "?   "}[self.status]
+        stated = f" (stated: {self.rung.stated})" if self.rung.stated else ""
         out = [f"[{mark}] {self.rung.symbol:<9} {self.rung.label}",
-               f"       expected {self.rung.band}: {self.detail}"]
+               f"       band {self.rung.band}{stated}: {self.detail}"]
+        if self.sweep is not None and self.sweep.rungs:
+            e = self.sweep.chosen
+            out.append(f"       {e.usable_bars} usable bars in the window "
+                       f"taken, of {self.sweep.available_bars} available")
         if self.sweep is not None and len(self.sweep.rungs) > 1:
             out.extend(f"       {line}" for line in self.sweep.lines())
         if self.quality is not None:
@@ -1258,14 +1416,18 @@ class LadderReport:
         out = ["Spread ladder: the estimator on instruments whose spread is "
                "not in doubt",
                "=" * 74, "",
-               f"Provider: {self.provider}. Every rung runs the whole path "
-               f"the survey runs --",
+               f"Provider: {self.provider}. Every rung runs the path the "
+               f"survey estimates by --",
                "bars through the cache, the window sweep, the bars set aside, "
-               "the tick -- on",
-               "an instrument whose half-spread is known to within a factor "
-               "of two. The",
-               "band is printed beside each result, so a disagreement is with "
-               "a number.", ""]
+               "the ceiling",
+               "against what the sample allows -- on an instrument whose "
+               "half-spread is known",
+               "to within a factor of two. The tick floor and the tier "
+               "decision are not run;",
+               "they act on the estimate and cannot make a wrong one right. "
+               "The band is",
+               "printed beside each result, so a disagreement is with a "
+               "number.", ""]
         for r in self.rungs:
             out.extend(r.lines())
             out.append("")
@@ -1306,7 +1468,8 @@ def _ladder_verdict(rungs: "tuple[RungResult, ...]",
     wide_us = [r for r in us if r.status == "too wide"]
     wide_eu = [r for r in eu if r.status == "too wide"]
     narrow = [r for r in rungs if r.status == "too narrow"]
-    missing = [r for r in rungs if r.status in ("no estimate", "unavailable")]
+    missing = [r for r in rungs
+               if r.status in ("no estimate", "unavailable", "unchecked")]
     fine = [r for r in rungs if r.status == "consistent"]
     bad_pairs = [p for p in pairs if p.consistent is False]
 
@@ -1321,12 +1484,13 @@ def _ladder_verdict(rungs: "tuple[RungResult, ...]",
                 f"can be\nread until this is found. The bars set aside per "
                 f"rung above are the first\nplace to look.", False)
     if wide_eu and us and not [r for r in us if r.status != "consistent"]:
-        return (f"THIS PROVIDER'S EUROPEAN BARS. The US rungs read inside "
-                f"their bands and\n{names(wide_eu)} read wide, on the same "
-                f"path. The estimator is not at fault; the\nbars it was "
-                f"handed for the European lines are. The counts of bars set "
-                f"aside\nabove say which kind, and the estimate with them set "
-                f"aside says whether\nthat kind is the whole of it.", False)
+        return (f"THIS PROVIDER'S EUROPEAN BARS. The same path reads the US "
+                f"rungs inside their\nbands and {names(wide_eu)} wide, so "
+                f"whatever differs is in the European bars or\nin how the "
+                f"model fits them, not in the path. The counts of bars set "
+                f"aside above\nsay whether it is bars that repeat, and the "
+                f"estimate with them set aside says\nwhether that is the "
+                f"whole of it.", False)
     if wide_eu:
         return (f"{names(wide_eu)} read wide, and no US rung was available "
                 f"to say whether the\npipeline reads a known-tight instrument "
@@ -1343,9 +1507,10 @@ def _ladder_verdict(rungs: "tuple[RungResult, ...]",
         listed = "; ".join(f"{p.symbols[0]}/{p.symbols[1]} {p.detail}"
                            for p in bad_pairs)
         return (f"THE DATA FOR ONE LISTING. Every rung is inside its band, "
-                f"but the same fund\non two venues disagrees beyond what a "
-                f"venue difference explains: {listed}.\nOne of those two "
-                f"lines is not the fund's trading.", False)
+                f"but the same fund\non two venues disagrees by more than "
+                f"this control allows two venues: {listed}.\nWhich line is "
+                f"wrong, and whether that factor is a venue difference for "
+                f"this fund,\nis not measured here.", False)
     if missing and not fine:
         return (f"NOTHING TO SAY. No rung produced an estimate "
                 f"({names(missing)}); the\nprovider is unreachable or the "
@@ -1401,7 +1566,9 @@ def run_ladder(*, provider="yfinance",
             clean = sweep_windows(*exclude_bars(o, h, l, c, bars.excluded)).chosen
         else:
             clean = sweep.chosen
-        return sweep, bars, clean, daily_volatility(c)
+        # Volatility on the window the sweep chose, for the reason given in
+        # `survey_spreads`.
+        return sweep, bars, clean, daily_volatility(c[-sweep.chosen_bars:])
 
     results = []
     for rung in rungs:
@@ -1427,9 +1594,12 @@ def run_ladder(*, provider="yfinance",
         est_b = None if isinstance(got_b, str) else got_b[0].chosen
         q_a = None if isinstance(got_a, str) else got_a[1]
         q_b = None if isinstance(got_b, str) else got_b[1]
+        s_a = None if isinstance(got_a, str) else got_a[3]
+        s_b = None if isinstance(got_b, str) else got_b[3]
         paired.append(_compare_pair((a, b), (est_a, est_b), (q_a, q_b),
                                     (got_a if isinstance(got_a, str) else "",
-                                     got_b if isinstance(got_b, str) else "")))
+                                     got_b if isinstance(got_b, str) else ""),
+                                    sigmas=(s_a, s_b)))
 
     cache.close()
     verdict, passed = _ladder_verdict(tuple(results), tuple(paired))
@@ -1437,8 +1607,39 @@ def run_ladder(*, provider="yfinance",
                         market_provider.name)
 
 
-def _compare_pair(symbols, estimates, qualities, errors) -> PairResult:
-    """Two listings of one fund: how far apart, in sigma and in ratio."""
+def _interval_bps(estimate, significance: float = 2.0
+                  ) -> tuple[float, float | None]:
+    """(lower, upper) bound on the half-spread in bps, on s^2 then rooted."""
+    s2 = estimate.signed_square
+    se = estimate.square_standard_error or 0.0
+    lower = math.sqrt(max(s2 - significance * se, 0.0)) * 10_000.0 / 2.0
+    top = s2 + significance * se
+    upper = math.sqrt(top) * 10_000.0 / 2.0 if top > 0 else None
+    return lower, upper
+
+
+def _compare_pair(symbols, estimates, qualities, errors,
+                  sigmas=(None, None)) -> PairResult:
+    """Two listings of one fund: how far apart, in sigma and in ratio.
+
+    Two resolved lines are compared on ``s^2``, the disjoint-sample
+    arithmetic the drift test uses, and called inconsistent only when both
+    the distance in standard errors and the ratio exceed the thresholds.
+
+    An unresolved line cannot be compared that way, and the first version
+    of this did anyway, which made it a dead check for exactly the case it
+    exists for: when the wider line is unresolved, ``|z| <= t < 2`` whatever
+    the ratio, so two listings a factor of thirteen apart were reported as
+    agreeing within error. The real book resolved nothing. So for an
+    unresolved line the ceiling is what is judged, the way `rung_verdict`
+    judges it: against the ceiling a clean sample of the same length and
+    volatility would put on the OTHER line's spread. A ceiling more than
+    `CEILING_SLACK` times that is a line whose error bar its sample cannot
+    explain, and that line is the inconsistent one. An unresolved ceiling
+    that sits BELOW the other line's lower bound is inconsistent the other
+    way. Two unresolved lines with ceilings both inside what their samples
+    allow are reported as not comparable, which is the truth.
+    """
     from .core.spread import _drift_z
     a, b = estimates
     if a is None or b is None or a.spread is None or b.spread is None:
@@ -1448,24 +1649,80 @@ def _compare_pair(symbols, estimates, qualities, errors) -> PairResult:
             if e is None or e.spread is None)
         return PairResult(symbols, estimates, qualities, detail=f"not "
                           f"comparable -- {why}", consistent=None)
-    z = _drift_z(a, b)
+
     ratio = (b.half_spread_bps / a.half_spread_bps
              if a.half_spread_bps else float("inf"))
     wider = symbols[1] if ratio >= 1 else symbols[0]
     factor = max(ratio, 1.0 / ratio) if ratio > 0 else float("inf")
-    far = z is not None and abs(z) > PAIR_SIGMA and factor > PAIR_RATIO
-    if far:
-        detail = (f"{wider} is {factor:.1f}x wider at {abs(z):.1f} standard "
-                  f"errors on s^2: over the factor of {PAIR_RATIO:g} this "
-                  f"control allows two venues")
-    elif z is not None and abs(z) > PAIR_SIGMA:
-        detail = (f"{wider} is {factor:.2f}x wider at {abs(z):.1f} standard "
-                  f"errors: a real difference between the two lines, under "
-                  f"the factor of {PAIR_RATIO:g} this control allows two "
-                  f"venues")
-    else:
-        detail = (f"{factor:.2f}x apart at "
-                  f"{'?' if z is None else f'{abs(z):.1f}'} standard errors: "
-                  f"the two venues agree within error")
-    return PairResult(symbols, estimates, qualities, z=z, ratio=ratio,
-                      detail=detail, consistent=not far)
+    resolved = (a.resolved(), b.resolved())
+
+    if all(resolved):
+        z = _drift_z(a, b)
+        far = z is not None and abs(z) > PAIR_SIGMA and factor > PAIR_RATIO
+        if far:
+            detail = (f"{wider} is {factor:.1f}x wider at {abs(z):.1f} "
+                      f"standard errors on s^2: over the factor of "
+                      f"{PAIR_RATIO:g} this control allows two venues")
+        elif z is not None and abs(z) > PAIR_SIGMA:
+            detail = (f"{wider} is {factor:.2f}x wider at {abs(z):.1f} "
+                      f"standard errors: a real difference between the two "
+                      f"lines, under the factor of {PAIR_RATIO:g} this "
+                      f"control allows two venues")
+        else:
+            detail = (f"{factor:.2f}x apart at "
+                      f"{'?' if z is None else f'{abs(z):.1f}'} standard "
+                      f"errors: the two venues agree within error")
+        return PairResult(symbols, estimates, qualities, z=z, ratio=ratio,
+                          detail=detail, consistent=not far)
+
+    # At least one line unresolved: judge each unresolved ceiling against
+    # what its sample allows at the other line's spread, and against the
+    # other line's lower bound.
+    notes, blamed, unchecked = [], [], []
+    for i, (symbol, mine, other, sigma) in enumerate(
+            zip(symbols, (a, b), (b, a), sigmas)):
+        if resolved[i]:
+            continue
+        lower_other, _ = _interval_bps(other)
+        _, upper_mine = _interval_bps(mine)
+        if upper_mine is None:
+            notes.append(f"{symbol}: the squared spread is negative beyond "
+                         f"two standard errors")
+            continue
+        if sigma is None or mine.usable_bars <= 0:
+            unchecked.append(symbol)
+            notes.append(f"{symbol}: not resolved, at most {upper_mine:.1f} "
+                         f"bps, and its ceiling could not be checked (no "
+                         f"volatility)")
+            continue
+        reference = other.half_spread_bps if resolved[1 - i] else 0.0
+        allowed = null_ceiling_bps(mine.usable_bars, sigma, reference)
+        if allowed == allowed and upper_mine > CEILING_SLACK * allowed:
+            blamed.append(symbol)
+            notes.append(f"{symbol}: not resolved, and its ceiling of "
+                         f"{upper_mine:.1f} bps is {upper_mine / allowed:.0f}x "
+                         f"the {allowed:.1f} that {mine.usable_bars} bars at "
+                         f"{sigma:.1%} a day put on a spread of "
+                         f"{reference:.1f} bps -- an error bar its sample "
+                         f"cannot explain")
+        elif resolved[1 - i] and upper_mine < lower_other:
+            blamed.append(symbol)
+            notes.append(f"{symbol}: not resolved, and its ceiling of "
+                         f"{upper_mine:.1f} bps sits below the other line's "
+                         f"floor of {lower_other:.1f}")
+        else:
+            notes.append(f"{symbol}: not resolved, at most {upper_mine:.1f} "
+                         f"bps, inside what {mine.usable_bars} bars at "
+                         f"{sigma:.1%} a day allow ({allowed:.1f})")
+    if blamed:
+        detail = ("; ".join(notes) + f". {', '.join(blamed)} is the "
+                  f"inconsistent line")
+        return PairResult(symbols, estimates, qualities, ratio=ratio,
+                          detail=detail, consistent=False)
+    if unchecked or not any(resolved):
+        return PairResult(symbols, estimates, qualities, ratio=ratio,
+                          detail="not comparable -- " + "; ".join(notes),
+                          consistent=None)
+    return PairResult(symbols, estimates, qualities, ratio=ratio,
+                      detail="; ".join(notes) + ": the unresolved line does "
+                      "not contradict the resolved one", consistent=True)

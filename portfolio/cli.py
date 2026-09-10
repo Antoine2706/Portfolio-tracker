@@ -206,18 +206,21 @@ def _controls(args: argparse.Namespace) -> int:
 
 def _parse_rung(text: str):
     """`SYMBOL=LOW-HIGH[:REGION]`, e.g. `VWCE.DE=1-6:EU`."""
+    import math
     from .research import Rung
     try:
-        symbol, rest = text.split("=", 1)
+        # rsplit, because Yahoo symbols carry "=" themselves (ES=F, EURUSD=X)
+        # and the band is always the last "="-separated piece.
+        symbol, rest = text.rsplit("=", 1)
         band, _, region = rest.partition(":")
         low, high = (float(x) for x in band.split("-", 1))
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"{text!r}: expected SYMBOL=LOW-HIGH[:REGION], the band in "
             f"half-spread bps, e.g. VWCE.DE=1-6:EU") from None
-    if not 0 <= low < high:
+    if not (math.isfinite(low) and math.isfinite(high) and 0 <= low < high):
         raise argparse.ArgumentTypeError(f"{text!r}: the band must be 0 <= "
-                                         f"LOW < HIGH")
+                                         f"LOW < HIGH, both finite")
     region = (region or ("EU" if "." in symbol else "US")).upper()
     if region not in ("US", "EU", "THIN"):
         raise argparse.ArgumentTypeError(f"{text!r}: region must be US, EU "
@@ -548,12 +551,14 @@ def _spreads(args: argparse.Namespace) -> int:
 
     # Every run is recorded, and the failed ones are the point of recording:
     # a control that failed and kept its numbers is a result; one that failed
-    # and scrolled off is an anecdote.
+    # and scrolled off is an anecdote. Under the mode's own directory, next
+    # to the instruments it describes, so the demo book and the real one do
+    # not share a log.
     from .data.store import DataMode, DataStore
     from .research import record_survey
     root = pathlib.Path(args.data_root) if args.data_root else None
     store = DataStore.open(DataMode(args.mode), root=root)
-    log = store.root / "spread-runs.jsonl"
+    log = store.directory / "spread-runs.jsonl"
     try:
         run_number = record_survey(survey, log)
         print()
