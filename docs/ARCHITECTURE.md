@@ -382,6 +382,7 @@ before rendering anything.
 | 13 | *"the series has been adjusted for distributions"*, refusing all 7 holdings | float32. Yahoo sends prices as float32 and `100.06` arrives as `100.05999755859375`, so an exact-divisibility test against a tick fails on nearly every price. Four of the seven are accumulating ETFs that have never made a distribution, and the one that pays a dividend had the *highest* fit rate — the explanation was not merely unproven, its ordering was backwards |
 | 14 | *"suspect the symbol mapping or the panel alignment"*, on a ranking check that failed at ρ = +0.89 | a guess. The check compares two numbers per instrument — an estimated spread and a volume-based liquidity proxy — and cannot tell which is wrong; the sentence picked one. The refusal was right. The verdict now prints the pairs it ranked, names the extremes, and says what it cannot tell apart |
 | 15 | a verdict of "consistent" from the ladder control on a 42 bps reading of a one-bp instrument | the interval on s² at t = 1.9 reaches below zero, so its floor is "inside any band". What was wrong was the *ceiling* — 60 bps off 5000 bars, eight times the ceiling a clean sample of that length reports at 1.5% a day — and the first version of the verdict did not look at it. Found by the test written for the real-book case before the control had been run on anything. The same-fund-two-listings check had the identical defect, found by review: when the wider line is unresolved its distance in standard errors is bounded by its own t, so two listings thirteen-fold apart "agreed within error" |
+| 16 | *"the path manufactures the autocorrelation and it says nothing about European listings"*, on the first real ladder run | SPY read +0.101 and IPRE.DE −0.459. Nothing manufactures both signs. The branch fired because one US rung crossed a threshold, and never compared sign or size against the European rungs it was drawing a conclusion about — a sentence written without reading the column it is about, #14's shape on the fix for #14 |
 
 Three of Group B were false sentences rather than false numbers (5, 7, and the
 "the structure cannot be fixed by contributions" that overclaimed what a search
@@ -582,6 +583,50 @@ What is and is not established:
 The 8 bps constant stays, and stays described as a constant. None of the
 ceilings was written. Every number above is under investigation and none of
 them is a measurement of a spread.
+
+### The ladder run, and what it narrowed
+
+The ladder was then run against the provider on eleven lines. Its verdict
+was the pipeline, and it was right: **SPY read about 19 bps** against a true
+half-spread near one. Across all eleven the estimates collapsed into **8 to
+34 bps** while the true spreads span 1 to 20, and the correlation between
+truth and estimate was **−0.50**. That is the strongest clue so far, and it
+is not eleven separate faults: `s = √(s²_true + b)` goes to `√b` whenever the
+true spread is small, which is exactly a floor. One additive term in s²,
+common across instruments. The four moment conditions of the estimator are
+now reported separately (`core.spread.edge_components`, printed by
+`portfolio controls --spread-reference`) because they say which prices carry
+such a term: a contaminated open inflates the two products that use the
+open and leaves the close product alone; a contaminated close does the
+reverse; a reversal, or a real spread, inflates all four alike.
+
+The per-bar autocorrelation column read **+0.101 on SPY and −0.459 on
+IPRE.DE**. Opposite signs, so not one mechanism, and the note that said
+otherwise is #16. The European value remains unexplained; whatever the path
+contributes is at most what SPY shows.
+
+The drift test was sabotaged against a break shaped like decimalisation
+(2000 bars at 30 bps, then 6000 at 1) and caught it, stopping the window at
+1000 bars with the old block at 18.3 ± 1.0 bps. What it cannot catch is a
+break smaller than its own reference: it compares every older block against
+the **most recent 250 bars**, whose floor is about 4.7 bps, so pre-decimal
+SPY at a few bps for 2000 bars followed by 6000 at one is reported as
+consistent. Both halves are tests. The reference block is the design choice
+to revisit, and it waits, with everything else, on the reference check:
+
+* **T5** the authors' `bidask` package on the identical SPY arrays — the same
+  number means the transcription is faithful and the fault is in the input
+  or in the method's fit to daily bars; a different one means the
+  implementation diverges on real data in a way three hundred synthetic
+  panels could not show;
+* **T6** the adjusted series beside the unadjusted one, since a factor
+  constant within a bar cancels in every log ratio the estimator takes;
+* **T7** SPY on 1993 to 2000 and on 2002 onward separately.
+
+Until T5 is back nothing is corrected. Whatever produces a nineteen-fold
+error on SPY produces it on everything, and a correction tuned to one
+instrument without the mechanism is how a wrong number acquires a plausible
+face.
 
 ## Why not Streamlit any more
 

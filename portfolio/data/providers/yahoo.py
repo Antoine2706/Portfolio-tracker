@@ -159,6 +159,42 @@ class YahooProvider(MarketDataProvider):
         frame.index = pd.DatetimeIndex([d.date() for d in frame.index])
         return frame
 
+    def adjusted_bars(self, symbol: str, *, period: str = "max") -> pd.DataFrame:
+        """The same bars with `auto_adjust=True`: every price scaled back
+        through the dividend history.
+
+        Not for the survey, which wants prices that traded. For the
+        reference check only: the estimator reads log ratios between the
+        open, the close and the mid-range, and a multiplicative factor that
+        is constant within a bar cancels in every one of them, so an
+        adjusted series should give the SAME estimate except around each
+        ex-date, where the factor steps between one bar and the next. Two
+        numbers that differ by more than that step accounts for are a
+        finding about the adjustment, not about the spread.
+        """
+        ticker = self._ticker(symbol)
+        try:
+            hist = ticker.history(period=period, interval="1d",
+                                  auto_adjust=True)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                self.name,
+                f"could not load adjusted bars for {symbol}: "
+                f"{_explain(exc)}") from exc
+        if hist is None or hist.empty:
+            raise ProviderError(self.name, f"no adjusted bars for {symbol}")
+        wanted = ["Open", "High", "Low", "Close"]
+        missing = [c for c in wanted if c not in hist.columns]
+        if missing:
+            raise ProviderError(self.name, f"{symbol} adjusted bars came "
+                                           f"back without {', '.join(missing)}")
+        frame = hist[wanted].astype(float)
+        frame.columns = [c.lower() for c in wanted]
+        frame.index = pd.DatetimeIndex([d.date() for d in frame.index])
+        return frame
+
     def quote(self, symbol: str) -> Quote:
         """Latest price, or a clearly-marked last close.
 

@@ -60,7 +60,8 @@ __all__ = ["Book", "load_book", "run_equal_risk_contribution",
            "allocate_new_money", "replay_the_ledger", "names_the_window",
            "dominant_holding", "survey_spreads", "SpreadSurvey",
            "record_survey", "Rung", "LADDER", "PAIRS", "RungResult",
-           "PairResult", "LadderReport", "run_ladder", "rung_verdict"]
+           "PairResult", "LadderReport", "run_ladder", "rung_verdict",
+           "ReferenceReport", "DateBlock", "reference_check"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1578,6 +1579,14 @@ def _autocorrelation_note(rungs) -> str:
     ...                               rung("SU.PA", "EU", -0.28)))
     >>> "SPY -0.310" in note and "the path manufactures it" in note
     True
+
+    The real ladder run: SPY +0.101 and a European line -0.459. Nothing
+    manufactures both signs, and the first version of this said it did:
+
+    >>> note = _autocorrelation_note((rung("SPY", "US", 0.101, bars=8000),
+    ...                               rung("IPRE.DE", "EU", -0.459)))
+    >>> "manufactures" in note, "not one mechanism" in note.replace("\\n", " ")
+    (False, True)
     >>> note = _autocorrelation_note((rung("SPY", "US", -0.004),
     ...                               rung("SU.PA", "EU", -0.28)))
     >>> "a property of those lines" in note and "SU.PA" in note.split("beyond")[1]
@@ -1616,11 +1625,42 @@ def _autocorrelation_note(rungs) -> str:
         return ", ".join(f"{rho_threshold(r.estimate.usable_bars):.2f} for "
                          f"{r.rung.symbol}" for r in items)
 
-    if large_us:
+    def extreme(items):
+        return max(items, key=lambda r: abs(r.autocorrelation))
+
+    if large_us and large_eu:
+        # Both sides beyond sampling error. One mechanism in the path would
+        # leave the same sign at comparable size on every rung; the first
+        # version of this branch did not look, and called SPY at +0.10 and
+        # a European line at -0.46 "manufactured". Opposite signs, or a
+        # European value several times the US one, is not one mechanism.
+        top_us, top_eu = extreme(large_us), extreme(large_eu)
+        same_sign = (top_us.autocorrelation > 0) == (top_eu.autocorrelation > 0)
+        comparable = abs(top_eu.autocorrelation) <= 2.0 * abs(top_us.autocorrelation)
+        if same_sign and comparable:
+            tail = (f"Beyond three standard errors of zero on both "
+                    f"({limits(large_us + large_eu)}), the same sign and of "
+                    f"comparable size, so one mechanism in the path "
+                    f"manufactures it and it says nothing about European "
+                    f"listings.")
+        else:
+            why = ("opposite signs" if not same_sign
+                   else f"{top_eu.rung.symbol} is "
+                        f"{abs(top_eu.autocorrelation) / abs(top_us.autocorrelation):.0f}x "
+                        f"the size of {top_us.rung.symbol}")
+            tail = (f"Beyond three standard errors of zero on both sides, but "
+                    f"{why}: not one mechanism. The path contributes at most "
+                    f"what the US rungs show ({each(large_us)}); what "
+                    f"{', '.join(r.rung.symbol for r in large_eu)} shows "
+                    f"beyond that is a property of those lines, and the next "
+                    f"question is thin trading on the specific listing, not "
+                    f"the fund.")
+    elif large_us:
         tail = (f"Beyond three standard errors of zero ({limits(large_us)}) "
-                f"on bars whose data is not in doubt, so the path "
-                f"manufactures it and it says nothing about European "
-                f"listings.")
+                f"on the US rungs only; the European rungs are within "
+                f"sampling error. The number is on the lines whose data is "
+                f"not in doubt and absent from the European ones, the reverse "
+                f"of the book, and nothing here explains the book's -0.40.")
     elif us and large_eu:
         tail = (f"Within sampling error of zero where the data is not in "
                 f"doubt and beyond three standard errors ({limits(large_eu)}) "
@@ -1717,6 +1757,251 @@ def _ladder_verdict(rungs: "tuple[RungResult, ...]",
             "fault is not one this ladder reproduces: look at the book's own "
             "symbols and\nits liquidity proxy, both printed by `portfolio "
             "spreads`.", True)
+
+
+# --------------------------------------------------------------------------
+# The reference check: one symbol, three questions, the exact bars we read
+# --------------------------------------------------------------------------
+#
+# The first real ladder run put SPY at about 19 bps against a true half-
+# spread near one, and every line of eleven between 8 and 34 whatever its
+# truth. Three questions separate the halves, in this order, and none of
+# them is answered by changing the estimator:
+#
+#   T5  The authors' own package on the identical arrays. Same number: the
+#       transcription is faithful and the fault is in the input or in the
+#       method's fit to daily bars. A different number: the implementation
+#       diverges on real data in a way three hundred synthetic panels could
+#       not show.
+#   T6  The adjusted series beside the unadjusted one. A factor constant
+#       within a bar cancels in every log ratio the estimator takes, so the
+#       two should agree except across ex-dates; a large difference is a
+#       finding about the adjustment path.
+#   T7  Blocks by date. SPY's history starts in 1993 and US markets
+#       decimalised in 2001; if the early block reads far wider, part of a
+#       long-window number is market history, and the drift test's silence
+#       on it is measured rather than argued.
+#
+# And the four moment conditions on their own, because a floor common to
+# every instrument is one additive term in s^2, and the four products say
+# which prices carry it.
+
+
+@dataclasses.dataclass(frozen=True)
+class DateBlock:
+    label: str
+    first: object                        # date
+    last: object
+    estimate: object                     # SpreadEstimate
+    components: object                   # SpreadComponents | None
+    quality: object                      # BarQuality
+
+
+@dataclasses.dataclass(frozen=True)
+class ReferenceReport:
+    symbol: str
+    provider: str
+    first: object
+    last: object
+    rows: int
+    quality: object                      # BarQuality
+    ours: object                         # SpreadEstimate on every bar
+    components: object                   # SpreadComponents | None
+    theirs_half_bps: float | None        # bidask.edge, signed root, half bps
+    theirs_note: str
+    adjusted: object = None              # SpreadEstimate on the adjusted series
+    adjusted_note: str = ""
+    blocks: tuple = ()                   # DateBlock, in date order
+    sigma_day: float | None = None
+
+    @property
+    def ours_half_bps(self) -> float | None:
+        e = self.ours
+        if e.signed_square is None:
+            return None
+        return math.copysign(math.sqrt(abs(e.signed_square)),
+                             e.signed_square) * 10_000.0 / 2.0
+
+    def lines(self) -> list[str]:
+        out = [f"Reference check: {self.symbol} on {self.provider}",
+               "=" * 74, "",
+               f"{self.rows} bars, {self.first} to {self.last}"]
+        out.extend(f"  {line}" for line in self.quality.lines())
+        out.append("")
+        out.append("T5  the authors' package on the identical arrays")
+        mine = self.ours_half_bps
+        out.append(f"  ours    {'-' if mine is None else f'{mine:+8.2f}'} bps "
+                   f"(signed root of s^2; {self.ours.describe()})")
+        if self.theirs_half_bps is None:
+            out.append(f"  bidask  not run: {self.theirs_note}")
+        else:
+            gap = (None if mine is None else self.theirs_half_bps - mine)
+            out.append(f"  bidask  {self.theirs_half_bps:+8.2f} bps"
+                       + ("" if gap is None else
+                          f"   difference {gap:+.4f} bps -- "
+                          + ("the two agree: the transcription is faithful "
+                             "and the fault is in the input or in the "
+                             "method's fit to daily bars"
+                             if abs(gap) < 0.01 else
+                             "THE TWO DISAGREE on real bars, which three "
+                             "hundred synthetic panels did not show")))
+        if self.components is not None:
+            out.append("")
+            out.append("  the four moment conditions, separately:")
+            out.extend(f"  {line}" for line in self.components.lines())
+        rho = self.ours.autocorrelation
+        if rho is not None:
+            out.append(f"  per-bar autocorrelation "
+                       f"{_rho_text(rho, self.ours.usable_bars)}")
+        out.append("")
+        out.append("T6  adjusted against unadjusted prices")
+        if self.adjusted is None:
+            out.append(f"  not run: {self.adjusted_note}")
+        else:
+            adj = self.adjusted
+            adj_bps = (None if adj.signed_square is None else
+                       math.copysign(math.sqrt(abs(adj.signed_square)),
+                                     adj.signed_square) * 10_000.0 / 2.0)
+            out.append(f"  unadjusted {'-' if mine is None else f'{mine:+8.2f}'} bps"
+                       f"   adjusted {'-' if adj_bps is None else f'{adj_bps:+8.2f}'} bps"
+                       f"   ({adj.describe()})")
+            out.append("  a factor constant within a bar cancels in every log "
+                       "ratio; the two should differ only by what the steps at "
+                       "each ex-date contribute")
+        out.append("")
+        out.append("T7  blocks by date")
+        if not self.blocks:
+            out.append("  no --split-at given; the window sweep's own blocks "
+                       "are in the ladder output")
+        for b in self.blocks:
+            e = b.estimate
+            out.append(f"  {b.label}: {b.first} to {b.last}, "
+                       f"{b.quality.bars} bars")
+            out.append(f"      {e.describe()}"
+                       + (f"; per-bar autocorrelation "
+                          f"{_rho_text(e.autocorrelation, e.usable_bars)}"
+                          if e.autocorrelation is not None else ""))
+            if b.components is not None:
+                parts = b.components
+                out.append(f"      moment conditions, signed roots: "
+                           f"r1r2 {parts.half_bps(parts.open_previous_mid):+.1f}  "
+                           f"r3r4 {parts.half_bps(parts.close_previous_mid):+.1f}  "
+                           f"r1r5 {parts.half_bps(parts.open_previous_close):+.1f}  "
+                           f"r5r4 {parts.half_bps(parts.close_open):+.1f}")
+            out.append(f"      {b.quality.lines()[0]}")
+        return out
+
+    def record(self) -> dict:
+        def estimate(e):
+            if e is None or e.spread is None:
+                return None
+            return {"half_spread_bps": e.half_spread_bps,
+                    "signed_square": e.signed_square,
+                    "error_bps": e.half_spread_error_bps, "t": e.t_statistic,
+                    "usable_bars": e.usable_bars,
+                    "autocorrelation": e.autocorrelation}
+
+        def components(p):
+            return None if p is None else dataclasses.asdict(p)
+
+        return {"symbol": self.symbol, "provider": self.provider,
+                "bars": {"first": str(self.first), "last": str(self.last),
+                         "rows": self.rows},
+                "quality": self.quality.counts(),
+                "ours": estimate(self.ours), "ours_half_bps": self.ours_half_bps,
+                "components": components(self.components),
+                "bidask_half_bps": self.theirs_half_bps,
+                "bidask_note": self.theirs_note,
+                "adjusted": estimate(self.adjusted),
+                "adjusted_note": self.adjusted_note,
+                "blocks": [{"label": b.label, "first": str(b.first),
+                            "last": str(b.last), "estimate": estimate(b.estimate),
+                            "components": components(b.components),
+                            "quality": b.quality.counts()} for b in self.blocks]}
+
+
+def reference_check(symbol: str, *, provider="yfinance",
+                    data_root: "pathlib.Path | None" = None,
+                    splits: tuple = ()) -> ReferenceReport:
+    """T5, T6 and T7 on one symbol, on the exact bars the survey reads.
+
+    `splits` are dates; the history is cut into blocks at each. Nothing here
+    changes what the survey does: it is a diagnostic, run before any fix,
+    because a correction tuned to one instrument without knowing the
+    mechanism is how a wrong number acquires a plausible face.
+    """
+    from .core.spread import classify_bars, edge, edge_components
+    from .data.cache import PriceCache
+
+    market_provider = _provider_named(provider)
+    root = pathlib.Path(data_root) if data_root else DataStore.open("user").root
+    cache_dir = root / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache = PriceCache(cache_dir / f"bars-{market_provider.name}.sqlite")
+    try:
+        frame = _bars_for(symbol, market_provider, cache)
+    finally:
+        cache.close()
+
+    o, h, l, c = (frame[k].to_numpy() for k in ("open", "high", "low", "close"))
+    volume = frame["volume"].to_numpy() if "volume" in frame.columns else None
+    quality = classify_bars(o, h, l, c, volume)
+    ours = edge(o, h, l, c)
+    parts = edge_components(o, h, l, c)
+
+    theirs, note = None, ""
+    try:
+        import bidask
+    except ImportError:
+        note = "the bidask package is not installed (pip install bidask)"
+    else:
+        try:
+            signed = float(bidask.edge(o, h, l, c, sign=True))
+            theirs = math.copysign(abs(signed), signed) * 10_000.0 / 2.0
+        except Exception as exc:                 # noqa: BLE001 - reported, not raised
+            note = f"bidask.edge raised {type(exc).__name__}: {exc}"
+
+    adjusted, adjusted_note = None, ""
+    fetch = getattr(market_provider, "adjusted_bars", None)
+    if fetch is None:
+        adjusted_note = f"{market_provider.name} does not supply adjusted bars"
+    else:
+        try:
+            adj = fetch(symbol, period="max")
+            adjusted = edge(*(adj[k].to_numpy()
+                              for k in ("open", "high", "low", "close")))
+        except Exception as exc:                 # noqa: BLE001 - reported, not raised
+            adjusted_note = f"{type(exc).__name__}: {exc}"
+
+    blocks = []
+    if splits:
+        edges = [None] + sorted(pd.Timestamp(s) for s in splits) + [None]
+        for start, stop in zip(edges, edges[1:]):
+            mask = np.ones(len(frame), dtype=bool)
+            if start is not None:
+                mask &= frame.index >= start
+            if stop is not None:
+                mask &= frame.index < stop
+            if mask.sum() < 3:
+                continue
+            piece = frame[mask]
+            po, ph, pl, pc = (piece[k].to_numpy()
+                              for k in ("open", "high", "low", "close"))
+            pv = piece["volume"].to_numpy() if "volume" in piece.columns else None
+            label = (f"{'start' if start is None else start.date()} to "
+                     f"{'end' if stop is None else stop.date()}")
+            blocks.append(DateBlock(label, piece.index[0].date(),
+                                    piece.index[-1].date(), edge(po, ph, pl, pc),
+                                    edge_components(po, ph, pl, pc),
+                                    classify_bars(po, ph, pl, pc, pv)))
+
+    return ReferenceReport(
+        symbol=symbol, provider=market_provider.name,
+        first=frame.index[0].date(), last=frame.index[-1].date(),
+        rows=int(len(frame)), quality=quality, ours=ours, components=parts,
+        theirs_half_bps=theirs, theirs_note=note, adjusted=adjusted,
+        adjusted_note=adjusted_note, blocks=tuple(blocks),
+        sigma_day=daily_volatility(c))
 
 
 def run_ladder(*, provider="yfinance",

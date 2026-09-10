@@ -202,7 +202,8 @@ import numpy as np
 __all__ = ["SpreadEstimate", "edge", "MINIMUM_BARS", "TickSize",
            "infer_tick_size", "CANDIDATE_TICKS", "WindowRung", "WindowSweep",
            "sweep_windows", "WINDOWS", "DRIFT_SIGMA", "BarQuality",
-           "classify_bars", "exclude_bars"]
+           "classify_bars", "exclude_bars", "SpreadComponents",
+           "edge_components"]
 
 
 # Below this many usable bars the estimator returns a refusal rather than a
@@ -397,6 +398,85 @@ def edge(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
         ...
     ValueError: open, high, low and close must be the same length
     """
+    terms = _per_bar_terms(open_, high, low, close)
+    if isinstance(terms, SpreadEstimate):
+        return terms
+    pairs = terms.pairs
+    p_o, p_c = terms.p_o, terms.p_c
+
+    x1 = -4.0 / p_o * terms.d1 * terms.r2 + -4.0 / p_c * terms.d3 * terms.r4
+    x2 = -4.0 / p_o * terms.d1 * terms.r5 + -4.0 / p_c * terms.d5 * terms.r4
+
+    # One mask for both series, so the point estimate and the standard error
+    # are computed off exactly the same rows. The two series depend on the
+    # same five inputs, so this discards nothing either of them could use.
+    usable = np.isfinite(x1) & np.isfinite(x2)
+    k = int(usable.sum())
+    if k < minimum_bars:
+        return SpreadEstimate(None, None, None, pairs, k,
+                              refusal=f"only {k} usable bars, fewer than the "
+                                      f"{minimum_bars} required")
+    a = x1[usable]
+    b = x2[usable]
+
+    e1, e2 = float(a.mean()), float(b.mean())
+    v1 = float(a.var())
+    v2 = float(b.var())
+    vt = v1 + v2
+
+    # The variance-weighted combination: the lower-variance estimator gets the
+    # larger weight. With no variance to go on, weight them equally.
+    weight = v2 / vt if vt > 0 else 0.5
+    s2 = weight * e1 + (1.0 - weight) * e2
+
+    # The combined per-bar series, whose mean IS s2. Its long-run variance is
+    # the honest input to a standard error: consecutive terms share bar t, so
+    # they are correlated at lag 1 by construction.
+    combined = weight * a + (1.0 - weight) * b
+    se_s2 = math.sqrt(_newey_west(combined, lags) / k)
+
+    # Reported so the i.i.d. assumption above is checkable on real data
+    # rather than carried over from the simulation that justified it.
+    centred = combined - combined.mean()
+    denominator = float(np.mean(centred * centred))
+    rho = (float(np.mean(centred[1:] * centred[:-1])) / denominator
+           if denominator > 0 else None)
+
+    spread = math.sqrt(abs(s2))
+    # Delta method. sqrt is not differentiable at zero and the error bar is
+    # correspondingly undefined there; report no error rather than infinity.
+    se = se_s2 / (2.0 * spread) if spread > 0 else None
+
+    return SpreadEstimate(spread=spread, signed_square=float(s2),
+                          standard_error=se, bars=pairs, usable_bars=k,
+                          square_standard_error=se_s2, autocorrelation=rho)
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class _Terms:
+    """The per-bar quantities `edge` and `edge_components` share."""
+    pairs: int
+    r1: np.ndarray
+    r2: np.ndarray
+    r3: np.ndarray
+    r4: np.ndarray
+    r5: np.ndarray
+    d1: np.ndarray
+    d3: np.ndarray
+    d5: np.ndarray
+    tau: np.ndarray
+    p_tau: float
+    p_o: float
+    p_c: float
+    active: int
+
+
+def _per_bar_terms(open_, high, low, close) -> "_Terms | SpreadEstimate":
+    """The five returns, their de-meaned versions and the corrections.
+
+    Returns a refusal as a `SpreadEstimate` where the estimator would refuse
+    before reaching the products, so that both callers refuse identically.
+    """
     o_raw = np.asarray(open_, dtype=float)
     h_raw = np.asarray(high, dtype=float)
     l_raw = np.asarray(low, dtype=float)
@@ -465,53 +545,117 @@ def edge(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
     d1 = r1 - np.nanmean(r1) / p_tau * tau
     d3 = r3 - np.nanmean(r3) / p_tau * tau
     d5 = r5 - np.nanmean(r5) / p_tau * tau
+    return _Terms(pairs, r1, r2, r3, r4, r5, d1, d3, d5, tau, p_tau, p_o, p_c,
+                  active)
 
-    x1 = -4.0 / p_o * d1 * r2 + -4.0 / p_c * d3 * r4
-    x2 = -4.0 / p_o * d1 * r5 + -4.0 / p_c * d5 * r4
 
-    # One mask for both series, so the point estimate and the standard error
-    # are computed off exactly the same rows. The two series depend on the
-    # same five inputs, so this discards nothing either of them could use.
+@dataclasses.dataclass(frozen=True)
+class SpreadComponents:
+    """The four moment conditions of the estimator, each on its own.
+
+    ``E[r1 r2]``, ``E[r3 r4]``, ``E[r1 r5]`` and ``E[r5 r4]`` each isolate
+    ``s^2/4``, and the estimator averages them in two pairs. Reported
+    separately they say WHICH prices carry a bounce, and that is a
+    diagnostic no single number can give: a contaminated open inflates the
+    two products that use ``o`` (``r1 r2``, ``r1 r5``) and leaves ``r3 r4``
+    alone; a contaminated close does the reverse; a reversal in the price
+    itself, or a genuine spread, inflates all four alike. On the first real
+    ladder run every line collapsed onto a floor of 8 to 34 bps whatever its
+    true spread, which is one additive term in ``s^2``; these four numbers
+    are where to look for it.
+
+    Each component is in the estimator's own units, the squared full spread
+    as a fraction of price, sign kept. `half_bps` roots one into the unit
+    the survey prints, with the sign carried.
+    """
+    open_previous_mid: float      # -(4/p_o) E[d1 r2]   uses o, eta, eta_{t-1}
+    close_previous_mid: float     # -(4/p_c) E[d3 r4]   uses eta, c_{t-1}, eta_{t-1}
+    open_previous_close: float    # -(4/p_o) E[d1 r5]   uses o, eta, c_{t-1}
+    close_open: float             # -(4/p_c) E[d5 r4]   uses o, c_{t-1}, eta_{t-1}
+    weight: float                 # on x1 = the first two; 1 - weight on x2
+    p_open: float
+    p_close: float
+    p_traded: float
+    usable_bars: int
+
+    @property
+    def x1(self) -> float:
+        return self.open_previous_mid + self.close_previous_mid
+
+    @property
+    def x2(self) -> float:
+        return self.open_previous_close + self.close_open
+
+    @property
+    def signed_square(self) -> float:
+        """Reproduces `edge(...).signed_square` exactly."""
+        return self.weight * self.x1 + (1.0 - self.weight) * self.x2
+
+    @staticmethod
+    def half_bps(component: float) -> float:
+        """A component as a signed half-spread in bps: its root, sign kept."""
+        return math.copysign(math.sqrt(abs(component)), component) * 10_000.0 / 2.0
+
+    def lines(self) -> list[str]:
+        rows = [("open vs previous mid      (r1 r2)", self.open_previous_mid),
+                ("close vs previous mid     (r3 r4)", self.close_previous_mid),
+                ("open vs previous close    (r1 r5)", self.open_previous_close),
+                ("close-to-open vs prev mid (r5 r4)", self.close_open)]
+        out = ["moment condition                      signed root, half bps"]
+        out.extend(f"  {label:<36} {self.half_bps(v):+8.2f}" for label, v in rows)
+        out.append(f"  x1 (first two)   {self.half_bps(self.x1):+8.2f}   "
+                   f"x2 (last two) {self.half_bps(self.x2):+8.2f}   "
+                   f"weight on x1 {self.weight:.2f}")
+        out.append(f"  p_open {self.p_open:.3f}  p_close {self.p_close:.3f}  "
+                   f"traded {self.p_traded:.3f}  over {self.usable_bars} bars")
+        return out
+
+
+def edge_components(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
+                    close: np.ndarray) -> "SpreadComponents | None":
+    """The four moment conditions behind `edge`, separately. None on refusal.
+
+    The same per-bar terms, the same mask and the same weight as `edge`, so
+    the weighted sum of the components is the estimator's own square:
+
+    >>> from portfolio.eval.spread_controls import simulate_bars
+    >>> o, h, l, c = simulate_bars(0.004, bars=800, seed=9)
+    >>> parts = edge_components(o, h, l, c)
+    >>> abs(parts.signed_square - edge(o, h, l, c).signed_square) < 1e-15
+    True
+
+    On clean bars every component carries the same bounce, so the four
+    signed roots sit near the imposed 20 bps:
+
+    >>> all(10 < parts.half_bps(v) < 30 for v in (
+    ...     parts.open_previous_mid, parts.close_previous_mid,
+    ...     parts.open_previous_close, parts.close_open))
+    True
+    """
+    terms = _per_bar_terms(open_, high, low, close)
+    if isinstance(terms, SpreadEstimate):
+        return None
+    p_o, p_c = terms.p_o, terms.p_c
+    a12 = -4.0 / p_o * terms.d1 * terms.r2
+    a34 = -4.0 / p_c * terms.d3 * terms.r4
+    a15 = -4.0 / p_o * terms.d1 * terms.r5
+    a54 = -4.0 / p_c * terms.d5 * terms.r4
+    x1 = a12 + a34
+    x2 = a15 + a54
     usable = np.isfinite(x1) & np.isfinite(x2)
     k = int(usable.sum())
-    if k < minimum_bars:
-        return SpreadEstimate(None, None, None, pairs, k,
-                              refusal=f"only {k} usable bars, fewer than the "
-                                      f"{minimum_bars} required")
-    a = x1[usable]
-    b = x2[usable]
-
-    e1, e2 = float(a.mean()), float(b.mean())
-    v1 = float(a.var())
-    v2 = float(b.var())
+    if k < 2:
+        return None
+    v1, v2 = float(x1[usable].var()), float(x2[usable].var())
     vt = v1 + v2
-
-    # The variance-weighted combination: the lower-variance estimator gets the
-    # larger weight. With no variance to go on, weight them equally.
     weight = v2 / vt if vt > 0 else 0.5
-    s2 = weight * e1 + (1.0 - weight) * e2
-
-    # The combined per-bar series, whose mean IS s2. Its long-run variance is
-    # the honest input to a standard error: consecutive terms share bar t, so
-    # they are correlated at lag 1 by construction.
-    combined = weight * a + (1.0 - weight) * b
-    se_s2 = math.sqrt(_newey_west(combined, lags) / k)
-
-    # Reported so the i.i.d. assumption above is checkable on real data
-    # rather than carried over from the simulation that justified it.
-    centred = combined - combined.mean()
-    denominator = float(np.mean(centred * centred))
-    rho = (float(np.mean(centred[1:] * centred[:-1])) / denominator
-           if denominator > 0 else None)
-
-    spread = math.sqrt(abs(s2))
-    # Delta method. sqrt is not differentiable at zero and the error bar is
-    # correspondingly undefined there; report no error rather than infinity.
-    se = se_s2 / (2.0 * spread) if spread > 0 else None
-
-    return SpreadEstimate(spread=spread, signed_square=float(s2),
-                          standard_error=se, bars=pairs, usable_bars=k,
-                          square_standard_error=se_s2, autocorrelation=rho)
+    return SpreadComponents(
+        open_previous_mid=float(a12[usable].mean()),
+        close_previous_mid=float(a34[usable].mean()),
+        open_previous_close=float(a15[usable].mean()),
+        close_open=float(a54[usable].mean()),
+        weight=weight, p_open=p_o, p_close=p_c, p_traded=terms.p_tau,
+        usable_bars=k)
 
 
 # --------------------------------------------------------------------------

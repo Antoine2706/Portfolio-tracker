@@ -458,6 +458,48 @@ class TestTheAutocorrelationColumn:
         short = _autocorrelation_note((rung("AAPL", "US", -0.104, 504),
                                        rung("SU.PA", "EU", -0.02, 504)))
         assert "Near zero on every rung" in short.replace("\n", " ")
+        # Off 5000 bars the same -0.104 is nine sigma and real -- but on the
+        # US side alone it is the reverse of the book, not "manufactured".
         long = _autocorrelation_note((rung("AAPL", "US", -0.104, 5000),
                                       rung("SU.PA", "EU", -0.02, 5000)))
-        assert "the path manufactures it" in long.replace("\n", " ")
+        assert "Near zero on every rung" not in long
+        assert "the reverse of the book" in long.replace("\n", " ")
+
+
+class TestTheNoteReadsBothSignsAndSizes:
+    """Point 2 of the brief. The real ladder: SPY +0.101, IPRE.DE -0.459.
+    The note said the path manufactures it. Nothing manufactures both
+    signs, and that sentence was written without reading the column."""
+
+    def rung(self, symbol, region, rho, bars=8000):
+        from portfolio.core.spread import WindowSweep
+        from portfolio.research import RungResult
+        e = SpreadEstimate(0.0004, 1.6e-7, 0.0001, bars + 1, bars,
+                           square_standard_error=1e-7, autocorrelation=rho)
+        return RungResult(Rung(symbol, "", 0.1, 2.0, region), "consistent",
+                          "", sweep=WindowSweep((), (), e, bars + 1, "all"))
+
+    def note(self, *rungs) -> str:
+        from portfolio.research import _autocorrelation_note
+        return _autocorrelation_note(rungs).replace("\n", " ")
+
+    def test_opposite_signs_is_not_one_mechanism(self):
+        text = self.note(self.rung("SPY", "US", 0.101), self.rung("AAPL", "US", 0.02),
+                         self.rung("IPRE.DE", "EU", -0.459))
+        assert "manufactures" not in text
+        assert "opposite signs" in text and "not one mechanism" in text
+        assert "IPRE.DE" in text and "thin trading" in text
+
+    def test_same_sign_but_far_larger_in_europe_is_not_either(self):
+        text = self.note(self.rung("SPY", "US", -0.11), self.rung("SU.PA", "EU", -0.45))
+        assert "manufactures" not in text
+        assert "4x the size of SPY" in text
+
+    def test_same_sign_and_comparable_is(self):
+        text = self.note(self.rung("SPY", "US", -0.31), self.rung("SU.PA", "EU", -0.28))
+        assert "one mechanism in the path manufactures it" in text
+
+    def test_large_on_the_us_side_only_is_the_reverse_of_the_book(self):
+        text = self.note(self.rung("SPY", "US", 0.15), self.rung("SU.PA", "EU", -0.01))
+        assert "manufactures" not in text
+        assert "the reverse of the book" in text

@@ -241,6 +241,25 @@ class FixtureProvider(MarketDataProvider):
             raise ProviderError(self.name, f"no bars returned for {symbol}")
         return frame
 
+    def adjusted_bars(self, symbol: str, *, period: str = "max") -> pd.DataFrame:
+        """`bars`, scaled back through an invented quarterly dividend.
+
+        What a distribution adjustment does: every price before an ex-date
+        is multiplied by a factor just under one, cumulatively, so the oldest
+        prices are scaled the most. Half a per cent every 63 bars here. The
+        factor is constant within a bar, so the estimator's log ratios are
+        untouched except across the 63-bar boundaries, and the reference
+        check's adjusted-versus-unadjusted comparison has something honest
+        to show offline: a small difference, from the steps, and no more.
+        """
+        frame = self.bars(symbol, period=period).copy()
+        n = len(frame)
+        steps = np.arange(n)[::-1] // 63          # how many ex-dates lie ahead
+        factor = 0.995 ** steps
+        for column in ("open", "high", "low", "close"):
+            frame[column] = frame[column] * factor
+        return frame[["open", "high", "low", "close"]]
+
     def quote(self, symbol: str) -> Quote:
         series = self._series(symbol)
         _, currency = self._exchange(symbol)

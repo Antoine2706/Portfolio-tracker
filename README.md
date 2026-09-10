@@ -138,6 +138,9 @@ portfolio spreads                  # each instrument's spread, from its own bars
 portfolio spreads --write          # commit the ones that clear every gate
 portfolio controls --spread        # prove the estimator recovers spreads it wasn't told
 portfolio controls --spread-ladder # run the whole data path on SPY, AAPL, SU.PA...
+portfolio controls --spread-reference SPY --split-at 2001-01-01 --split-at 2002-01-01
+                                   # the authors' package on the same bars, adjusted
+                                   # vs unadjusted, blocks by date, the four moments
 ```
 
 Commission and transaction tax are printed on the confirmation. The spread is
@@ -257,6 +260,19 @@ autocorrelation beside the estimate — the one number from the real book that
 no simulated contamination reproduces — so that SPY and AAPL say whether the
 path manufactures it or the European lines own it. Against the fixture the
 ladder is expected to fail — which is how the check is seen to bite.
+
+The first real ladder run gave the pipeline verdict, correctly: SPY read about
+19 bps, and all eleven lines collapsed into 8 to 34 bps whatever their true
+spread — one additive term in s², not eleven faults. `portfolio controls
+--spread-reference SYMBOL` is the tool for that question and changes nothing
+else: on the exact bars the survey reads it runs the authors' own `bidask`
+package (same number means the transcription is faithful and the fault is in
+the input; a different one means the implementation diverges on real data),
+the adjusted series beside the unadjusted one (a factor constant within a bar
+cancels in every log ratio), blocks cut at dates you give (`--split-at`), and
+the estimator's four moment conditions separately, because a contaminated
+open inflates the two that use the open and a contaminated close the one that
+uses the close. Nothing is corrected until that run is back.
 
 ### Directing new money
 

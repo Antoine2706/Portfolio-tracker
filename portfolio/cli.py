@@ -147,6 +147,8 @@ def _controls(args: argparse.Namespace) -> int:
     """
     from .eval.controls import NEGATIVE_CONTROL_SEEDS, run_calibration
 
+    if getattr(args, "spread_reference", None):
+        return _spread_reference(args)
     if getattr(args, "spread_ladder", False):
         return _spread_ladder(args)
 
@@ -262,6 +264,24 @@ def _spread_ladder(args: argparse.Namespace) -> int:
                         rungs=rungs, pairs=pairs)
     print("\n".join(report.lines()))
     return 0 if report.passed else 1
+
+
+def _parse_date(text: str):
+    import datetime as dt
+    try:
+        return dt.date.fromisoformat(text.strip())
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{text!r}: expected YYYY-MM-DD") from None
+
+
+def _spread_reference(args: argparse.Namespace) -> int:
+    """T5, T6 and T7 on one symbol: see the note above `research.reference_check`."""
+    from .research import reference_check
+    report = reference_check(args.spread_reference, provider=args.provider,
+                             data_root=args.data_root,
+                             splits=tuple(args.split_at or ()))
+    print("\n".join(report.lines()))
+    return 0
 
 
 def _backtest(args: argparse.Namespace) -> int:
@@ -806,6 +826,18 @@ def build_parser() -> argparse.ArgumentParser:
     controls.add_argument("--pair", action="append", type=_parse_pair,
                           default=None, metavar="A,B",
                           help="two listings of the same fund to compare; "
+                               "repeatable")
+    controls.add_argument("--spread-reference", metavar="SYMBOL",
+                          dest="spread_reference", default=None,
+                          help="one symbol, three questions on the exact bars "
+                               "the survey reads: the authors' bidask package "
+                               "on the same arrays, adjusted against "
+                               "unadjusted prices, and blocks by date "
+                               "(--split-at); plus the four moment conditions "
+                               "separately")
+    controls.add_argument("--split-at", action="append", type=_parse_date,
+                          default=None, metavar="YYYY-MM-DD",
+                          help="with --spread-reference: cut the history here; "
                                "repeatable")
     controls.set_defaults(func=_controls)
 
