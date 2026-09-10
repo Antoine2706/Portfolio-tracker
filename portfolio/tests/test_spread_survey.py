@@ -488,3 +488,210 @@ class TestTheTickIsReadOffRecentBarsOnly:
 
     def test_a_series_shorter_than_the_window_still_reads(self):
         assert tick_for(self.frame(bars_count=120)).usable
+
+
+# --------------------------------------------------------------------------
+# The survey after the real book failed its ranking check
+# --------------------------------------------------------------------------
+
+import json
+import pathlib
+
+from portfolio.core.spread import classify_bars
+from portfolio.data.store import DataMode, DataStore
+from portfolio.research import load_book, record_survey, survey_spreads
+
+# Five fixture instruments with imposed half-spreads 11.3, 12.1, 17.0, 21.5
+# and 26.8 bps. The fixture makes volume inversely related to spread, so the
+# tightest is the most liquid, which is the ordering a real book has. The
+# bias a carried bar adds scales with the daily variance, so the tight lines
+# were chosen among the fixture's more volatile ones; a low-volatility line
+# would need a still larger sabotage to overtake the wide ones.
+BOOK = (
+    ("IE00B579F325", "Gold ETC", "SGLD.AS"),          # 11.3 bps, most liquid
+    ("IE0031442068", "S&P 500 tracker", "IUSA.AS"),   # 12.1
+    ("IE00BK5BQT80", "All-World tracker", "VWCE.DE"),  # 17.0
+    ("IE00B4K48X80", "Europe tracker", "SMEA.MI"),     # 21.5
+    ("IE00BKM4GZ66", "EM tracker", "IEMA.AS"),         # 26.8, least liquid
+)
+
+
+def book_at(root: pathlib.Path):
+    store = DataStore(mode=DataMode.USER, root=root)
+    store.directory.mkdir(parents=True, exist_ok=True)
+    rows = ["isin,name,issuer,asset_class,base_currency,primary_symbol,"
+            "exchange,quote_currency,provider_symbols,active,manual_overrides,"
+            "note,broker,tradeable,tob_rate,tob_observed,half_spread_bps,"
+            "spread_observed,buy_tax_rate,buyable"]
+    ledger = ["id,date,isin,type,quantity,price_per_unit,currency,fees,note"]
+    for i, (isin, name, symbol) in enumerate(BOOK):
+        rows.append(f"{isin},{name},X,ETF,EUR,{symbol.split('.')[0]},XAMS,EUR,"
+                    f"yfinance={symbol},true,,,MeDirect,true,0.0012,false,"
+                    f"8.0,false,0.0,true")
+        ledger.append(f"t{i},2025-02-0{i + 1},{isin},BUY,10,20.0,EUR,0,")
+    store.instruments_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+    store.transactions_path.write_text("\n".join(ledger) + "\n",
+                                       encoding="utf-8")
+    return load_book(mode="user", data_root=root, provider="fixture",
+                     lookback=400)
+
+
+class CarriesBarsForward(FixtureProvider):
+    """The fixture, with whole bars copied forward on chosen symbols.
+
+    The kind of bar measured to inflate the estimate most, imposed on the
+    most liquid lines most heavily -- which is the shape of the real book's
+    failure, where the fault anti-correlated with liquidity.
+    """
+
+    def __init__(self, carry: dict[str, float]) -> None:
+        super().__init__()
+        self.carry = carry
+
+    def bars(self, symbol, start=None, *, period="2y"):
+        frame = super().bars(symbol, start, period=period).copy()
+        fraction = self.carry.get(symbol, 0.0)
+        if fraction:
+            rng = np.random.default_rng(len(symbol) * 7919)
+            n = len(frame)
+            picked = np.sort(rng.choice(np.arange(1, n), int(fraction * n),
+                                        replace=False))
+            cols = ["open", "high", "low", "close"]
+            values = frame[cols].to_numpy().copy()
+            for i in picked:
+                values[i] = values[i - 1]
+            frame[cols] = values
+        return frame
+
+
+# Whole bars carried forward on the three most liquid lines, most heavily on
+# the most liquid. Thirty per cent is a sabotage level: the bias a carried
+# bar adds to s^2 is about half the daily variance per carried bar, so on a
+# five-instrument book whose true spreads span 11 to 27 bps it takes this
+# much to push the tight lines past the wide ones. It says nothing about what
+# a real feed does, which is the survey's job to count.
+CARRY = {"SGLD.AS": 0.30, "IUSA.AS": 0.30, "VWCE.DE": 0.25}
+
+
+@pytest.fixture(scope="module")
+def contaminated(tmp_path_factory):
+    root = tmp_path_factory.mktemp("contaminated")
+    book = book_at(root)
+    return survey_spreads(book, mode="user", data_root=root,
+                          provider=CarriesBarsForward(CARRY))
+
+
+@pytest.fixture(scope="module")
+def clean(tmp_path_factory):
+    root = tmp_path_factory.mktemp("clean")
+    book = book_at(root)
+    return survey_spreads(book, mode="user", data_root=root,
+                          provider="fixture")
+
+
+class TestTheSurveyRunsTwiceAndSaysWhy:
+    """T3 and T4 end to end: the two-column survey on a contaminated feed."""
+
+    CARRY = CARRY
+
+    def test_on_the_clean_feed_both_columns_agree_and_rank_right(self, clean):
+        assert clean.ranking.passed and clean.ranking.rho < -0.5
+        assert clean.clean_ranking.passed
+        for isin, d in clean.decisions.items():
+            c = clean.clean[isin]
+            assert c.half_spread_bps == pytest.approx(d.half_spread_bps, rel=0.15), (
+                f"{isin}: {d.half_spread_bps:.1f} on every bar, "
+                f"{c.half_spread_bps:.1f} with a handful set aside")
+
+    def test_carried_bars_on_the_liquid_lines_invert_the_ranking(self, contaminated):
+        """The real book's failure, reproduced: the most liquid instruments
+        come out widest and the check refuses."""
+        check = contaminated.ranking
+        assert not check.passed, check.line(contaminated.names)
+        assert check.rho > 0.5
+
+    def test_and_the_column_with_them_set_aside_ranks_right_again(self, contaminated):
+        """The attribution. Same feed, same estimator, the counted bars
+        excluded, and liquidity predicts the ordering once more."""
+        check = contaminated.clean_ranking
+        assert check.passed, check.line(contaminated.names)
+        assert check.rho < -0.2
+
+    def test_the_counts_name_the_contamination_per_instrument(self, contaminated):
+        by_symbol = {contaminated.symbols[i]: q
+                     for i, q in contaminated.quality.items()}
+        for symbol, fraction in self.CARRY.items():
+            expected = int(fraction * 505)
+            got = by_symbol[symbol].counts()["repeated"]
+            assert got == expected, (symbol, got, expected)
+        for symbol in ("SMEA.MI", "IEMA.AS"):
+            assert by_symbol[symbol].counts()["repeated"] == 0
+
+    def test_the_report_shows_both_columns_and_the_pairs(self, contaminated):
+        text = "\n".join(contaminated.lines())
+        assert "on every bar" in text and "with those bars set aside" in text
+        assert "whole bars carried forward" in text
+        assert "liquidity proxy: median daily traded value" in text
+        assert "liquidity rank  spread rank" in text
+        assert "(SGLD.AS)" in text                 # the symbol, per instrument
+        assert "With the" in text and "bars set aside above excluded" in text
+
+    def test_the_old_verdict_guessed_and_the_new_one_does_not(self, contaminated):
+        verdict = contaminated.ranking.verdict
+        assert "suspect the symbol mapping" not in verdict
+        assert "cannot say which is wrong" in verdict
+        assert "SGLD.AS" not in verdict            # keys are ISINs here...
+        assert contaminated.ranking.pairs[0][0] == "IE00B579F325"  # ...most liquid first
+
+    def test_a_ceiling_above_the_constant_is_not_called_safe(self, clean, contaminated):
+        for survey in (clean, contaminated):
+            text = "\n".join(survey.lines())
+            assert "intended direction" not in text
+            assert "wrong error" not in text
+
+
+class TestTheRunIsRecorded:
+    def test_every_run_is_appended_with_its_numbers(self, tmp_path):
+        root = tmp_path / "book"
+        book = book_at(root)
+        survey = survey_spreads(book, mode="user", data_root=root,
+                                provider=CarriesBarsForward({"SGLD.AS": 0.2}))
+        log = root / "spread-runs.jsonl"
+        assert record_survey(survey, log) == 1
+        assert record_survey(survey, log) == 2
+        entries = [json.loads(line) for line in log.read_text().splitlines()]
+        assert len(entries) == 2
+        entry = entries[0]
+        assert entry["provider"] == "fixture" and "recorded_at" in entry
+        assert entry["ranking"]["rho"] == pytest.approx(survey.ranking.rho)
+        assert entry["clean_ranking"]["rho"] == pytest.approx(
+            survey.clean_ranking.rho)
+        gold = entry["instruments"]["IE00B579F325"]
+        assert gold["symbol"] == "SGLD.AS"
+        assert gold["bars_set_aside"]["repeated"] == int(0.2 * 505)
+        assert gold["every_bar"]["charged_bps"] > gold["clean"]["charged_bps"]
+        assert gold["every_bar"]["estimate"]["usable_bars"] > 0
+
+    def test_the_command_records_a_failed_run_before_refusing(self, tmp_path, capsys,
+                                                             monkeypatch):
+        """The point of the log: the run that refuses to write is the one
+        whose numbers must not be lost."""
+        from portfolio import cli
+        root = tmp_path / "book"
+        book_at(root)
+        monkeypatch.setattr(
+            "portfolio.research._provider_named",
+            lambda name: CarriesBarsForward(
+                {"SGLD.AS": 0.3, "IUSA.AS": 0.3, "VWCE.DE": 0.25}))
+        code = cli.main(["spreads", "--mode", "user", "--data-root", str(root),
+                         "--provider", "fixture", "--write"])
+        captured = capsys.readouterr()
+        assert code == 1
+        assert "Recorded as run 1" in captured.out
+        assert "did not pass" in captured.err
+        assert "spread-ladder" in captured.err
+        assert (root / "spread-runs.jsonl").exists()
+        # And nothing was written to the instruments.
+        store = DataStore(mode=DataMode.USER, root=root)
+        assert all(not i.spread_observed and i.spread_source != "bounded"
+                   for i in store.load_instruments().values())

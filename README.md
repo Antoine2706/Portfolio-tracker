@@ -134,9 +134,10 @@ portfolio backtest erc      # equal risk contribution against buy-and-hold
 ### The bid-ask spread, which appears on no document
 
 ```bash
-portfolio spreads           # each instrument's spread, from its own bars
-portfolio spreads --write   # commit the ones that clear every gate
-portfolio controls --spread # prove the estimator recovers spreads it wasn't told
+portfolio spreads                  # each instrument's spread, from its own bars
+portfolio spreads --write          # commit the ones that clear every gate
+portfolio controls --spread        # prove the estimator recovers spreads it wasn't told
+portfolio controls --spread-ladder # run the whole data path on SPY, AAPL, SU.PA...
 ```
 
 Commission and transaction tax are printed on the confirmation. The spread is
@@ -197,10 +198,11 @@ Four tiers, and the third is why any of this is useful on a tight book:
 Failing the significance test does not mean nothing was learned: it puts a
 ceiling on the spread, and that ceiling is per instrument because the standard
 error depends on that instrument's own volatility and bar count. So the
-differentiation survives even where nothing resolves. It errs toward
-overstating cost, which makes the allocator too reluctant rather than too
-eager, and unlike a constant it is falsifiable — a bound below a spread later
-seen on a quote screen is a bug report.
+differentiation survives even where nothing resolves, and unlike a constant it
+is falsifiable — a bound below a spread later seen on a quote screen is a bug
+report. What a ceiling is *not* is safe: it is only as good as the bars under
+it, and the first real book this ran on produced seven ceilings that were
+wrong by a factor of ten. That run is recorded in `docs/ARCHITECTURE.md`.
 
 The tick is inferred from the prices themselves (the coarsest grid essentially
 every print falls on) rather than from a table of venue rules nobody here
@@ -219,6 +221,26 @@ history actually buys, and a refusal below a minimum bar count. Plus a ranking
 check on the result as a whole: estimated spread against median daily traded
 value, because an ordering that contradicts liquidity is more likely a wiring
 fault than a market fact, and `--write` refuses when it fails.
+
+Those six validate the estimator on simulated bars. They say nothing about
+whether a provider's bars are what the estimator assumes, and the first real
+book failed the ranking check at ρ = +0.89 with the most liquid holding
+estimated widest. So the survey now runs **twice** per instrument — on every
+bar the provider sent, and again with the bars a feed manufactures set aside
+— and prints both with the counts: whole bars carried forward, closes carried
+forward, impossible bars, zero-volume bars. Measured on simulated bars, a
+carried close on five per cent of days inflates a 10 bps spread to 18, and
+setting those days aside recovers it; widening the high and low does nothing.
+The liquidity proxy is printed per instrument so a failed ranking can be laid
+at the right number, and every run is appended to `spread-runs.jsonl` whether
+it passed or not.
+
+`portfolio controls --spread-ladder` is the seventh control and the one that
+decides which end of the path is wrong: the whole survey path on SPY, AAPL,
+SU.PA, MEUD.PA and a thin European fund, each against a band its spread is
+known to sit in. US tight and Europe wide is the provider's European bars;
+SPY wide is the pipeline. It needs the real provider, and against the fixture
+it is expected to fail — which is how the check is seen to bite.
 
 ### Directing new money
 

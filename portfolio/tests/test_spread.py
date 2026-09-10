@@ -19,7 +19,8 @@ import math
 import numpy as np
 import pytest
 
-from portfolio.core.spread import (MINIMUM_BARS, SpreadEstimate, TickSize,
+from portfolio.core.spread import (FLOAT32_EPSILON, MINIMUM_BARS, SpreadEstimate,
+                                   TickSize, classify_bars, exclude_bars,
                                    edge, infer_tick_size, sweep_windows)
 from portfolio.eval.spread_controls import simulate_bars
 
@@ -565,3 +566,151 @@ class TestTheRefusalDoesNotAssertACauseItDidNotTest:
             message = infer_tick_size(series).why_not_a_grid()
             assert "has been adjusted for distributions" not in message
             assert "dividend adjustment" in message  # offered, among others
+
+
+class TestBarsThatCannotBeTrusted:
+    """`classify_bars`, and the measurement behind which kinds it excludes.
+
+    The estimator passed six controls on simulated bars and then estimated
+    a CAC 40 mega-cap at 41.85 bps on a real feed. So each kind of bar a feed
+    manufactures was imposed on simulated bars and measured, and the table
+    is in `core/spread.py` above `classify_bars`. These tests pin the three
+    findings that decide what the survey sets aside:
+
+      * a carried close or a carried whole bar inflates the estimate by more
+        than half at five per cent of bars, and setting them aside recovers
+        the imposed spread;
+      * a flat bar does nothing, which is why it is counted and not excluded;
+      * contaminating the high and the low, symmetrically or on one side,
+        does nothing either -- the hypothesis that reading (h+l)/2 makes the
+        estimator "maximally sensitive to high/low contamination" is wrong
+        as stated, and this is the test that says so.
+    """
+
+    IMPOSED = 10.0
+    N = 1500
+
+    def clean(self, seed: int = 0):
+        return bars(self.IMPOSED, n=self.N, seed=seed)
+
+    def picked(self, seed: int, fraction: float) -> np.ndarray:
+        rng = np.random.default_rng(1000 + seed)
+        return np.sort(rng.choice(np.arange(1, self.N), int(fraction * self.N),
+                                  replace=False))
+
+    def test_a_clean_series_has_nothing_to_set_aside(self):
+        o, h, l, c = self.clean()
+        q = classify_bars(o, h, l, c)
+        assert q.excluded_count == 0
+        assert q.counts()["flat"] == 0 and q.counts()["impossible"] == 0
+
+    def test_each_kind_is_counted_exactly_once(self):
+        o, h, l, c = self.clean()
+        v = np.full(self.N, 500.0)
+        # Ten whole bars carried, ten closes carried, five flat bars at the
+        # previous close, three impossible bars, four with zero volume, two
+        # with no volume figure. Disjoint rows, so each is one thing.
+        for i in range(100, 110):
+            o[i], h[i], l[i], c[i] = o[i - 1], h[i - 1], l[i - 1], c[i - 1]
+        for i in range(200, 210):
+            c[i] = c[i - 1]
+            h[i], l[i] = max(h[i], c[i]), min(l[i], c[i])
+        for i in range(300, 305):
+            o[i] = h[i] = l[i] = c[i] = c[i - 1]
+        for i in range(400, 403):
+            c[i] = h[i] * 1.01
+        v[500:504] = 0.0
+        v[600:602] = np.nan
+        q = classify_bars(o, h, l, c, v)
+        n = q.counts()
+        assert n["repeated"] == 10 and n["stale_close"] == 10
+        assert n["flat"] == 5 and n["flat_at_previous_close"] == 5
+        assert n["impossible"] == 3
+        assert n["zero_volume"] == 4 and n["no_volume"] == 2
+        assert n["excluded"] == 10 + 10 + 3 + 4
+
+    def test_a_carried_whole_bar_inflates_the_estimate_and_exclusion_undoes_it(self):
+        """Five per cent of bars, the measured +84% on average. One sample
+        here, so the assertion is a floor on the effect, not its size."""
+        o, h, l, c = self.clean(seed=3)
+        for i in self.picked(3, 0.05):
+            o[i], h[i], l[i], c[i] = o[i - 1], h[i - 1], l[i - 1], c[i - 1]
+        contaminated = edge(o, h, l, c)
+        assert contaminated.half_spread_bps > 1.4 * self.IMPOSED, (
+            f"{contaminated.half_spread_bps:.1f} bps: the carried bars did "
+            f"not inflate the estimate, and the whole exclusion rests on "
+            f"the claim that they do")
+        q = classify_bars(o, h, l, c)
+        assert q.counts()["repeated"] == int(0.05 * self.N)
+        recovered = edge(*exclude_bars(o, h, l, c, q.excluded))
+        off = abs(recovered.half_spread_bps - self.IMPOSED) / recovered.half_spread_error_bps
+        assert off < 3.0, f"{recovered.describe()} against {self.IMPOSED}"
+
+    def test_a_carried_close_alone_does_too(self):
+        o, h, l, c = self.clean(seed=4)
+        for i in self.picked(4, 0.05):
+            c[i] = c[i - 1]
+            h[i], l[i] = max(h[i], c[i]), min(l[i], c[i])
+        assert edge(o, h, l, c).half_spread_bps > 1.3 * self.IMPOSED
+        q = classify_bars(o, h, l, c)
+        assert q.counts()["stale_close"] == int(0.05 * self.N)
+        recovered = edge(*exclude_bars(o, h, l, c, q.excluded))
+        off = abs(recovered.half_spread_bps - self.IMPOSED) / recovered.half_spread_error_bps
+        assert off < 3.0, recovered.describe()
+
+    def test_a_flat_bar_is_harmless_which_is_why_it_is_kept(self):
+        """Fifteen per cent of bars collapsed to one price. The estimator's
+        own tau already treats these as untraded; excluding them would
+        change the bar count and nothing else."""
+        o, h, l, c = self.clean(seed=5)
+        for i in self.picked(5, 0.15):
+            o[i] = h[i] = l[i] = c[i]
+        e = edge(o, h, l, c)
+        off = abs(e.half_spread_bps - self.IMPOSED) / e.half_spread_error_bps
+        assert off < 3.0, e.describe()
+        q = classify_bars(o, h, l, c)
+        assert q.counts()["flat"] == int(0.15 * self.N)
+        assert q.excluded_count == 0
+
+    def test_widening_the_range_is_harmless_symmetric_or_not(self):
+        """The pushback. (h+l)/2 is unmoved by a symmetric widening, and the
+        de-meaning absorbs a one-sided one; neither is what broke the real
+        book, whatever it looked like from the formula."""
+        for side in ("both", "high"):
+            o, h, l, c = self.clean(seed=6)
+            for i in self.picked(6, 0.15):
+                h[i] *= 1.003
+                if side == "both":
+                    l[i] /= 1.003
+            e = edge(o, h, l, c)
+            off = abs(e.half_spread_bps - self.IMPOSED) / e.half_spread_error_bps
+            assert off < 3.0, f"{side}: {e.describe()}"
+
+    def test_an_impossible_bar_is_flagged_but_a_float32_ulp_is_not(self):
+        o, h, l, c = self.clean()
+        c[7] = h[7] * (1.0 + 2.0 * FLOAT32_EPSILON)     # a representation error
+        c[8] = h[8] * 1.001                              # a bar that cannot be
+        q = classify_bars(o, h, l, c)
+        assert not q.impossible[7] and q.impossible[8]
+
+    def test_exclusion_is_by_nan_so_pairs_are_not_manufactured(self):
+        """Deleting a bar would pair two days that were never consecutive."""
+        o, h, l, c = self.clean()
+        mask = np.zeros(self.N, dtype=bool)
+        mask[10] = True
+        o2, h2, l2, c2 = exclude_bars(o, h, l, c, mask)
+        assert len(o2) == self.N and np.isnan(o2[10]) and o2[11] == o[11]
+        # Two pairs lost, (9,10) and (10,11), not one.
+        assert edge(o2, h2, l2, c2).usable_bars == edge(o, h, l, c).usable_bars - 2
+
+    def test_the_carried_bars_push_the_autocorrelation_positive_not_negative(self):
+        """Recorded because it was NOT expected. The real book's seven
+        instruments all read negative, four beyond -0.10; a carried bar
+        moves it the other way, so whatever produced those is not this."""
+        rhos = []
+        for seed in range(6):
+            o, h, l, c = self.clean(seed=20 + seed)
+            for i in self.picked(20 + seed, 0.15):
+                o[i], h[i], l[i], c[i] = o[i - 1], h[i - 1], l[i - 1], c[i - 1]
+            rhos.append(edge(o, h, l, c).autocorrelation)
+        assert np.mean(rhos) > 0.02, rhos

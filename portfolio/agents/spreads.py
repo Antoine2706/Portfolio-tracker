@@ -297,10 +297,10 @@ class RankingCheck:
 
     The controls establish that the estimator works on simulated markets. They
     cannot establish that it is being fed the right bars for the right
-    instruments -- a symbol mapped to the wrong listing, a panel column
-    misaligned by one, an adjusted series where an unadjusted one was meant.
-    Every one of those produces spreads that are individually plausible and
-    collectively nonsense.
+    instruments -- a feed that carries a close forward on days a venue was
+    shut, a symbol resolving to the wrong listing, a volume figure that
+    belongs to another line of the same fund. Every one of those produces
+    spreads that are individually plausible and collectively nonsense.
 
     So: rank the instruments by estimated spread, rank them by a liquidity
     proxy, and check the two disagree the way they should. Bigger and more
@@ -312,18 +312,58 @@ class RankingCheck:
     no power, so this is a check on gross wiring errors and is honest about
     being one. A near-zero correlation says nothing either way and reports
     itself as saying nothing.
+
+    What it does not do is say *why* it failed. It compares two numbers per
+    instrument and either can be the wrong one; the first version of this
+    verdict said "suspect the symbol mapping or the panel alignment", which
+    was a guess dressed as a diagnosis and sent the reader to the wrong
+    place. It now carries the pairs it ranked, so that the reader can see
+    which instruments drove the correlation, and leaves the cause to the
+    checks that can measure it: the per-instrument bar counts in the survey,
+    and the ladder control on instruments whose spread is not in doubt.
     """
     rho: float | None
     instruments: int
     verdict: str
     passed: bool
+    # (key, half-spread bps, liquidity), most liquid first. The evidence the
+    # verdict was reached on, printed with it so a failure is attributable.
+    pairs: tuple[tuple[str, float, float], ...] = ()
 
-    def line(self) -> str:
+    def table(self, names: dict[str, str] | None = None) -> list[str]:
+        """The pairs, most liquid first, with the rank each number holds."""
+        if not self.pairs:
+            return []
+        by_spread = sorted(self.pairs, key=lambda p: p[1])
+        spread_rank = {p[0]: i + 1 for i, p in enumerate(by_spread)}
+        out = [f"  {'liquidity rank':>14}  {'spread rank':>11}  "
+               f"{'half-spread':>11}  {'median daily traded':>19}  instrument"]
+        for i, (key, spread, traded) in enumerate(self.pairs):
+            label = (names or {}).get(key, "")
+            out.append(f"  {i + 1:>14}  {spread_rank[key]:>11}  "
+                       f"{spread:8.1f} bps  {_money(traded):>19}  {key}"
+                       f"{'  ' + label if label else ''}")
+        return out
+
+    def line(self, names: dict[str, str] | None = None) -> str:
         if self.rho is None:
             return f"Ranking check: {self.verdict}"
-        return (f"Ranking check: rho = {self.rho:+.2f} between estimated "
+        head = (f"Ranking check: rho = {self.rho:+.2f} between estimated "
                 f"spread and liquidity\nacross {self.instruments} "
                 f"instruments. {self.verdict}")
+        table = self.table(names)
+        return head + ("\n" + "\n".join(table) if table else "")
+
+
+def _money(value: float) -> str:
+    """A traded value, in a unit a reader can rank at a glance."""
+    if value >= 1e9:
+        return f"{value / 1e9:.1f}bn"
+    if value >= 1e6:
+        return f"{value / 1e6:.1f}m"
+    if value >= 1e3:
+        return f"{value / 1e3:.0f}k"
+    return f"{value:.0f}"
 
 
 def ranking_is_plausible(spreads: dict[str, float],
@@ -340,15 +380,23 @@ def ranking_is_plausible(spreads: dict[str, float],
     >>> check.rho, check.passed
     (-1.0, True)
 
-    Reversed, which is what a mis-mapped symbol would look like:
+    Reversed, which is what a mis-mapped symbol, a carried close on the
+    liquid lines, or a volume figure from the wrong listing would all look
+    like. The verdict names what was measured and which instruments sit at
+    the extremes; it does not pick among the causes, because it cannot:
 
     >>> check = ranking_is_plausible(tight, {k: 1 / v for k, v in big.items()})
     >>> check.rho, check.passed
     (1.0, False)
     >>> print(check.verdict)
-    The most liquid instruments are estimated to have the WIDEST spreads.
-    That ordering is backwards; suspect the symbol mapping or the panel
-    alignment before believing it.
+    The most liquid instruments are estimated to have the WIDEST spreads: the
+    most traded by the proxy, D, is estimated at 55.0 bps and the least
+    traded, A, at 4.0. That ordering is backwards. This check compares two
+    numbers per instrument and cannot say which is wrong: the bars (a feed
+    that carries a close forward inflates the estimate -- see the bars set
+    aside per instrument above), the liquidity proxy (a volume figure from
+    another listing, or none), or the symbol (the wrong line of the fund).
+    The pairs it ranked follow.
 
     >>> ranking_is_plausible({"A": 4.0}, {"A": 900.0}).passed
     True
@@ -357,26 +405,37 @@ def ranking_is_plausible(spreads: dict[str, float],
     """
     shared = sorted(set(spreads) & set(liquidity))
     n = len(shared)
+    pairs = tuple(sorted(((k, float(spreads[k]), float(liquidity[k]))
+                          for k in shared), key=lambda p: -p[2]))
     if n < minimum:
         return RankingCheck(
             None, n,
             f"only {n} instrument{'' if n == 1 else 's'} {'has' if n == 1 else 'have'} "
-            f"both a spread and a liquidity figure; too few to rank", True)
+            f"both a spread and a liquidity figure; too few to rank", True,
+            pairs=pairs)
 
     rho = _spearman([spreads[k] for k in shared], [liquidity[k] for k in shared])
     if rho > 0.5:
+        most, least = pairs[0], pairs[-1]
         return RankingCheck(rho, n, (
-            "The most liquid instruments are estimated to have the WIDEST "
-            "spreads.\nThat ordering is backwards; suspect the symbol mapping "
-            "or the panel\nalignment before believing it."), False)
+            f"The most liquid instruments are estimated to have the WIDEST "
+            f"spreads: the\nmost traded by the proxy, {most[0]}, is estimated "
+            f"at {most[1]:.1f} bps and the least\ntraded, {least[0]}, at "
+            f"{least[1]:.1f}. That ordering is backwards. This check compares "
+            f"two\nnumbers per instrument and cannot say which is wrong: the "
+            f"bars (a feed\nthat carries a close forward inflates the estimate "
+            f"-- see the bars set\naside per instrument above), the liquidity "
+            f"proxy (a volume figure from\nanother listing, or none), or the "
+            f"symbol (the wrong line of the fund).\nThe pairs it ranked "
+            f"follow."), False, pairs=pairs)
     if rho > -0.2:
         return RankingCheck(rho, n, (
             "Spread and liquidity are close to unranked here. Over this few "
             "instruments\nthat is weak evidence either way, and is reported "
-            "rather than read as a pass."), True)
+            "rather than read as a pass."), True, pairs=pairs)
     return RankingCheck(rho, n, (
         "More liquid instruments are estimated tighter, which is the "
-        "ordering\nliquidity predicts."), True)
+        "ordering\nliquidity predicts."), True, pairs=pairs)
 
 
 def _upper_bound_bps(estimate: SpreadEstimate,

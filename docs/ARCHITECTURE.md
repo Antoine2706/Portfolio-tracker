@@ -380,6 +380,8 @@ before rendering anything.
 | 11 | an instrument's bid-ask spread, on the fixture | a discontinuity the fixture's own bar generator left at the close-to-open boundary, which is exactly where the estimator reads its bounce |
 | 12 | an amount of new money, "10.000" | ten euros. The English convention hard-coded in a client-side parser, in a book kept in Belgium, while `data/importers.py` had the rule right all along |
 | 13 | *"the series has been adjusted for distributions"*, refusing all 7 holdings | float32. Yahoo sends prices as float32 and `100.06` arrives as `100.05999755859375`, so an exact-divisibility test against a tick fails on nearly every price. Four of the seven are accumulating ETFs that have never made a distribution, and the one that pays a dividend had the *highest* fit rate — the explanation was not merely unproven, its ordering was backwards |
+| 14 | *"suspect the symbol mapping or the panel alignment"*, on a ranking check that failed at ρ = +0.89 | a guess. The check compares two numbers per instrument — an estimated spread and a volume-based liquidity proxy — and cannot tell which is wrong; the sentence picked one. The refusal was right. The verdict now prints the pairs it ranked, names the extremes, and says what it cannot tell apart |
+| 15 | a verdict of "consistent" from the ladder control on a 42 bps reading of a one-bp instrument | the interval on s² at t = 1.9 reaches below zero, so its floor is "inside any band". What was wrong was the *ceiling* — 60 bps off 5000 bars, an error bar sixty times what the sample allows — and the first version of the verdict did not look at it. Found by the test written for the real-book case before the control had been run on anything |
 
 Three of Group B were false sentences rather than false numbers (5, 7, and the
 "the structure cannot be fixed by contributions" that overclaimed what a search
@@ -408,6 +410,39 @@ that sit on the 0.0001 grid by construction: a dividend-adjusted series then
 The real constraint is epistemic — **a grid finer than the data's own
 precision cannot be established from it** — so those candidates are now
 excluded rather than fitted.
+
+#14 is #13 and #5 for the third time, and it is the entry that finally made
+the shape a rule (rule 8 below): a correct refusal carrying a cause it never
+tested. The three sentences were all plausible, all specific, and all sent the
+reader somewhere the data had not pointed. What replaced the guess was not a
+better guess but three measurements the check could not make on its own: the
+bars each instrument's estimate rests on, classified and counted
+(`core.spread.classify_bars`); the same estimator with the suspect bars set
+aside, printed beside the first; and the ladder — the whole data path run on
+instruments whose spread is not in doubt (`portfolio controls
+--spread-ladder`).
+
+The classification was preceded by a measurement of what each kind of bar
+does, and the measurement corrected the hypothesis it was testing. The
+working theory was that EDGE, reading (h+l)/2, is *maximally sensitive to
+high/low contamination*. It is not: widening the high and low by 30 bps on 15%
+of bars, symmetrically or on one side, moves the estimate by 0%. What it
+cannot survive is a **carried price** — a close copied from the previous day,
+or a whole bar copied — which turns a day's real price move into a squared
+spread. Five per cent of such bars inflates a 10 bps spread to 18; fifteen per
+cent, to 27. Setting them aside recovers 10.0. Flat bars do nothing, which is
+what the estimator's own `tau` was designed for. The full table is above
+`classify_bars`, and the tests in `test_spread.py` pin all three findings,
+including the negative one.
+
+#15 is the same family as Group A, found in the same way — by writing the
+test for the case the control existed for before believing the control — and
+is in Group B only because it *did* fail once the ceiling was looked at. It is
+worth its own line because the fix is a measurement rather than a threshold:
+the ceiling a clean sample of the same length and volatility would report is
+simulated per rung, and a ceiling more than three times that is called wide.
+The survey prints the same ratio for every instrument that did not resolve,
+because for those the ceiling is the claim.
 
 #9 and #10 are the same lesson from opposite sides. Both came from arguments
 that were sound in form: consecutive terms share a bar, *therefore* correlate;
@@ -449,6 +484,72 @@ The working rules that fall out of it, in the order they pay off:
    calibrated against something else, so a disagreement pointed at the
    fixture. Had both been written together, they would have agreed on the
    wrong answer.
+8. **A verdict may name only what it measured.** #5, #13 and #14 are one
+   defect: a correct refusal with a confident cause attached that nothing had
+   tested. The refusal is the result; the cause is a second claim and is held
+   to the same standard. Where the check cannot tell causes apart, it says
+   so and prints what it compared, and the discrimination is done by a check
+   that can.
+9. **Conservative is not a substitute for right.** The bounded tier was
+   defended as "errs toward overstating cost, which is the safe direction",
+   and that defence would have accepted seven ceilings wrong by a factor of
+   ten. A number that is wrong in a direction one likes is still wrong, and
+   the direction is not even stable: a ceiling built on carried bars is
+   pushed *up*, and the same feed defect on a different estimator could push
+   it down. The direction of an error is not evidence about its size.
+
+## An open result: the first real-book spread survey
+
+Recorded here because a failed control with its numbers preserved is a
+result, and one whose numbers scrolled off a terminal is an anecdote. Every
+subsequent run is appended to `spread-runs.jsonl` in the data root by
+`portfolio spreads`, so this is the last one that has to be written by hand.
+
+The survey was run on a real book of seven holdings against Yahoo's daily
+bars, over each instrument's whole available history. **Nothing resolved.**
+All seven came back `bounded`, with ceilings from **15.2 to 59.7 bps**. Two of
+them are known to be wrong in opposite directions:
+
+* Schneider Electric (FR0000121972), a CAC 40 mega-cap whose half-spread on
+  Euronext Paris is one or two basis points, came back at **41.85 bps at
+  t = 1.93** — the most nearly resolved of the seven, with a ceiling of 59.7.
+* The European Property Yield fund, a small sector ETF whose half-spread is
+  fifteen to thirty, came back at **3.18 bps**, the tightest of the book.
+
+The ranking check compared the seven against median daily traded value and
+found **ρ = +0.89**: the most liquid instruments estimated widest. It refused
+to write, which is what it is for, and it was not weakened, given a tolerance,
+or turned into a warning. The per-bar autocorrelation was negative on all
+seven and beyond −0.10 on four — EURO STOXX Banks −0.403, VanEck
+Semiconductors −0.197, Physical Gold −0.162, Europe Industrials −0.138.
+
+What is and is not established:
+
+* The estimator is not the fault on its own: it passes six controls on
+  simulated bars, and #14's measurement shows that carried bars alone produce
+  exactly this shape — an inflated ceiling with an error bar far wider than
+  the sample allows — with the fault falling on whichever lines the feed
+  carries most.
+* Carried bars are **not** what produces the negative autocorrelation. On
+  simulated bars they push it positive (+0.03 at 5%, up to +0.12 at 15%), and
+  nothing tried — carried closes, carried opens, contaminated ranges, flat
+  bars — pushes it negative. Seven negatives with four beyond −0.10 is a
+  signature of something not yet simulated, and it is left as an observation
+  rather than attributed.
+* Whether Yahoo's European bars carry closes at a rate that explains a factor
+  of twenty is not established from here. It is exactly what the two-column
+  survey now counts and what the ladder decides: SPY and AAPL inside their
+  bands with SU.PA and MEUD.PA outside theirs is the provider; SPY outside
+  its band is the pipeline. That run needs the provider and is the user's.
+* The book's symbol for Schneider is one thing the ladder and the survey now
+  print side by side. SU.PA is Euronext Paris; a symbol resolving to a
+  secondary listing would be a wide spread measured correctly on the wrong
+  line, and the check's old verdict would, for once, have been right for the
+  wrong reason.
+
+The 8 bps constant stays, and stays described as a constant. None of the
+ceilings was written. Every number above is under investigation and none of
+them is a measurement of a spread.
 
 ## Why not Streamlit any more
 

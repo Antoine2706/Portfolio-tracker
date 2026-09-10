@@ -147,6 +147,9 @@ def _controls(args: argparse.Namespace) -> int:
     """
     from .eval.controls import NEGATIVE_CONTROL_SEEDS, run_calibration
 
+    if getattr(args, "spread_ladder", False):
+        return _spread_ladder(args)
+
     if args.spread:
         # A separate family: these calibrate the spread estimator against
         # simulated markets, not the backtest harness against simulated
@@ -198,6 +201,63 @@ def _controls(args: argparse.Namespace) -> int:
                 met_criterion=outcome.passed))
         print()
         print(f"Registered in {registry.path}: {registry.summary()}")
+    return 0 if report.passed else 1
+
+
+def _parse_rung(text: str):
+    """`SYMBOL=LOW-HIGH[:REGION]`, e.g. `VWCE.DE=1-6:EU`."""
+    from .research import Rung
+    try:
+        symbol, rest = text.split("=", 1)
+        band, _, region = rest.partition(":")
+        low, high = (float(x) for x in band.split("-", 1))
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"{text!r}: expected SYMBOL=LOW-HIGH[:REGION], the band in "
+            f"half-spread bps, e.g. VWCE.DE=1-6:EU") from None
+    if not 0 <= low < high:
+        raise argparse.ArgumentTypeError(f"{text!r}: the band must be 0 <= "
+                                         f"LOW < HIGH")
+    region = (region or ("EU" if "." in symbol else "US")).upper()
+    if region not in ("US", "EU", "THIN"):
+        raise argparse.ArgumentTypeError(f"{text!r}: region must be US, EU "
+                                         f"or THIN")
+    return Rung(symbol.strip(), "supplied on the command line", low, high,
+                region if region != "THIN" else "thin")
+
+
+def _parse_pair(text: str) -> tuple[str, str]:
+    parts = [p.strip() for p in text.split(",")]
+    if len(parts) != 2 or not all(parts):
+        raise argparse.ArgumentTypeError(f"{text!r}: expected two symbols, "
+                                         f"A,B")
+    return parts[0], parts[1]
+
+
+def _spread_ladder(args: argparse.Namespace) -> int:
+    """The estimator on instruments whose spread is not in doubt.
+
+    A control on the data path rather than on the estimator, and one that
+    needs the real provider: see the note above `research.LADDER`. Exits
+    non-zero on any rung outside its band, so that it can gate `--write`
+    by hand the way the ranking check gates it automatically.
+    """
+    from .research import LADDER, PAIRS, run_ladder
+
+    rungs = tuple(args.rung) if args.rung else LADDER
+    if args.rung and not args.replace_ladder:
+        rungs = LADDER + tuple(args.rung)
+    pairs = tuple(args.pair) if args.pair else PAIRS
+    if args.provider == "fixture":
+        print("The fixture provider invents bars whose spreads bear no "
+              "relation to the bands,")
+        print("so this run is expected to FAIL. That is the control being "
+              "seen to bite, not a")
+        print("result about any market.")
+        print()
+    report = run_ladder(provider=args.provider, data_root=args.data_root,
+                        rungs=rungs, pairs=pairs)
+    print("\n".join(report.lines()))
     return 0 if report.passed else 1
 
 
@@ -486,6 +546,21 @@ def _spreads(args: argparse.Namespace) -> int:
                             fallback_bps=args.fallback)
     print("\n".join(survey.lines()))
 
+    # Every run is recorded, and the failed ones are the point of recording:
+    # a control that failed and kept its numbers is a result; one that failed
+    # and scrolled off is an anecdote.
+    from .data.store import DataMode, DataStore
+    from .research import record_survey
+    root = pathlib.Path(args.data_root) if args.data_root else None
+    store = DataStore.open(DataMode(args.mode), root=root)
+    log = store.root / "spread-runs.jsonl"
+    try:
+        run_number = record_survey(survey, log)
+        print()
+        print(f"Recorded as run {run_number} in {log}")
+    except OSError as exc:
+        print(f"Could not record the run in {log}: {exc}", file=sys.stderr)
+
     if not survey.ranking.passed:
         print()
         print("The ranking check did not pass. Nothing is written on that "
@@ -495,13 +570,19 @@ def _spreads(args: argparse.Namespace) -> int:
         print("than a market fact, and writing it would bake the fault into "
               "every", file=sys.stderr)
         print("cost figure the tool prints.", file=sys.stderr)
+        print(file=sys.stderr)
+        print("The check cannot say which of its two inputs is wrong. Two "
+              "things can:", file=sys.stderr)
+        print("the bars set aside per instrument above, if the estimate "
+              "with them excluded", file=sys.stderr)
+        print("ranks differently; and `portfolio controls --spread-ladder`, "
+              "which runs the", file=sys.stderr)
+        print("same path on instruments whose spread is not in doubt.",
+              file=sys.stderr)
         return 1
 
     if args.write:
-        from .data.store import DataMode, DataStore
         from .agents.spreads import BOUNDED, ESTIMATED
-        root = pathlib.Path(args.data_root) if args.data_root else None
-        store = DataStore.open(DataMode(args.mode), root=root)
         instruments = store.load_instruments()
         counts = {ESTIMATED: 0, BOUNDED: 0}
         for isin, decision in survey.decisions.items():
@@ -697,6 +778,30 @@ def build_parser() -> argparse.ArgumentParser:
     controls.add_argument("--spread", action="store_true",
                           help="calibrate the bid-ask spread estimator instead "
                                "of the backtest harness")
+    controls.add_argument("--spread-ladder", action="store_true",
+                          dest="spread_ladder",
+                          help="run the spread estimator's whole data path on "
+                               "instruments whose spread is not in doubt "
+                               "(SPY, AAPL, SU.PA, MEUD.PA, a thin fund) and "
+                               "say which end of the path is wrong. Needs "
+                               "the real provider")
+    controls.add_argument("--provider", choices=["yfinance", "fixture"],
+                          default="yfinance",
+                          help="for --spread-ladder; the fixture is expected "
+                               "to fail it, which is how the check is seen "
+                               "to bite")
+    controls.add_argument("--data-root", default=None,
+                          help="for --spread-ladder: where the bar cache lives")
+    controls.add_argument("--rung", action="append", type=_parse_rung,
+                          default=None, metavar="SYMBOL=LOW-HIGH[:REGION]",
+                          help="add a rung to the ladder, band in half-spread "
+                               "bps, e.g. VWCE.DE=1-6:EU; repeatable")
+    controls.add_argument("--replace-ladder", action="store_true",
+                          help="with --rung: use only the rungs given")
+    controls.add_argument("--pair", action="append", type=_parse_pair,
+                          default=None, metavar="A,B",
+                          help="two listings of the same fund to compare; "
+                               "repeatable")
     controls.set_defaults(func=_controls)
 
     backtest = sub.add_parser(

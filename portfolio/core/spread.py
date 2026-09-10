@@ -201,7 +201,8 @@ import numpy as np
 
 __all__ = ["SpreadEstimate", "edge", "MINIMUM_BARS", "TickSize",
            "infer_tick_size", "CANDIDATE_TICKS", "WindowRung", "WindowSweep",
-           "sweep_windows", "WINDOWS", "DRIFT_SIGMA"]
+           "sweep_windows", "WINDOWS", "DRIFT_SIGMA", "BarQuality",
+           "classify_bars", "exclude_bars"]
 
 
 # Below this many usable bars the estimator returns a refusal rather than a
@@ -897,3 +898,240 @@ def sweep_windows(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
     return WindowSweep(rungs=rungs, blocks=blocks_t, chosen=chosen,
                        chosen_bars=chosen_size, reason=reason,
                        drifted_at=drifted_at)
+
+
+# --------------------------------------------------------------------------
+# Bars that cannot be trusted, counted per kind and measured per kind
+# --------------------------------------------------------------------------
+#
+# Why this exists
+# ---------------
+# On a real book of seven holdings the survey estimated the most liquid
+# instrument, a CAC 40 mega-cap whose half-spread is one or two basis points,
+# at 41.85 bps, and a small property fund whose half-spread is fifteen to
+# thirty at 3.18. Both extremes inverted, and the ranking check refused to
+# write. The estimator passes six controls on simulated bars, so the fault
+# was placed on the data path -- and the data path had never been controlled.
+#
+# A feed can be wrong in several ways, and it matters which, because the
+# estimator is indifferent to most of them and enormously sensitive to one.
+# Measured, 60 runs of 1500 bars at 10 bps imposed, contaminating 5% and 15%
+# of bars, with the contaminated bars then set aside and the estimate re-run:
+#
+#     contamination                    5% of bars   15% of bars   set aside
+#     whole bar carried forward          +84%         +171%        10.0 bps
+#     close carried forward              +56%         +150%        10.0 bps
+#     open carried (= previous close)     -2%           -7%        10.0 bps
+#     high and low widened by 30 bps       0%            0%
+#     high alone widened by 30 bps         0%            0%
+#     high == low (one price all day)      0%           +1%
+#     open == high == low == close        +3%           -1%
+#
+# So the hypothesis that reading (h+l)/2 makes the estimator "maximally
+# sensitive to high/low contamination" is wrong as stated: a symmetric
+# widening leaves the mid-range where it was, and a one-sided one is absorbed
+# by the de-meaning. Flat bars are what ``tau`` and ``p_o``/``p_c`` were
+# designed for, and they do nothing. What the estimator cannot survive is a
+# **carried** price. A close copied from the previous day makes
+# ``r4 = c_{t-1} - eta_{t-1}`` and ``r3 = eta_t - c_{t-1}`` read a day's real
+# price move as a bounce, and ``-(4/p_c) d3 r4`` turns that into a squared
+# spread. A carried whole bar does the same on both edges. Five per cent of
+# such bars nearly doubles the estimate, and daily feeds for European venues
+# are known to fill non-trading days with exactly that.
+#
+# The autocorrelation of the per-bar series is measured on the same runs and
+# is worth recording because it did NOT behave as expected: carried bars push
+# it *positive* (+0.03 at 5%, +0.06 to +0.12 at 15%), and nothing in the table
+# pushes it negative. The real book showed it negative on all seven
+# instruments, four of them beyond -0.10. That is therefore not explained by
+# anything here, and it is left as an open observation rather than attributed.
+#
+# So this classifies every bar, counts each kind separately, and hands back a
+# mask of the ones whose effect was measured to bias the estimate, so that
+# the survey can run the estimator with and without them and print both. A
+# difference between the two columns larger than the error bar is attributable
+# to a named count of named bars, which is what a failed ranking check needs
+# to be worth anything.
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class BarQuality:
+    """Which bars of a series are of a kind the estimator cannot trust.
+
+    Every field but `bars` is a boolean mask over the series. The counts
+    are properties, and `excluded` is the union of the kinds measured to bias
+    the estimate, which is the mask `exclude_bars` takes.
+
+    Flat bars are counted and **not** excluded. They are harmless -- measured,
+    above -- and the estimator's own ``tau`` already treats them as bars that
+    did not trade. Excluding them would change nothing except the bar count
+    the estimate is reported off.
+    """
+    bars: int
+    repeated: np.ndarray        # o, h, l, c all identical to the previous bar, h != l
+    stale_close: np.ndarray     # close identical to the previous close, bar otherwise fresh
+    flat: np.ndarray            # high == low: one price all day
+    flat_at_previous_close: np.ndarray   # ...and that price is the previous close
+    impossible: np.ndarray      # open or close outside [low, high], or high < low
+    zero_volume: np.ndarray     # volume reported as exactly zero
+    no_volume: np.ndarray       # volume not reported at all
+
+    @property
+    def excluded(self) -> np.ndarray:
+        """Bars the estimator must not see: carried, or not a bar at all."""
+        return self.repeated | self.stale_close | self.impossible | self.zero_volume
+
+    @property
+    def excluded_count(self) -> int:
+        return int(self.excluded.sum())
+
+    def counts(self) -> dict[str, int]:
+        return {"bars": self.bars,
+                "repeated": int(self.repeated.sum()),
+                "stale_close": int(self.stale_close.sum()),
+                "flat": int(self.flat.sum()),
+                "flat_at_previous_close": int(self.flat_at_previous_close.sum()),
+                "impossible": int(self.impossible.sum()),
+                "zero_volume": int(self.zero_volume.sum()),
+                "no_volume": int(self.no_volume.sum()),
+                "excluded": self.excluded_count}
+
+    def lines(self) -> list[str]:
+        """The counts, with the ones that bias the estimate said first."""
+        n = self.counts()
+
+        def share(k: int) -> str:
+            return f"{k} ({k / self.bars:.1%})" if self.bars else str(k)
+
+        out = [f"set aside {share(n['excluded'])} of {self.bars} bars: "
+               f"{n['repeated']} whole bars carried forward, "
+               f"{n['stale_close']} closes carried forward, "
+               f"{n['impossible']} impossible, {n['zero_volume']} with zero "
+               f"volume"]
+        flat = f"flat bars (one price all day): {share(n['flat'])}"
+        if n["flat"]:
+            flat += (f", of which {n['flat_at_previous_close']} at the previous "
+                     f"close; kept, the estimator already treats them as "
+                     f"untraded")
+        out.append(flat)
+        if n["no_volume"] == self.bars:
+            out.append("no volume reported on any bar")
+        elif n["no_volume"]:
+            out.append(f"no volume reported on {share(n['no_volume'])} bars")
+        return out
+
+
+def classify_bars(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
+                  close: np.ndarray, volume: np.ndarray | None = None
+                  ) -> BarQuality:
+    """Count the kinds of bar a daily feed produces that never traded.
+
+    Exact equality throughout. A carried bar is a copy, and a copy is equal to
+    the byte; a genuine unchanged close on a coarse grid is also equal, and is
+    counted here too, which is why the survey reports both columns rather than
+    silently preferring the one with those bars removed. The impossibility
+    test alone carries a tolerance, of a few float32 ulps, because a close a
+    representation error outside the high is a rounding artefact rather than
+    an impossible bar.
+
+    A clean series has nothing to set aside:
+
+    >>> from portfolio.eval.spread_controls import simulate_bars
+    >>> o, h, l, c = simulate_bars(0.002, bars=300, seed=1)
+    >>> classify_bars(o, h, l, c).excluded_count
+    0
+
+    Copy one bar over the next and it is found, once, as a repeated bar:
+
+    >>> o[10], h[10], l[10], c[10] = o[9], h[9], l[9], c[9]
+    >>> q = classify_bars(o, h, l, c)
+    >>> q.counts()["repeated"], q.counts()["stale_close"], q.excluded_count
+    (1, 0, 1)
+
+    A close carried on its own, with the rest of the bar fresh, is the other
+    kind, and is not double-counted as a repeat:
+
+    >>> c[20] = c[19]; h[20] = max(h[20], c[20]); l[20] = min(l[20], c[20])
+    >>> q = classify_bars(o, h, l, c)
+    >>> q.counts()["repeated"], q.counts()["stale_close"]
+    (1, 1)
+
+    Volume is optional, and absent is a count of its own rather than zero:
+
+    >>> classify_bars(o, h, l, c).counts()["no_volume"] == 300
+    True
+    >>> v = np.ones(300); v[5] = 0.0
+    >>> classify_bars(o, h, l, c, v).counts()["zero_volume"]
+    1
+    """
+    o = np.asarray(open_, dtype=float)
+    h = np.asarray(high, dtype=float)
+    l = np.asarray(low, dtype=float)
+    c = np.asarray(close, dtype=float)
+    n = o.size
+    if h.size != n or l.size != n or c.size != n:
+        raise ValueError("open, high, low and close must be the same length")
+    if volume is not None and np.asarray(volume).size != n:
+        raise ValueError("volume must be the same length as the prices")
+
+    present = np.isfinite(o) & np.isfinite(h) & np.isfinite(l) & np.isfinite(c)
+    prev = np.zeros(n, dtype=bool)
+    prev[1:] = present[:-1]
+    both = present & prev
+
+    same_as_previous = np.zeros(n, dtype=bool)
+    close_as_previous = np.zeros(n, dtype=bool)
+    if n > 1:
+        same_as_previous[1:] = ((o[1:] == o[:-1]) & (h[1:] == h[:-1])
+                                & (l[1:] == l[:-1]) & (c[1:] == c[:-1]))
+        close_as_previous[1:] = c[1:] == c[:-1]
+    flat = present & (h == l)
+    repeated = both & same_as_previous & ~flat
+    stale_close = both & close_as_previous & ~flat & ~repeated
+    flat_at_previous = flat & both & close_as_previous
+
+    # A few float32 ulps of slack, so that a close one representation error
+    # outside the high, which Yahoo's upcast produces, is not called
+    # impossible. Anything larger is a bar that cannot have happened.
+    slack = np.abs(h) * FLOAT32_EPSILON * FLOAT32_SLACK
+    impossible = present & ((h < l - slack) | (o > h + slack) | (o < l - slack)
+                            | (c > h + slack) | (c < l - slack))
+
+    if volume is None:
+        zero_volume = np.zeros(n, dtype=bool)
+        no_volume = present.copy()
+    else:
+        v = np.asarray(volume, dtype=float)
+        no_volume = present & ~np.isfinite(v)
+        zero_volume = present & np.isfinite(v) & (v == 0.0)
+
+    return BarQuality(bars=int(present.sum()), repeated=repeated,
+                      stale_close=stale_close, flat=flat,
+                      flat_at_previous_close=flat_at_previous,
+                      impossible=impossible, zero_volume=zero_volume,
+                      no_volume=no_volume)
+
+
+def exclude_bars(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
+                 close: np.ndarray, mask: np.ndarray
+                 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Copies of the four series with the masked bars set to NaN.
+
+    NaN rather than deletion, because the estimator pairs each bar with the
+    one before it and a deleted bar would pair two days that were never
+    consecutive. A NaN bar drops both pairs it belonged to, which is the
+    honest thing to do with a bar that did not happen.
+
+    >>> from portfolio.eval.spread_controls import simulate_bars
+    >>> o, h, l, c = simulate_bars(0.002, bars=100, seed=2)
+    >>> mask = np.zeros(100, dtype=bool); mask[[3, 4]] = True
+    >>> o2, h2, l2, c2 = exclude_bars(o, h, l, c, mask)
+    >>> bool(np.isnan(o2[3]) and np.isnan(c2[4]) and o2[5] == o[5])
+    True
+    """
+    out = []
+    for series in (open_, high, low, close):
+        copy = np.array(series, dtype=float, copy=True)
+        copy[np.asarray(mask, dtype=bool)] = np.nan
+        out.append(copy)
+    return out[0], out[1], out[2], out[3]
