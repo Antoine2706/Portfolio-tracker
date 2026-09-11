@@ -77,7 +77,15 @@ from ..core.taxes import (BELGIAN_TOB_BANDS, BELGIAN_TOB_CAP, FRENCH_FTT_RATE,
 
 __all__ = ["BrokerFees", "InstrumentCost", "CostModel", "UnknownCost", "cost_table",
            "Provenance", "MEDIRECT", "KEYTRADE", "BROKERS", "OBSERVED_TOB_RATE",
-           "FRENCH_FTT_RATE", "BELGIAN_TOB_BANDS"]
+           "FRENCH_FTT_RATE", "BELGIAN_TOB_BANDS", "DECLARED_HALF_SPREAD_BPS"]
+
+# The half-spread the cost model charges for every instrument nobody watched
+# on a quote screen. A declared constant, permanently: the estimator that was
+# meant to replace it is not measuring a spread on daily bars at the scale of
+# this book (docs/ARCHITECTURE.md, "A closed result"). Not tuned to the
+# ceilings that run produced, because they came from the thing shown not to
+# work.
+DECLARED_HALF_SPREAD_BPS = 8.0
 
 
 class UnknownCost(RuntimeError):
@@ -219,7 +227,7 @@ class InstrumentCost:
     broker_recorded: bool = True         # False = the schedule is a fallback
     tob_rate: float | None = OBSERVED_TOB_RATE
     tob_observed: bool = False
-    half_spread_bps: float = 8.0
+    half_spread_bps: float = DECLARED_HALF_SPREAD_BPS
     spread_observed: bool = False
     buy_tax_rate: float = 0.0            # the French FTT, where it applies
     # What the broker actually charged, read off a confirmation. Overrides the
@@ -228,10 +236,10 @@ class InstrumentCost:
     # confirmations and 7.00 EUR flat on a share, at the same broker in the
     # same month. A schedule keyed on the broker alone gets one of those wrong
     # whichever way it is written.
-    # How the half-spread above was arrived at: "observed", "estimated", or
-    # "" meaning the declared constant. `spread_observed` predates this and
-    # remains the boolean the cost split uses; this is the finer statement,
-    # and the two agree because an observed spread sets both.
+    # How the half-spread above was arrived at: "observed", or "" meaning
+    # the declared constant. `spread_observed` predates this and remains the
+    # boolean the cost split uses; the two agree because an observed spread
+    # sets both, and nothing else sets either any more.
     spread_source: str = ""
     commission: float | None = None      # None = use the broker schedule
     commission_observed: bool = False
@@ -281,11 +289,12 @@ class Provenance:
     cost_spread_estimated: float = 0.0
     weighted: bool = False               # were real weights supplied?
     # How each instrument's half-spread was arrived at: "observed" (a document
-    # or a quote screen), "estimated" (EDGE on its own bars, having cleared
-    # every gate in `agents/spreads.py`), or "assumed" (the declared
-    # constant). Separate from the tax provenance above and reported
-    # separately, because until this existed the spread was in the assumed
-    # column by construction and the sentence saying so could never change.
+    # or a quote screen) or "constant" (the declared one). There was an
+    # "estimated" tier, EDGE on the instrument's own bars behind every gate
+    # in `agents/spreads.py`, and a "bounded" one; the first real book closed
+    # both, because the estimator was not measuring a spread on that data
+    # (docs/ARCHITECTURE.md, "A closed result"). The survey still prints
+    # its verdicts; none of them reaches this.
     spread_tiers: tuple = ()             # (isin, tier) pairs
 
     @property
@@ -341,35 +350,29 @@ class Provenance:
             out.append(line + ".")
 
         if self.spread_tiers:
-            counts: dict = {}
-            for _, tier in self.spread_tiers:
-                counts[tier] = counts.get(tier, 0) + 1
             total = len(self.spread_tiers)
-            measured = counts.get("estimated", 0) + counts.get("observed", 0)
-            bounded = counts.get("bounded", 0)
-            if measured or bounded:
-                parts = [f"{count} {tier}"
-                         for tier, count in sorted(counts.items())]
+            watched = sum(1 for _, tier in self.spread_tiers
+                          if tier == "observed")
+            constant = total - watched
+            if watched:
                 out.append(
-                    f"Half-spread: {', '.join(parts)} across {total} "
-                    f"instrument{'' if total == 1 else 's'}. An estimated "
-                    f"spread is EDGE on that instrument's own open, high, low "
-                    f"and close, kept only where it stands two standard errors "
-                    f"clear of zero and above half a tick.")
-            if bounded:
-                out.append(
-                    f"{bounded} of those {'is' if bounded == 1 else 'are'} an "
-                    f"upper bound rather than a reading: the sample could not "
-                    f"distinguish the spread from zero, so what is charged is "
-                    f"the most it could be, which is per instrument and errs "
-                    f"towards overstating cost. Those are not measurements "
-                    f"and are not counted as evidence above.")
+                    f"Half-spread: {watched} of {total} watched on a quote "
+                    f"screen and charged as watched; the other "
+                    f"{constant} the declared constant of "
+                    f"{DECLARED_HALF_SPREAD_BPS:.0f} bps.")
             else:
                 out.append(
                     f"Half-spread: every one of the {total} is the declared "
-                    f"constant. None of their price histories can support an "
-                    f"estimate that is distinguishable from the estimator's "
-                    f"own noise floor.")
+                    f"constant of {DECLARED_HALF_SPREAD_BPS:.0f} bps, and "
+                    f"stays one.")
+            out.append(
+                "The spread is not measurable from daily bars at the scale "
+                "of a book of liquid trackers: on the first real run the "
+                "estimator read 19 bps for SPY, whose true half-spread is "
+                "under one, the same number the authors' own package gives "
+                "on the same bars, and its four moment conditions never "
+                "agreed. It is a declared constant by conclusion, not by "
+                "omission; see docs/ARCHITECTURE.md, \"A closed result\".")
         return out
 
 
@@ -657,9 +660,8 @@ class CostModel:
             # band: whether its spread was measured is a separate question
             # from whether its trades can be priced at all, and skipping the
             # unpriced ones here would quietly shrink the denominator.
-            tiers.append((isin, facts.spread_source
-                          or ("observed" if facts.spread_observed
-                              else "assumed")))
+            tiers.append((isin, "observed" if facts.spread_observed
+                          else "constant"))
             if facts.tob_rate is None:
                 unpriced.append(isin)
                 continue
@@ -735,11 +737,21 @@ def cost_table(instruments) -> dict:
             broker_recorded=bool(inst.broker),
             tob_rate=inst.tob_rate,
             tob_observed=bool(inst.tob_observed and inst.tob_rate is not None),
-            half_spread_bps=(8.0 if inst.half_spread_bps is None
-                             else float(inst.half_spread_bps)),
+            # A watched half-spread is charged as watched. Anything else is
+            # the declared constant, whatever the record carries: the survey
+            # once wrote estimates and ceilings onto instruments, and on the
+            # first real book those numbers were not measurements of a
+            # spread (docs/ARCHITECTURE.md, "A closed result"). A record
+            # that still carries one is charged the constant and labelled
+            # as such, so the conclusion cannot be undone by a stale row.
+            half_spread_bps=(float(inst.half_spread_bps)
+                             if inst.spread_observed
+                             and inst.half_spread_bps is not None
+                             else DECLARED_HALF_SPREAD_BPS),
             spread_observed=bool(inst.spread_observed
                                  and inst.half_spread_bps is not None),
-            spread_source=(inst.spread_source or "").strip().lower(),
+            spread_source=("observed" if inst.spread_observed
+                           and inst.half_spread_bps is not None else ""),
             buy_tax_rate=float(inst.buy_tax_rate),
             commission=(None if inst.commission is None
                         else float(inst.commission)),

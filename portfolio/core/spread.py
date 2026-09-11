@@ -203,7 +203,8 @@ __all__ = ["SpreadEstimate", "edge", "MINIMUM_BARS", "TickSize",
            "infer_tick_size", "CANDIDATE_TICKS", "WindowRung", "WindowSweep",
            "sweep_windows", "WINDOWS", "DRIFT_SIGMA", "BarQuality",
            "classify_bars", "exclude_bars", "SpreadComponents",
-           "edge_components"]
+           "edge_components", "SpecificationTest", "specification_test",
+           "chi2_survival_3dof", "chi2_survival", "RangeRatio", "range_ratio"]
 
 
 # Below this many usable bars the estimator returns a refusal rather than a
@@ -242,6 +243,9 @@ class SpreadEstimate:
     # zero is a reason to raise `lags`, and a reason to say so out loud.
     autocorrelation: float | None = None
     refusal: str = ""                    # non-empty means no estimate
+    # Hansen's J on the four moment conditions: do they agree on one s^2?
+    # None when there was no estimate. See `SpecificationTest`.
+    specification: "SpecificationTest | None" = None
 
     @property
     def half_spread_bps(self) -> float | None:
@@ -402,10 +406,10 @@ def edge(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
     if isinstance(terms, SpreadEstimate):
         return terms
     pairs = terms.pairs
-    p_o, p_c = terms.p_o, terms.p_c
 
-    x1 = -4.0 / p_o * terms.d1 * terms.r2 + -4.0 / p_c * terms.d3 * terms.r4
-    x2 = -4.0 / p_o * terms.d1 * terms.r5 + -4.0 / p_c * terms.d5 * terms.r4
+    a12, a34, a15, a54 = _four_products(terms)
+    x1 = a12 + a34
+    x2 = a15 + a54
 
     # One mask for both series, so the point estimate and the standard error
     # are computed off exactly the same rows. The two series depend on the
@@ -418,6 +422,9 @@ def edge(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
                                       f"{minimum_bars} required")
     a = x1[usable]
     b = x2[usable]
+    specification = _specification_test(
+        np.column_stack([a12[usable], a34[usable], a15[usable], a54[usable]]),
+        terms.p_o, terms.p_c)
 
     e1, e2 = float(a.mean()), float(b.mean())
     v1 = float(a.var())
@@ -449,7 +456,349 @@ def edge(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
 
     return SpreadEstimate(spread=spread, signed_square=float(s2),
                           standard_error=se, bars=pairs, usable_bars=k,
-                          square_standard_error=se_s2, autocorrelation=rho)
+                          square_standard_error=se_s2, autocorrelation=rho,
+                          specification=specification)
+
+
+# --------------------------------------------------------------------------
+# The specification test: do the four moment conditions agree on one spread?
+# --------------------------------------------------------------------------
+#
+# Why this exists
+# ---------------
+# The estimator has four moment conditions and one parameter. That is
+# over-identified, so their mutual consistency is testable, and it was not
+# being tested. On SPY the four read +14.2, +0.9, +13.0 and -5.4 bps in the
+# eighth-tick era: not four noisy readings of one number. The point estimate
+# in that case is a weighted average of four inconsistent numbers, and its
+# error bar describes sampling noise around a quantity the model is not
+# estimating -- this project's signature defect in a new costume.
+#
+# The test
+# --------
+# Over the k usable bars let A be the k x 4 matrix of per-bar products, each
+# column an unbiased read on s^2 under the model; g the vector of its column
+# means; S their sample covariance. The efficient fit of one theta to four
+# means is
+#
+#     theta = (1' S^-1 g) / (1' S^-1 1)
+#
+# and Hansen's statistic
+#
+#     J = k (g - theta 1)' S^-1 (g - theta 1)
+#
+# is chi-square with rank(S) - 1 degrees of freedom when the four agree and
+# the per-bar vectors are independent.
+#
+# That rank is THREE, not four, and the first version of this test got it
+# wrong. The five returns satisfy r2 = r4 + r5 and r3 = r1 + r5 by
+# construction (both are telescoping sums of the same log prices), and the
+# de-meaning preserves the second, d3 = d1 + d5. So bar by bar
+#
+#     p_o (a12 - a15) = -4 d1 r4 = p_c (a34 - a54),
+#
+# one exact linear identity among the four products. S is singular, the
+# four conditions are three, and J has 3 - 1 = 2 degrees of freedom. The
+# first version inverted S with a pseudo-inverse and read J against
+# chi-square(3); a second found the rank with an eigenvalue tolerance. Both
+# failed the same sabotage, and for a reason worth keeping. Set three bars
+# of five hundred to NaN and the de-meaning of r3 is no longer the sum of
+# the de-meanings of r1 and r5, because the three series lose different
+# rows; the identity then holds only to a few parts in a million. That
+# leaves a fourth direction whose variance is of order epsilon squared and
+# whose mean is of order epsilon, so its contribution to J is k times a
+# squared t-ratio of the drift in close-minus-mid, independent of epsilon
+# and nothing to do with the spread. Measured on the fixture's IEMA.AS
+# bars: p = 0.04 on all 505 bars, and under 0.01 on 29 of 30 random
+# three-bar exclusions. So the identity's direction, (p_o, -p_c, -p_o,
+# p_c) in the order (a12, a34, a15, a54), is projected out exactly before
+# anything is inverted, the 3 x 3 covariance on the complement is inverted
+# directly, and the degrees of freedom are two by construction. The
+# survival functions for one, two and three degrees of freedom are
+# closed-form, so nothing here needs scipy:
+#
+#     P(chi2_1 > x) = 1 - erf(sqrt(x/2))
+#     P(chi2_2 > x) = exp(-x/2)
+#     P(chi2_3 > x) = 1 - erf(sqrt(x/2)) + sqrt(2x/pi) exp(-x/2).
+#
+# Independence is the assumption the real data strains: with per-bar
+# autocorrelation of +0.13 the covariance is understated and J runs high,
+# so a rejection at p = 0.04 on such bars is not a rejection. The refusal
+# threshold is 1%, and the number is printed beside every estimate rather
+# than folded into it.
+#
+# What it catches and what it cannot, measured rather than argued, because
+# the first version of this paragraph argued that a reversal moves all four
+# alike and was wrong. A contamination of the open moves the three products
+# that use the open and leaves close-versus-previous-mid (r3 r4) at zero. A
+# contamination of the close, a carried close, and a reversal in the price
+# itself all load on the two products that use the previous close (r3 r4,
+# r5 r4) and leave the open-based two at zero -- the reversal because it
+# lives in the overnight step, which r3 and r5 span and r1 does not. J
+# rejects every one of those, and cannot tell a reversal from a bad close.
+# What it cannot see is a displacement of BOTH the open and the close from
+# the session's mid: that moves all four alike, exactly as a genuine spread
+# does, and no test on these four moments separates them. On the first real
+# ladder run SPY's 2002-2026 block read all four alike; its 1993-2000 block
+# read the open signature. `eval.spread_controls.specification_control`
+# measures every case above.
+
+
+def chi2_survival_3dof(x: float) -> float:
+    """``P(chi^2_3 > x)``, in closed form.
+
+    >>> round(chi2_survival_3dof(7.815), 3), round(chi2_survival_3dof(11.345), 3)
+    (0.05, 0.01)
+    >>> chi2_survival_3dof(0.0)
+    1.0
+    """
+    if x <= 0:
+        return 1.0
+    return float(1.0 - math.erf(math.sqrt(x / 2.0))
+                 + math.sqrt(2.0 * x / math.pi) * math.exp(-x / 2.0))
+
+
+def chi2_survival(x: float, dof: int) -> float:
+    """``P(chi^2_dof > x)`` for one, two or three degrees of freedom.
+
+    >>> round(chi2_survival(3.841, 1), 3), round(chi2_survival(5.991, 2), 3)
+    (0.05, 0.05)
+    >>> round(chi2_survival(9.210, 2), 3), round(chi2_survival(11.345, 3), 3)
+    (0.01, 0.01)
+    """
+    if x <= 0:
+        return 1.0
+    if dof == 1:
+        return float(1.0 - math.erf(math.sqrt(x / 2.0)))
+    if dof == 2:
+        return float(math.exp(-x / 2.0))
+    if dof == 3:
+        return chi2_survival_3dof(x)
+    raise ValueError(f"no closed form here for {dof} degrees of freedom")
+
+
+@dataclasses.dataclass(frozen=True)
+class SpecificationTest:
+    """Hansen's J on the estimator's four moment conditions, three of which
+    are independent."""
+    statistic: float
+    dof: int
+    p_value: float
+    theta: float                         # the one-parameter fit, s^2 units
+    moments: tuple                       # the four means, s^2 units
+    bars: int
+
+    def rejects(self, alpha: float = 0.01) -> bool:
+        return self.p_value < alpha
+
+    @property
+    def moments_half_bps(self) -> tuple:
+        return tuple(math.copysign(math.sqrt(abs(m)), m) * 10_000.0 / 2.0
+                     for m in self.moments)
+
+    def line(self) -> str:
+        roots = ", ".join(f"{m:+.1f}" for m in self.moments_half_bps)
+        return (f"J = {self.statistic:.1f} on {self.dof} degrees of freedom, "
+                f"p = {self.p_value:.3f}; the four moment conditions read "
+                f"{roots} bps")
+
+
+def _specification_test(products: np.ndarray, p_o: float, p_c: float
+                        ) -> "SpecificationTest | None":
+    """J on a k x 4 matrix of finite per-bar products. None if degenerate.
+
+    The identity ``p_o (a12 - a15) = p_c (a34 - a54)`` is projected out
+    before anything is inverted, using the corrections it is stated in, so
+    the covariance inverted is the full-rank 3 x 3 one on the complement
+    and the degrees of freedom are 3 - 1 = 2 by construction.
+    """
+    k = int(products.shape[0])
+    if k < 8:
+        return None
+    g = products.mean(axis=0)
+    # The identity's direction in (a12, a34, a15, a54), and an orthonormal
+    # basis of its complement: the three rows of the SVD's right factor
+    # that are not the direction itself.
+    identity = np.array([p_o, -p_c, -p_o, p_c], dtype=float)
+    basis = np.linalg.svd(identity.reshape(1, 4))[2][1:].T        # 4 x 3
+    reduced = products @ basis                                       # k x 3
+    s = np.cov(reduced, rowvar=False, ddof=1)
+    if not np.all(np.isfinite(s)):
+        return None
+    try:
+        w = np.linalg.inv(s)
+    except np.linalg.LinAlgError:
+        return None
+    ones = basis.T @ np.ones(4)          # "all four equal theta", reduced
+    denominator = float(ones @ w @ ones)
+    if denominator <= 0:
+        return None
+    theta = float(ones @ w @ (basis.T @ g)) / denominator
+    e = basis.T @ g - theta * ones
+    j = float(k * (e @ w @ e))
+    if not math.isfinite(j) or j < 0:
+        return None
+    return SpecificationTest(statistic=j, dof=2, p_value=chi2_survival(j, 2),
+                             theta=theta, moments=tuple(float(x) for x in g),
+                             bars=k)
+
+
+def specification_test(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
+                       close: np.ndarray) -> "SpecificationTest | None":
+    """J for a series of bars, on the same rows the estimator uses.
+
+    On clean bars the four agree and J sits at its two degrees of freedom
+    (four conditions, one exact identity among them, one parameter):
+
+    >>> from portfolio.eval.spread_controls import simulate_bars
+    >>> o, h, l, c = simulate_bars(0.004, bars=1500, seed=17)
+    >>> t = specification_test(o, h, l, c)
+    >>> t.dof, t.p_value > 0.01
+    (2, True)
+
+    The sabotage: a one-bp instrument over 5000 bars, its open pushed 50 bps
+    off the market on a fifth of days but kept inside the day's range, so
+    the mid is untouched. The estimate becomes 10 bps -- what a real
+    instrument shows, and resolved -- while the products that use the open
+    carry all of it and the close-versus-mid product sits at zero. J
+    rejects:
+
+    >>> o, h, l, c = simulate_bars(0.0002, bars=5000, seed=500)
+    >>> rng = np.random.default_rng(600)
+    >>> i = rng.choice(np.arange(1, 4999), 1000, replace=False)
+    >>> o2 = o.copy()
+    >>> o2[i] = np.clip(o2[i] * np.where(rng.random(1000) < 0.5, 1.005, 0.995),
+    ...                 l[i], h[i])
+    >>> e = edge(o2, h, l, c)
+    >>> e.resolved(), 5 < e.half_spread_bps < 20, e.specification.rejects(0.01)
+    (True, True, True)
+    >>> roots = e.specification.moments_half_bps
+    >>> roots[1] < 5 < min(roots[0], roots[2])     # r3 r4 alone stays clean
+    True
+
+    What the four cannot tell apart is a bounce and a displacement of both
+    ends of the day: push the open AND the close off the mid and all four
+    products rise alike, which is what a genuine spread does, and J passes:
+
+    >>> o, h, l, c = simulate_bars(0.0002, bars=5000, seed=700)
+    >>> rng = np.random.default_rng(1700)
+    >>> i = rng.choice(np.arange(1, 4999), 1000, replace=False)
+    >>> j = rng.choice(np.arange(1, 4999), 1000, replace=False)
+    >>> o2, c2 = o.copy(), c.copy()
+    >>> o2[i] = np.clip(o2[i] * np.where(rng.random(1000) < 0.5, 1.005, 0.995),
+    ...                 l[i], h[i])
+    >>> c2[j] = np.clip(c2[j] * np.where(rng.random(1000) < 0.5, 1.005, 0.995),
+    ...                 l[j], h[j])
+    >>> e = edge(o2, h, l, c2)
+    >>> e.half_spread_bps > 8, e.specification.rejects(0.01)
+    (True, False)
+    """
+    e = edge(open_, high, low, close, minimum_bars=0)
+    return e.specification
+
+
+# --------------------------------------------------------------------------
+# Is the range contaminated? Parkinson against close-to-close
+# --------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class RangeRatio:
+    """Parkinson's range variance over the close-to-close variance.
+
+    Parkinson (1980): for a Brownian price watched continuously through the
+    session, ``E[ln(H/L)^2] = 4 ln 2 sigma^2``, so ``mean(ln(H/L)^2) /
+    (4 ln 2)`` estimates the variance the range saw. Close-to-close
+    ``mean((Delta ln C)^2)`` estimates the variance of the whole day
+    including the overnight gap. On clean daily equity bars the ratio
+    therefore sits below one, around 0.7 to 0.9, and a bar sampled at
+    sixty prints rather than continuously pulls it lower still: the
+    simulator's bars, which have no overnight gap at all, read 0.80 to
+    0.85 at a one-bp spread. A ratio above one means the high and the low
+    contain prices the close-to-close series never sees: extended-hours
+    prints, off-book trades, bad ticks. The estimator reads the spread out
+    of (h+l)/2, so an inflated range is exactly fatal, and this is the one
+    number that says whether it is.
+
+    One caveat, measured: the spread itself widens the range, because the
+    high sits at the ask and the low at the bid, so ``ln(H/L)`` carries the
+    full spread on top of the day's move. At 20 bps half-spread the same
+    clean simulator reads 1.03. A thin line therefore sits above one without
+    any contamination; the ratio is decisive on tight instruments and must
+    be read against the spread on wide ones.
+    """
+    parkinson: float
+    close_to_close: float
+    bars: int
+
+    @property
+    def ratio(self) -> float | None:
+        if self.close_to_close <= 0:
+            return None
+        return self.parkinson / self.close_to_close
+
+    # Above this the range is called contaminated. One, with a margin for the
+    # simulator, whose bars have no overnight gap and sit at 1.0; a real
+    # daily bar has the gap and sits at 0.7 to 0.9, so on real bars the
+    # margin is generous rather than tight.
+    CONTAMINATED_ABOVE = 1.1
+
+    def line(self) -> str:
+        r = self.ratio
+        if r is None:
+            return "range/close ratio: not defined, the closes never moved"
+        if r > self.CONTAMINATED_ABOVE:
+            verdict = ("above 1: the high and low carry prices the closes "
+                       "never see, unless the spread itself is wide enough "
+                       "to account for it")
+        else:
+            verdict = ("not above 1; a clean daily range sits under 1 "
+                       "because it misses the overnight gap")
+        return (f"range/close ratio {r:.2f} (Parkinson {self.parkinson:.2e} "
+                f"against close-to-close {self.close_to_close:.2e} per bar, "
+                f"{self.bars} bars): {verdict}")
+
+
+def range_ratio(high: np.ndarray, low: np.ndarray, close: np.ndarray,
+                *, minimum_bars: int = 20) -> "RangeRatio | None":
+    """Parkinson over close-to-close for a series of bars. None if too short.
+
+    On the simulator's bars at a tight spread the ratio sits near 0.8,
+    the discrete-sampling shortfall of a range read off sixty prints; the
+    simulator has no overnight gap, and real daily bars sit lower still:
+
+    >>> from portfolio.eval.spread_controls import simulate_bars
+    >>> o, h, l, c = simulate_bars(0.0002, bars=2000, seed=8)
+    >>> 0.7 < range_ratio(h, l, c).ratio < 0.95
+    True
+
+    A wide spread lifts it on its own, because the range carries the full
+    spread on top of the day's move:
+
+    >>> o, h, l, c = simulate_bars(0.004, bars=2000, seed=8)
+    >>> range_ratio(h, l, c).ratio > 0.95
+    True
+
+    Highs and lows pushed outward by prints the closes never see take it
+    above one:
+
+    >>> 1.0 < range_ratio(h * 1.004, l / 1.004, c).ratio
+    True
+    """
+    h = np.asarray(high, dtype=float)
+    l = np.asarray(low, dtype=float)
+    c = np.asarray(close, dtype=float)
+    ok = np.isfinite(h) & np.isfinite(l) & (h > 0) & (l > 0) & (h >= l)
+    if ok.sum() < minimum_bars:
+        return None
+    parkinson = float(np.mean(np.log(h[ok] / l[ok]) ** 2) / (4.0 * math.log(2.0)))
+    closes = c[np.isfinite(c) & (c > 0)]
+    if closes.size < minimum_bars:
+        return None
+    returns = np.diff(np.log(closes))
+    return RangeRatio(parkinson=parkinson,
+                      close_to_close=float(np.mean(returns ** 2)),
+                      bars=int(ok.sum()))
 
 
 @dataclasses.dataclass(frozen=True, eq=False)
@@ -549,6 +898,15 @@ def _per_bar_terms(open_, high, low, close) -> "_Terms | SpreadEstimate":
                   active)
 
 
+def _four_products(terms: "_Terms") -> tuple[np.ndarray, ...]:
+    """The four per-bar products, each an unbiased read on s^2 under the model."""
+    p_o, p_c = terms.p_o, terms.p_c
+    return (-4.0 / p_o * terms.d1 * terms.r2,
+            -4.0 / p_c * terms.d3 * terms.r4,
+            -4.0 / p_o * terms.d1 * terms.r5,
+            -4.0 / p_c * terms.d5 * terms.r4)
+
+
 @dataclasses.dataclass(frozen=True)
 class SpreadComponents:
     """The four moment conditions of the estimator, each on its own.
@@ -636,10 +994,7 @@ def edge_components(open_: np.ndarray, high: np.ndarray, low: np.ndarray,
     if isinstance(terms, SpreadEstimate):
         return None
     p_o, p_c = terms.p_o, terms.p_c
-    a12 = -4.0 / p_o * terms.d1 * terms.r2
-    a34 = -4.0 / p_c * terms.d3 * terms.r4
-    a15 = -4.0 / p_o * terms.d1 * terms.r5
-    a54 = -4.0 / p_c * terms.d5 * terms.r4
+    a12, a34, a15, a54 = _four_products(terms)
     x1 = a12 + a34
     x2 = a15 + a54
     usable = np.isfinite(x1) & np.isfinite(x2)

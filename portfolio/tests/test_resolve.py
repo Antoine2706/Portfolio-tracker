@@ -15,8 +15,8 @@ from portfolio.core.models import AssetClass, Instrument
 from portfolio.data.provider import FigiListing, IdentityProvider, ListingProbe, MarketDataProvider
 from portfolio.data.providers.openfigi import parse_mapping_response
 from portfolio.data.resolve import (Verdict, candidates_from_listings,
-                                    instrument_from_candidate, rank_candidates,
-                                    resolve_isin)
+                                    instrument_from_candidate, rank_candidates)
+from portfolio.data.resolve import resolve_isin as _resolve_isin
 from portfolio.tests.fixtures_openfigi import (NO_MATCH_RESPONSE,
                                                WDEF_MAPPING_RESPONSE, wdef_listings)
 
@@ -73,6 +73,19 @@ PROBES: dict[str, ListingProbe] = {
 }
 
 TODAY = D(2026, 9, 3)
+
+
+def resolve_isin(*args, as_of=TODAY, **kwargs):
+    """The resolver at the clock the probes were observed on.
+
+    The probes above are as observed on 2026-09-03 and the resolver's clock
+    defaults to the machine's. Left to that default, the two-row listing
+    turned STALE rather than THIN on 2026-09-11, six business days later,
+    and a test that had passed for a week failed without a line changing. A
+    fixed fixture needs a fixed clock, so every call here gets one unless it
+    says otherwise.
+    """
+    return _resolve_isin(*args, as_of=as_of, **kwargs)
 
 
 class FakeIdentity(IdentityProvider):

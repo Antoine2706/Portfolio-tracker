@@ -50,6 +50,7 @@ import pandas as pd
 from .agents.execution import CostModel, cost_table
 from .agents.referee import Referee, Refereed
 from .agents.risk import EqualRiskContribution
+from .agents.voltarget import TARGET_VOLATILITY, VolatilityTarget
 from .core.positions import derive_positions, weights as position_weights
 from .core.returns import MIN_OBSERVATIONS
 from .data.store import DataMode, DataStore
@@ -309,6 +310,176 @@ def run_equal_risk_contribution(book: Book, *, lookback: int = 252,
                    trial_sharpe_sd=trial_sharpe_sd, overlap=rebalance_every,
                    weights=book.weights, capital_gains=CapitalGainsTax(),
                    constraint_notes=tuple(notes))
+
+
+@dataclasses.dataclass(frozen=True)
+class VolatilityTargetRun:
+    """One run of the pre-registered volatility-targeting trial, judged
+    against its own three criteria and nothing else.
+
+    `docs/PREREGISTRATION-volatility-targeting.md` fixed the criteria
+    before this existed: realised volatility within 15% of the target,
+    relative; the matched-risk gap indistinguishable from zero at |t| < 2 on
+    Jobson-Korkie with Memmel's correction; cost under 0.50% a year. All
+    three, not any one. A higher Sharpe ratio and a lower drawdown were
+    written down in advance as not counting, and are not counted here.
+    """
+    comparison: Comparison
+    result: object                         # the policy's BacktestResult
+    target: float = TARGET_VOLATILITY
+
+    VOLATILITY_TOLERANCE = 0.15            # relative
+    DECISIVE_T = 2.0
+    COST_CEILING = 0.005                   # a year, as a fraction of the book
+
+    @property
+    def realised_volatility(self) -> float:
+        return float(self.comparison.net.volatility)
+
+    @property
+    def volatility_miss(self) -> float:
+        """Relative distance of the realised volatility from the target."""
+        return abs(self.realised_volatility / self.target - 1.0)
+
+    @property
+    def on_target(self) -> bool:
+        return self.volatility_miss <= self.VOLATILITY_TOLERANCE
+
+    @property
+    def matched_risk_t(self) -> "float | None":
+        ra = self.comparison.risk_adjusted
+        return None if ra is None else ra.t_statistic
+
+    @property
+    def indistinguishable(self) -> "bool | None":
+        t = self.matched_risk_t
+        return None if t is None else abs(t) < self.DECISIVE_T
+
+    @property
+    def cost_a_year(self) -> "float | None":
+        return self.comparison.net.cost_drag
+
+    @property
+    def affordable(self) -> "bool | None":
+        c = self.cost_a_year
+        return None if c is None else c < self.COST_CEILING
+
+    @property
+    def binding_share(self) -> "float | None":
+        """The fraction of decisions on which the scalar was below one.
+
+        Printed beside the first criterion because a policy that never
+        bound has not been tested: its realised volatility is buy-and-hold's,
+        and missing the target then says nothing about the estimator.
+        """
+        decisions = getattr(self.result, "decisions", ())
+        if not decisions:
+            return None
+        below = sum(1 for d in decisions
+                    if sum(d.proposed.values()) < 1.0 - 1e-6)
+        return below / len(decisions)
+
+    @property
+    def interpretable(self) -> bool:
+        return self.on_target
+
+    @property
+    def passed(self) -> bool:
+        return bool(self.on_target and self.indistinguishable
+                    and self.affordable)
+
+
+def criteria_lines(run: VolatilityTargetRun) -> list[str]:
+    """The three pre-registered criteria, each with its number and verdict."""
+    out = ["-" * 74,
+           "The pre-registered criteria (docs/PREREGISTRATION-volatility-"
+           "targeting.md), all three, not any one:"]
+    miss = run.volatility_miss
+    share = run.binding_share
+    bound = ("" if share is None else
+             f" The scalar was below one on {share:.0%} of decisions.")
+    out.append(
+        f"  1. realised volatility {run.realised_volatility:.2%} against a "
+        f"target of {run.target:.0%}, {miss:.0%} off; within 15%: "
+        f"{'yes' if run.on_target else 'NO'}.{bound}")
+    t = run.matched_risk_t
+    if t is None:
+        out.append("  2. matched-risk gap: no comparison, one leg has no "
+                   "volatility to match to.")
+    else:
+        out.append(
+            f"  2. matched-risk gap t = {t:+.2f} on Jobson-Korkie with "
+            f"Memmel's correction; |t| < 2: "
+            f"{'yes' if run.indistinguishable else 'NO'}.")
+    c = run.cost_a_year
+    if c is None:
+        out.append("  3. cost: not measured, the run was cost-free.")
+    else:
+        out.append(f"  3. cost {c:.2%} a year against a ceiling of 0.50% a "
+                   f"year: {'yes' if run.affordable else 'NO'}.")
+    if not run.on_target:
+        out.append("Criterion 1 failed, so the run is uninterpretable rather "
+                   "than negative: the estimator did not forecast what it "
+                   "claims, and nothing else in it can be read.")
+    elif run.passed:
+        out.append("All three met. The pre-registration expected this to "
+                   "fail, in writing; that expectation was wrong in a way it "
+                   "can point at.")
+    else:
+        out.append("Criterion 1 passed and another failed: the policy is "
+                   "measured and rejected, as the pre-registration expected.")
+    return out
+
+
+def run_volatility_target(book: Book, *, lookback: int = 252,
+                          warmup: int | None = None,
+                          rebalance_every: int = 21,
+                          trials: int = 1,
+                          trial_sharpe_sd: float = 0.0) -> VolatilityTargetRun:
+    """The pre-registered volatility-targeting trial on this book.
+
+    Same benchmark, same warmup, same overlap rule and same referee as the
+    equal risk contribution run, so the two policies are compared on one
+    footing. The target is `agents.voltarget.TARGET_VOLATILITY` and is not
+    a parameter here: the pre-registration fixed it, and a run at another
+    value is another trial.
+    """
+    warmup = warmup if warmup is not None else lookback + 1
+    policy = VolatilityTarget(lookback=lookback, fixed=dict(book.frozen))
+    refereed = Refereed(policy, Referee(costs=book.costs,
+                                        tradeable=book.tradeable))
+    result = walk_forward(book.panel, refereed, warmup=warmup,
+                          rebalance_every=rebalance_every,
+                          cost_model=book.costs,
+                          execution=Execution.NEXT_CLOSE,
+                          initial_weights=book.weights,
+                          frozen=frozenset(book.frozen))
+    benchmark = buy_and_hold(book.panel, book.weights, warmup=warmup,
+                             cost_model=book.costs,
+                             execution=Execution.NEXT_CLOSE)
+    notes = list(book.notes)
+    if result.decisions:
+        scales = [sum(d.proposed.values()) for d in result.decisions]
+        notes.append(
+            f"the scalar ran from {min(scales):.2f} to {max(scales):.2f} of "
+            f"the book over {len(scales)} decisions, mean {np.mean(scales):.2f}; "
+            f"below one on {sum(s < 1.0 - 1e-6 for s in scales)} of them")
+    dominant = dominant_holding(book, warmup=warmup)
+    if dominant is not None:
+        notes.append(dominant)
+    if refereed.adjustments:
+        notes.append(f"{len(refereed.adjustments)} proposed trades were skipped "
+                     f"as too small to cover their broker's fee; the first was "
+                     f"{refereed.adjustments[0]}")
+    if result.decisions:
+        notes.append("policy said: " + result.decisions[-1].reason)
+    from .core.taxes import CapitalGainsTax
+    comparison = compare(result, benchmark, cost_model=book.costs,
+                         trials=trials, trial_sharpe_sd=trial_sharpe_sd,
+                         overlap=rebalance_every, weights=book.weights,
+                         capital_gains=CapitalGainsTax(),
+                         constraint_notes=tuple(notes))
+    return VolatilityTargetRun(comparison, result, target=policy.target)
 
 
 def dominant_holding(book: Book, *, warmup: int = 0,
@@ -588,6 +759,10 @@ class SpreadSurvey:
     # isin -> (first date, last date, rows): which bars the estimate rests
     # on, printed so that a stale or short history is visible.
     spans: dict = dataclasses.field(default_factory=dict)
+    # isin -> core.spread.RangeRatio: is the range carrying prices the
+    # closes never see? Above one and the estimator's (h+l)/2 is reading
+    # something other than the session.
+    ratios: dict = dataclasses.field(default_factory=dict)
 
     @property
     def bars_set_aside(self) -> int:
@@ -644,6 +819,15 @@ class SpreadSurvey:
                         if abs(rho) > threshold else "")
                 out.append(f"           per-bar autocorrelation {rho:+.3f} "
                            f"(the error bar assumes ~0){loud}")
+            spec = None if d.estimate is None else d.estimate.specification
+            if spec is not None:
+                from .agents.spreads import SPECIFICATION_ALPHA
+                flag = (" -- REJECTED: not four readings of one spread"
+                        if spec.rejects(SPECIFICATION_ALPHA) else "")
+                out.append(f"           {spec.line()}{flag}")
+            ratio = self.ratios.get(isin)
+            if ratio is not None:
+                out.append(f"           {ratio.line()}")
             allowed = self.null_ceiling.get(isin)
             if allowed is not None and d.estimate is not None \
                     and d.estimate.spread is not None:
@@ -680,8 +864,8 @@ class SpreadSurvey:
                         and d.estimate.spread and c.estimate.spread:
                     ratio = d.half_spread_bps / c.half_spread_bps \
                         if c.half_spread_bps else float("inf")
-                    out.append(f"           the bars set aside move the number "
-                               f"charged by a factor of {ratio:.2f}; the two "
+                    out.append(f"           the bars set aside move the "
+                               f"verdict by a factor of {ratio:.2f}; the two "
                                f"samples are nested,")
                     out.append(f"           so no significance is attached -- "
                                f"read it against the two error bars")
@@ -719,11 +903,14 @@ class SpreadSurvey:
         constant = by_tier[ASSUMED] + list(self.refused)
 
         out.append("-" * 74)
-        out.append(f"Of {total} instruments: {len(measured)} carry a measured "
-                   f"spread, {len(bounded)} carry an upper")
-        out.append(f"bound from their own data, and {len(constant)} were not "
-                   f"measurable at all and keep")
-        out.append(f"the declared {self.fallback_bps:.0f} bps.")
+        out.append(f"Of {total} instruments: {len(measured)} read as a "
+                   f"measured spread, {len(bounded)} as an upper")
+        out.append(f"bound from their own data, and {len(constant)} as not "
+                   f"measurable at all.")
+        out.append(f"None of these is charged. The cost model keeps the "
+                   f"declared {self.fallback_bps:.0f} bps for every")
+        out.append("instrument, by conclusion: see docs/ARCHITECTURE.md, "
+                   "\"A closed result\".")
 
         own = measured + bounded
         if own:
@@ -804,7 +991,7 @@ class SpreadSurvey:
         def decision(d, sweep) -> dict | None:
             if d is None:
                 return None
-            return {"charged_bps": d.half_spread_bps, "source": d.source,
+            return {"verdict_bps": d.half_spread_bps, "source": d.source,
                     "clamped_to_tick": d.clamped_to_tick,
                     "estimate": estimate(d.estimate),
                     "window_bars": None if sweep is None else sweep.chosen_bars,
@@ -834,6 +1021,9 @@ class SpreadSurvey:
                                   self.clean_sweeps.get(isin)),
                 "null_ceiling_bps": None if allowed is None else allowed[0],
                 "daily_volatility": None if allowed is None else allowed[1],
+                "specification": _specification_record(
+                    None if d.estimate is None else d.estimate.specification),
+                "range_ratio": _ratio_record(self.ratios.get(isin)),
                 "liquidity": self.liquidity.get(isin),
                 "liquidity_bars": self.liquidity_bars.get(isin, 0)}
         return {"provider": self.provider,
@@ -842,6 +1032,21 @@ class SpreadSurvey:
                 "refused": dict(self.refused),
                 "ranking": ranking(self.ranking),
                 "clean_ranking": ranking(self.clean_ranking)}
+
+
+def _specification_record(spec) -> dict | None:
+    if spec is None:
+        return None
+    return {"J": spec.statistic, "dof": spec.dof, "p_value": spec.p_value,
+            "theta": spec.theta, "moments_half_bps": list(spec.moments_half_bps),
+            "bars": spec.bars}
+
+
+def _ratio_record(ratio) -> dict | None:
+    if ratio is None:
+        return None
+    return {"parkinson": ratio.parkinson, "close_to_close": ratio.close_to_close,
+            "ratio": ratio.ratio, "bars": ratio.bars}
 
 
 def record_survey(survey: SpreadSurvey, path: "pathlib.Path") -> int:
@@ -896,16 +1101,18 @@ def survey_spreads(book: Book, *, mode: str = "user",
 
     Fetches unadjusted OHLC through the cache, runs EDGE on each instrument
     separately, infers each one's tick from its own prices, and applies the
-    three-tier rule. Nothing is written to the instrument records here; that
-    is `portfolio spreads --write`, so that looking is not the same action as
-    committing.
+    three-tier rule to produce a verdict per instrument. Nothing is written
+    to the instrument records, here or anywhere: the cost model charges the
+    declared constant, and the survey exists so that this stays known rather
+    than believed (docs/ARCHITECTURE.md, "A closed result").
 
     Every instrument is estimated on its own bars and nothing is pooled. Two
     funds tracking the same index on two venues have different spreads, and
     the venue is the reason.
     """
     from .agents.spreads import decide_spread, ranking_is_plausible
-    from .core.spread import classify_bars, exclude_bars, sweep_windows
+    from .core.spread import (classify_bars, exclude_bars, range_ratio,
+                              sweep_windows)
     from .data.cache import PriceCache
     from .data.market import MarketData
 
@@ -929,6 +1136,7 @@ def survey_spreads(book: Book, *, mode: str = "user",
     symbols: dict = {}
     null_ceiling: dict = {}
     spans: dict = {}
+    ratios: dict = {}
 
     for isin, inst in book.instruments.items():
         names[isin] = getattr(inst, "name", "") or ""
@@ -948,6 +1156,7 @@ def survey_spreads(book: Book, *, mode: str = "user",
                                                      "close"))
         spans[isin] = (frame.index[0].date(), frame.index[-1].date(),
                        int(len(frame)))
+        ratios[isin] = range_ratio(h, l, c)
         sweep = sweep_windows(o, h, l, c)
         estimate = sweep.chosen
         tick = tick_for(prices)
@@ -972,8 +1181,7 @@ def survey_spreads(book: Book, *, mode: str = "user",
             continue
         # An already-recorded observed spread wins, and the estimate is
         # reported beside it rather than discarded: two independent readings
-        # of the same quantity are worth comparing, and `--write` must never
-        # replace something somebody watched with something inferred.
+        # of the same quantity are worth comparing.
         watched = (float(inst.half_spread_bps)
                    if getattr(inst, "spread_observed", False)
                    and inst.half_spread_bps is not None else None)
@@ -1039,7 +1247,7 @@ def survey_spreads(book: Book, *, mode: str = "user",
                                                            liquidity),
                         liquidity=liquidity, liquidity_bars=liquidity_bars,
                         symbols=symbols, provider=market_provider.name,
-                        null_ceiling=null_ceiling, spans=spans)
+                        null_ceiling=null_ceiling, spans=spans, ratios=ratios)
 
 
 def _provider_named(provider):
@@ -1369,6 +1577,7 @@ class RungResult:
     clean_detail: str = ""
     lower_bps: float | None = None
     upper_bps: float | None = None
+    ratio: object = None                 # RangeRatio
 
     @property
     def estimate(self):
@@ -1394,6 +1603,14 @@ class RungResult:
         if e is not None and e.autocorrelation is not None:
             out.append(f"       per-bar autocorrelation "
                        f"{_rho_text(e.autocorrelation, e.usable_bars)}")
+        if e is not None and e.specification is not None:
+            from .agents.spreads import SPECIFICATION_ALPHA
+            spec = e.specification
+            flag = (" -- REJECTED: not four readings of one spread"
+                    if spec.rejects(SPECIFICATION_ALPHA) else "")
+            out.append(f"       {spec.line()}{flag}")
+        if self.ratio is not None:
+            out.append(f"       {self.ratio.line()}")
         if self.sweep is not None and len(self.sweep.rungs) > 1:
             out.extend(f"       {line}" for line in self.sweep.lines())
         if self.quality is not None:
@@ -1506,20 +1723,25 @@ class LadderReport:
         autocorrelation. SPY and AAPL are the rows that decide whether the
         path manufactures it."""
         out = [f"  {'rung':<9} {'estimate':>9} {'t':>6} {'ceiling':>8} "
-               f"{'per-bar rho':>11} {'set aside':>9}  status"]
+               f"{'per-bar rho':>11} {'J p':>6} {'range':>6} {'set aside':>9}"
+               f"  status"]
         for r in self.rungs:
             e = r.estimate
             if e is None or e.spread is None:
                 out.append(f"  {r.rung.symbol:<9} {'-':>9} {'-':>6} {'-':>8} "
-                           f"{'-':>11} {'-':>9}  {r.status}")
+                           f"{'-':>11} {'-':>6} {'-':>6} {'-':>9}  {r.status}")
                 continue
             ceiling = "-" if r.upper_bps is None else f"{r.upper_bps:.1f}"
             rho = "-" if e.autocorrelation is None else f"{e.autocorrelation:+.3f}"
+            j_p = ("-" if e.specification is None
+                   else f"{e.specification.p_value:.3f}")
+            span = ("-" if r.ratio is None or r.ratio.ratio is None
+                    else f"{r.ratio.ratio:.2f}")
             aside = ("-" if r.quality is None
                      else f"{r.quality.excluded_count / max(r.quality.bars, 1):.1%}")
             out.append(f"  {r.rung.symbol:<9} {e.half_spread_bps:7.1f} bps "
                        f"{e.t_statistic:+6.2f} {ceiling:>8} {rho:>11} "
-                       f"{aside:>9}  {r.status}")
+                       f"{j_p:>6} {span:>6} {aside:>9}  {r.status}")
         return out
 
     def record(self) -> dict:
@@ -1540,6 +1762,10 @@ class LadderReport:
                            "detail": r.detail,
                            "estimate": estimate(r.estimate),
                            "clean_estimate": estimate(r.clean),
+                           "specification": _specification_record(
+                               None if r.estimate is None
+                               else r.estimate.specification),
+                           "range_ratio": _ratio_record(r.ratio),
                            "lower_bps": r.lower_bps, "upper_bps": r.upper_bps,
                            "bars_set_aside": (None if r.quality is None
                                               else r.quality.counts()),
@@ -1795,6 +2021,7 @@ class DateBlock:
     estimate: object                     # SpreadEstimate
     components: object                   # SpreadComponents | None
     quality: object                      # BarQuality
+    ratio: object = None                 # RangeRatio | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1813,6 +2040,7 @@ class ReferenceReport:
     adjusted_note: str = ""
     blocks: tuple = ()                   # DateBlock, in date order
     sigma_day: float | None = None
+    ratio: object = None                 # RangeRatio on every bar
 
     @property
     def ours_half_bps(self) -> float | None:
@@ -1849,10 +2077,18 @@ class ReferenceReport:
             out.append("")
             out.append("  the four moment conditions, separately:")
             out.extend(f"  {line}" for line in self.components.lines())
+        spec = self.ours.specification
+        if spec is not None:
+            from .agents.spreads import SPECIFICATION_ALPHA
+            flag = (" -- REJECTED: the model is misspecified on these bars"
+                    if spec.rejects(SPECIFICATION_ALPHA) else "")
+            out.append(f"  specification: {spec.line()}{flag}")
         rho = self.ours.autocorrelation
         if rho is not None:
             out.append(f"  per-bar autocorrelation "
                        f"{_rho_text(rho, self.ours.usable_bars)}")
+        if self.ratio is not None:
+            out.append(f"  {self.ratio.line()}")
         out.append("")
         out.append("T6  adjusted against unadjusted prices")
         if self.adjusted is None:
@@ -1888,6 +2124,10 @@ class ReferenceReport:
                            f"r3r4 {parts.half_bps(parts.close_previous_mid):+.1f}  "
                            f"r1r5 {parts.half_bps(parts.open_previous_close):+.1f}  "
                            f"r5r4 {parts.half_bps(parts.close_open):+.1f}")
+            if e.specification is not None:
+                out.append(f"      {e.specification.line().split(';')[0]}")
+            if b.ratio is not None:
+                out.append(f"      {b.ratio.line()}")
             out.append(f"      {b.quality.lines()[0]}")
         return out
 
@@ -1914,9 +2154,14 @@ class ReferenceReport:
                 "bidask_note": self.theirs_note,
                 "adjusted": estimate(self.adjusted),
                 "adjusted_note": self.adjusted_note,
+                "specification": _specification_record(self.ours.specification),
+                "range_ratio": _ratio_record(self.ratio),
                 "blocks": [{"label": b.label, "first": str(b.first),
                             "last": str(b.last), "estimate": estimate(b.estimate),
                             "components": components(b.components),
+                            "specification": _specification_record(
+                                b.estimate.specification),
+                            "range_ratio": _ratio_record(b.ratio),
                             "quality": b.quality.counts()} for b in self.blocks]}
 
 
@@ -1930,7 +2175,8 @@ def reference_check(symbol: str, *, provider="yfinance",
     because a correction tuned to one instrument without knowing the
     mechanism is how a wrong number acquires a plausible face.
     """
-    from .core.spread import classify_bars, edge, edge_components
+    from .core.spread import (classify_bars, edge, edge_components,
+                              range_ratio)
     from .data.cache import PriceCache
 
     market_provider = _provider_named(provider)
@@ -1993,7 +2239,8 @@ def reference_check(symbol: str, *, provider="yfinance",
             blocks.append(DateBlock(label, piece.index[0].date(),
                                     piece.index[-1].date(), edge(po, ph, pl, pc),
                                     edge_components(po, ph, pl, pc),
-                                    classify_bars(po, ph, pl, pc, pv)))
+                                    classify_bars(po, ph, pl, pc, pv),
+                                    ratio=range_ratio(ph, pl, pc)))
 
     return ReferenceReport(
         symbol=symbol, provider=market_provider.name,
@@ -2001,7 +2248,7 @@ def reference_check(symbol: str, *, provider="yfinance",
         rows=int(len(frame)), quality=quality, ours=ours, components=parts,
         theirs_half_bps=theirs, theirs_note=note, adjusted=adjusted,
         adjusted_note=adjusted_note, blocks=tuple(blocks),
-        sigma_day=daily_volatility(c))
+        sigma_day=daily_volatility(c), ratio=range_ratio(h, l, c))
 
 
 def run_ladder(*, provider="yfinance",
@@ -2014,7 +2261,8 @@ def run_ladder(*, provider="yfinance",
     once is free thereafter and so that the ladder reads exactly the rows
     the survey would.
     """
-    from .core.spread import classify_bars, exclude_bars, sweep_windows
+    from .core.spread import (classify_bars, exclude_bars, range_ratio,
+                              sweep_windows)
     from .data.cache import PriceCache
 
     market_provider = _provider_named(provider)
@@ -2040,7 +2288,8 @@ def run_ladder(*, provider="yfinance",
             clean = sweep.chosen
         # Volatility on the window the sweep chose, for the reason given in
         # `survey_spreads`.
-        return sweep, bars, clean, daily_volatility(c[-sweep.chosen_bars:])
+        return (sweep, bars, clean, daily_volatility(c[-sweep.chosen_bars:]),
+                range_ratio(h, l, c))
 
     results = []
     for rung in rungs:
@@ -2048,7 +2297,7 @@ def run_ladder(*, provider="yfinance",
         if isinstance(got, str):
             results.append(RungResult(rung, "unavailable", got))
             continue
-        sweep, bars, clean, sigma = got
+        sweep, bars, clean, sigma, ratio = got
         status, detail, lower, upper = rung_verdict(sweep.chosen, rung,
                                                     sigma_day=sigma)
         clean_status, clean_detail, _, _ = rung_verdict(clean, rung,
@@ -2057,7 +2306,8 @@ def run_ladder(*, provider="yfinance",
                                   quality=bars, clean=clean,
                                   clean_status=clean_status,
                                   clean_detail=clean_detail,
-                                  lower_bps=lower, upper_bps=upper))
+                                  lower_bps=lower, upper_bps=upper,
+                                  ratio=ratio))
 
     paired = []
     for a, b in pairs:

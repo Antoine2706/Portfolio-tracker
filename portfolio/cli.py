@@ -244,8 +244,8 @@ def _spread_ladder(args: argparse.Namespace) -> int:
 
     A control on the data path rather than on the estimator, and one that
     needs the real provider: see the note above `research.LADDER`. Exits
-    non-zero on any rung outside its band, so that it can gate `--write`
-    by hand the way the ranking check gates it automatically.
+    non-zero on any rung outside its band. Its first real run is the reason
+    the cost model keeps its constant: see docs/ARCHITECTURE.md.
     """
     from .research import LADDER, PAIRS, run_ladder
 
@@ -294,8 +294,8 @@ def _backtest(args: argparse.Namespace) -> int:
     on no contract note.
     """
     from .eval.registry import Preregistration, Registry, TrialResult
-    from .research import (load_book, replay_the_ledger,
-                           run_equal_risk_contribution)
+    from .research import (criteria_lines, load_book, replay_the_ledger,
+                           run_equal_risk_contribution, run_volatility_target)
 
     try:
         book = load_book(mode=args.mode, data_root=args.data_root,
@@ -328,6 +328,9 @@ def _backtest(args: argparse.Namespace) -> int:
               "follows it. Run against real prices, or drop --register.",
               file=sys.stderr)
         return 2
+
+    if args.policy == "voltarget":
+        return _backtest_volatility_target(args, book)
 
     registry = Registry()
     trial = None
@@ -366,6 +369,85 @@ def _backtest(args: argparse.Namespace) -> int:
                 comparison.net.sharpe is not None
                 and comparison.benchmark.sharpe is not None
                 and comparison.net.sharpe > comparison.benchmark.sharpe)))
+        print()
+        print(f"Registered in {registry.path}: {registry.summary()}")
+    return 0
+
+
+def _backtest_volatility_target(args: argparse.Namespace, book) -> int:
+    """The pre-registered trial, run and judged on its own three criteria.
+
+    The registration text is the pre-registration document's, not a new
+    one: the hypothesis, the parameters, what counts as working and what the
+    author expected were all written before this command existed, and the
+    point of registering is to hold the run to them. `--register` is refused
+    on synthetic prices above, as it is for every policy.
+    """
+    from .agents.voltarget import TARGET_VOLATILITY
+    from .eval.registry import Preregistration, Registry, TrialResult
+    from .research import criteria_lines, run_volatility_target
+
+    registry = Registry()
+    trial = None
+    if args.register and (args.lookback, args.rebalance) != (252, 21):
+        print("Refusing to register: the pre-registration fixed the window at "
+              "252 days and the rebalance interval at 21, and a run at other "
+              "values is another trial with its own document. Run it "
+              "unregistered, or at the pre-registered values.",
+              file=sys.stderr)
+        return 2
+    if args.register:
+        trial = registry.register(Preregistration(
+            hypothesis=(
+                "Scaling the book down to a 15% volatility target, never up, "
+                "holds realised volatility on target at a matched-risk cost "
+                "indistinguishable from zero and a trading cost under 0.50% "
+                "a year. Written before the run, expected to fail."),
+            policy="volatility-target",
+            parameters={"target": TARGET_VOLATILITY,
+                        "lookback": args.lookback,
+                        "rebalance_every": args.rebalance,
+                        "band": None, "leverage_cap": 1.0,
+                        "execution": "next close",
+                        "frozen": sorted(book.frozen),
+                        "provider": args.provider,
+                        "account_value": book.account_value},
+            success_criterion=(
+                "all three: realised volatility within 15% of the 15% target "
+                "(relative); the matched-risk Sharpe difference indistinguishable "
+                "from zero at |t| < 2 on Jobson-Korkie with Memmel's correction; "
+                "cost under 0.50% a year. A higher Sharpe ratio or a lower "
+                "drawdown does not count."),
+            expected_outcome=(
+                "Fails after costs and before them: an annualised shortfall "
+                "against buy-and-hold larger than equal risk contribution's "
+                "7.46 points, a matched-risk |t| under 2, and realised "
+                "volatility materially below buy-and-hold's 19.79%. "
+                "docs/PREREGISTRATION-volatility-targeting.md.")))
+
+    run = run_volatility_target(book, lookback=args.lookback,
+                                rebalance_every=args.rebalance,
+                                trials=args.trials,
+                                trial_sharpe_sd=args.trial_spread)
+    print("\n".join(run.comparison.lines()))
+    print("\n".join(criteria_lines(run)))
+
+    if trial is not None:
+        net = run.comparison.net
+        registry.record(TrialResult(
+            trial_id=trial.id,
+            sharpe_per_period=net.sharpe_per_period,
+            observations=net.observations,
+            independent_observations=net.independent_observations,
+            verdict=net.verdict(),
+            met_criterion=run.passed,
+            detail={"realised_volatility": run.realised_volatility,
+                    "target": run.target,
+                    "on_target": run.on_target,
+                    "matched_risk_t": run.matched_risk_t,
+                    "cost_a_year": run.cost_a_year,
+                    "binding_share": run.binding_share,
+                    "interpretable": run.interpretable}))
         print()
         print(f"Registered in {registry.path}: {registry.summary()}")
     return 0
@@ -549,10 +631,14 @@ def _instruments(args: argparse.Namespace) -> int:
 def _spreads(args: argparse.Namespace) -> int:
     """Estimate the bid-ask spread for every instrument, from its own bars.
 
-    Read-only unless `--write` is given. Looking at what the estimator says
-    and committing it to the instrument records are different actions, and a
-    number that is about to become an input to every cost figure in the tool
-    should have to be looked at first.
+    Read-only, permanently. The survey's verdicts are printed and recorded
+    in `spread-runs.jsonl`; none of them is charged. The cost model keeps
+    the declared constant for every instrument, by conclusion rather than by
+    omission: on the first real book the estimator read 19 bps for SPY,
+    whose true half-spread is under one, and its four moment conditions
+    never agreed. The `--write` flag that once committed estimates and
+    ceilings to the instrument records is gone with that conclusion; see
+    docs/ARCHITECTURE.md, "A closed result".
     """
     from .research import load_book, survey_spreads
 
@@ -606,30 +692,12 @@ def _spreads(args: argparse.Namespace) -> int:
               file=sys.stderr)
         return 1
 
-    if args.write:
-        from .agents.spreads import BOUNDED, ESTIMATED
-        instruments = store.load_instruments()
-        counts = {ESTIMATED: 0, BOUNDED: 0}
-        for isin, decision in survey.decisions.items():
-            # A bound is written as well as a measurement, and stored under
-            # its own source so that nothing downstream can mistake the two.
-            # An instrument that was not measurable at all is left alone.
-            if decision.source not in counts or isin not in instruments:
-                continue
-            instruments[isin] = dataclasses.replace(
-                instruments[isin],
-                half_spread_bps=round(decision.half_spread_bps, 2),
-                spread_observed=False,
-                spread_source=decision.source)
-            counts[decision.source] += 1
-        store.save_instruments(instruments)
-        print()
-        print(f"Wrote {counts[ESTIMATED]} measured half-spread(s) and "
-              f"{counts[BOUNDED]} upper bound(s) to")
-        print(f"{store.directory}, each under its own source. Instruments "
-              f"that were not")
-        print("measurable at all were left alone, keeping the declared "
-              "constant.")
+    print()
+    print("Recorded, not applied. The cost model charges the declared constant of")
+    print(f"{args.fallback:.0f} bps for every instrument, permanently: on daily bars the")
+    print("estimator is not measuring the spread at the scale of this book (docs/")
+    print("ARCHITECTURE.md, \"A closed result\"). Nothing in the table above enters a")
+    print("cost figure; it is here so that this stays known rather than believed.")
     return 0
 
 
@@ -843,8 +911,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     backtest = sub.add_parser(
         "backtest", help="evaluate a policy against buy-and-hold on your book")
-    backtest.add_argument("policy", choices=["erc", "allocator"],
-                          help="erc = equal risk contribution; allocator = "
+    backtest.add_argument("policy", choices=["erc", "voltarget", "allocator"],
+                          help="erc = equal risk contribution; voltarget = "
+                               "volatility targeting, the de-risking half, "
+                               "at the pre-registered 15%%; allocator = "
                                "replay your real purchases with only the "
                                "destination changed")
     backtest.add_argument("--mode", choices=["seed", "user"], default="user")
@@ -906,11 +976,9 @@ def build_parser() -> argparse.ArgumentParser:
                          help="price history to load, in rows")
     spreads.add_argument("--account-value", type=float, default=None)
     spreads.add_argument("--fallback", type=float, default=8.0,
-                         help="the declared constant, in bps, charged where "
-                              "an estimate cannot be supported (default 8)")
-    spreads.add_argument("--write", action="store_true",
-                         help="store the estimates that cleared every gate "
-                              "onto the instrument records")
+                         help="the declared constant, in bps, that the cost "
+                              "model charges for every instrument; the survey "
+                              "reports its verdicts beside it (default 8)")
     spreads.set_defaults(func=_spreads)
     return parser
 

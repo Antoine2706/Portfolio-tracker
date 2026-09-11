@@ -387,6 +387,47 @@ class TestTheBookLoadsAndRuns:
         assert report.mean_turnover > 0
         assert report.total_cost > 0
 
+    def test_the_volatility_target_runs_on_the_same_book_and_leaves_gold_alone(
+            self, book):
+        """The pre-registered trial through the same referee: the frozen
+        holding is outside the scaling on every decision, the three
+        criteria print with their numbers, and nothing is registered."""
+        from portfolio.research import criteria_lines, run_volatility_target
+        run = run_volatility_target(book, lookback=126, rebalance_every=21)
+        assert run.comparison.rebalances > 0
+        assert run.comparison.net.observations > 0
+        for d in run.result.decisions:
+            # Executed, not proposed: the proposal pins gold at the weight
+            # seen on the decision bar, and the harness carries it through
+            # one more bar of drift before trading, so the executed weight
+            # is the drifted one and it is never traded.
+            assert d.weights_after[GOLD] == pytest.approx(d.weights_before[GOLD])
+            assert "outside the scaling" in d.reason
+        text = "\n".join(criteria_lines(run))
+        assert "realised volatility" in text and "all three, not any one" in text
+        assert run.binding_share is not None
+
+    def test_the_command_refuses_to_register_the_trial_on_synthetic_prices(
+            self, tmp_path, capsys):
+        """One trial against the deflation budget, and only against real
+        prices. On the fixture the run prints and is not counted."""
+        from portfolio import cli
+        root = tmp_path / "book"
+        store_with(root, OLD_SCHEMA, LEDGER)
+        common = ["backtest", "voltarget", "--mode", "user", "--data-root",
+                  str(root), "--provider", "fixture", "--lookback", "126"]
+        assert cli.main(common + ["--register"]) == 2
+        assert "Refusing to register" in capsys.readouterr().err
+        # And at the pre-registered values, still refused on the fixture.
+        real_values = [a for a in common if a not in ("--lookback", "126")]
+        assert cli.main(real_values + ["--register"]) == 2
+        assert "synthetic prices" in capsys.readouterr().err
+        assert cli.main(common) == 0
+        out = capsys.readouterr().out
+        assert "pre-registered criteria" in out
+        assert "within 15%" in out and "|t| < 2" in out and "0.50% a year" in out
+        assert "Registered in" not in out
+
     def test_the_result_says_how_much_of_its_cost_is_evidence(self, book):
         from portfolio.research import run_equal_risk_contribution
         text = "\n".join(run_equal_risk_contribution(

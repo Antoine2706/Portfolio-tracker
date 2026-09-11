@@ -317,12 +317,15 @@ class TestEndToEnd:
             self, provider):
         """The other half, and the one that matters more.
 
-        ESIE.DE has 4.7 bps imposed and estimates at 10.3 -- more than three
-        standard errors out, because below the noise floor the estimator is
-        not centred on the truth and the controls measured that. What must
-        hold is not that the number is right; it is that the number never
-        reaches the cost model. It does not: its squared estimate comes out
-        negative, so the significance test on s^2 rejects it outright.
+        Below the noise floor the estimator is not centred on the truth and
+        the controls measured that. What must hold is not that the number
+        is right; it is that it is never called a measurement. On the
+        fixture as first written every sub-floor line came back with a
+        negative squared spread and fell to the constant; with the fixture's
+        open moved to the previous close (see `FixtureProvider.bars`) the
+        same lines come back as ceilings, 6 bps on a 4 bps line, which is
+        the other honest answer. Either is allowed here; `estimated` is
+        not.
         """
         below = [s for s in SYMBOLS
                  if provider.fixture_half_spread_bps(s) < self.RESOLVABLE_BPS]
@@ -332,7 +335,7 @@ class TestEndToEnd:
             e = edge(frame["open"].to_numpy(), frame["high"].to_numpy(),
                      frame["low"].to_numpy(), frame["close"].to_numpy())
             d = decide_spread(e, price=float(frame["close"].iloc[-1]))
-            assert d.source == ASSUMED, (
+            assert d.source in (BOUNDED, ASSUMED), (
                 f"{symbol}: {provider.fixture_half_spread_bps(symbol):.1f} bps "
                 f"imposed came back as {d.half_spread_bps:.1f} bps of "
                 f"'{d.source}', which the floor says it cannot be")
@@ -360,8 +363,8 @@ class TestEndToEnd:
 
     def test_the_book_splits_across_the_tiers(self, provider):
         """The offline demo must contain instruments the estimator resolves
-        and instruments it declines. A fixture where everything resolves would
-        never exercise the tier that keeps the constant."""
+        and instruments it does not. A fixture where everything resolves
+        would never exercise the verdicts that are not measurements."""
         sources = []
         for symbol in SYMBOLS:
             frame = provider.bars(symbol)
@@ -371,7 +374,8 @@ class TestEndToEnd:
             sources.append(decide_spread(
                 e, price=float(frame["close"].iloc[-1]),
                 tick=infer_tick_size(prices.to_numpy().ravel())).source)
-        assert ESTIMATED in sources and ASSUMED in sources
+        assert ESTIMATED in sources
+        assert BOUNDED in sources or ASSUMED in sources
 
     def test_the_ranking_check_finds_the_relation_the_fixture_imposed(
             self, provider):
@@ -396,11 +400,11 @@ class TestEndToEnd:
 class TestAnObservedSpreadOutranksAnEstimatedOne:
     """A quote screen beats an inference from daily bars.
 
-    The gap this closes: `--write` computes an estimate for every instrument,
-    and without this it would overwrite a half-spread somebody had watched
-    and recorded by hand with one this code inferred. The tier ordering is
-    the whole point of having tiers, and it has to bind in the direction that
-    costs something.
+    The survey computes an estimate for every instrument, and a watched
+    half-spread must outrank it in the verdict as it does in the cost model,
+    where a watched spread is the only kind charged. The tier ordering is
+    the whole point of having tiers, and it has to bind in the direction
+    that costs something.
     """
 
     def _estimate(self, half_bps: float, *, certain: bool = True):
@@ -570,13 +574,63 @@ class CarriesBarsForward(FixtureProvider):
         return frame
 
 
-# Whole bars carried forward on the three most liquid lines, most heavily on
-# the most liquid. Thirty per cent is a sabotage level: the bias a carried
-# bar adds to s^2 is about half the daily variance per carried bar, so on a
-# five-instrument book whose true spreads span 11 to 27 bps it takes this
-# much to push the tight lines past the wide ones. It says nothing about what
-# a real feed does, which is the survey's job to count.
-CARRY = {"SGLD.AS": 0.30, "IUSA.AS": 0.30, "VWCE.DE": 0.25}
+# Whole bars carried forward on the three most liquid lines. Thirty-five per
+# cent is a sabotage level: the bias a carried bar adds to s^2 is about half
+# the daily variance per carried bar, so on a five-instrument book whose true
+# spreads span 11 to 27 bps it takes this much to push the tight lines past
+# the wide ones. It says nothing about what a real feed does, which is the
+# survey's job to count. Measured, the specification test refuses all three
+# at this level (p < 0.001 each; at 30/30/25 it refused two of the three and
+# let VWCE.DE through at 36 bps against 17), so the ranking check never sees
+# them: what a carried bar does to the four moment conditions is load the
+# two that use the overnight return, and J reads that as four numbers that
+# are not one spread.
+CARRY = {"SGLD.AS": 0.35, "IUSA.AS": 0.35, "VWCE.DE": 0.35}
+
+
+class DisplacesBothEnds(FixtureProvider):
+    """The fixture, with the open AND the close pushed off the mid on
+    independent days, kept inside the day's range and on the cent grid.
+
+    The one contamination the specification test cannot see, measured in
+    `eval.spread_controls.specification_control`: both ends displaced move
+    all four moment conditions alike, exactly as a genuine spread does. Two
+    per cent on half the days lifts the liquid lines from 10-18 bps to over
+    50 while J passes on every one of them (p from 0.03 to 0.5), which
+    inverts the ranking and is what the ranking check is for.
+    """
+
+    def __init__(self, push: dict[str, float], size: float = 0.02) -> None:
+        super().__init__()
+        self.push = push
+        self.size = size
+
+    def bars(self, symbol, start=None, *, period="2y"):
+        frame = super().bars(symbol, None, period=period).copy()
+        fraction = self.push.get(symbol, 0.0)
+        if fraction:
+            rng = np.random.default_rng(len(symbol) * 7919)
+            n = len(frame)
+            o, h, l, c = (frame[k].to_numpy().copy()
+                          for k in ("open", "high", "low", "close"))
+            count = int(fraction * n)
+            i = rng.choice(np.arange(1, n), count, replace=False)
+            j = rng.choice(np.arange(1, n), count, replace=False)
+            up = 1.0 + self.size
+            down = 1.0 - self.size
+            o[i] = np.clip(np.round(o[i] * np.where(rng.random(count) < 0.5,
+                                                    up, down) / 0.01) * 0.01,
+                           l[i], h[i])
+            c[j] = np.clip(np.round(c[j] * np.where(rng.random(count) < 0.5,
+                                                    up, down) / 0.01) * 0.01,
+                           l[j], h[j])
+            frame["open"], frame["close"] = o, c
+        if start is not None:
+            frame = frame[frame.index >= pd.Timestamp(start)]
+        return frame
+
+
+PUSH = {"SGLD.AS": 0.5, "IUSA.AS": 0.5, "VWCE.DE": 0.4}
 
 
 @pytest.fixture(scope="module")
@@ -585,6 +639,14 @@ def contaminated(tmp_path_factory):
     book = book_at(root)
     return survey_spreads(book, mode="user", data_root=root,
                           provider=CarriesBarsForward(CARRY))
+
+
+@pytest.fixture(scope="module")
+def displaced(tmp_path_factory):
+    root = tmp_path_factory.mktemp("displaced")
+    book = book_at(root)
+    return survey_spreads(book, mode="user", data_root=root,
+                          provider=DisplacesBothEnds(PUSH))
 
 
 @pytest.fixture(scope="module")
@@ -609,12 +671,22 @@ class TestTheSurveyRunsTwiceAndSaysWhy:
                 f"{isin}: {d.half_spread_bps:.1f} on every bar, "
                 f"{c.half_spread_bps:.1f} with a handful set aside")
 
-    def test_carried_bars_on_the_liquid_lines_invert_the_ranking(self, contaminated):
-        """The real book's failure, reproduced: the most liquid instruments
-        come out widest and the check refuses."""
+    def test_carried_bars_are_refused_before_the_ranking_check_sees_them(
+            self, contaminated):
+        """The real book's failure, reproduced, and caught one gate earlier
+        than it was the first time: the specification test refuses every
+        carried line as four numbers that are not one spread, so the every-
+        bar column has too few instruments left to rank. The check cannot
+        fail on what it never sees, and says so rather than passing."""
+        for symbol in self.CARRY:
+            isin = next(i for i, s in contaminated.symbols.items() if s == symbol)
+            d = contaminated.decisions[isin]
+            assert d.source == ASSUMED, (symbol, d.source, d.reason)
+            assert "moment conditions disagree" in d.reason, d.reason
+            assert d.estimate.specification.rejects(0.01)
         check = contaminated.ranking
-        assert not check.passed, check.line(contaminated.names)
-        assert check.rho > 0.5
+        assert check.rho is None and check.instruments == 2
+        assert "too few to rank" in check.verdict
 
     def test_and_the_column_with_them_set_aside_ranks_right_again(self, contaminated):
         """The attribution. Same feed, same estimator, the counted bars
@@ -641,16 +713,33 @@ class TestTheSurveyRunsTwiceAndSaysWhy:
         assert "liquidity rank  spread rank" in text
         assert "(SGLD.AS)" in text                 # the symbol, per instrument
         assert "With the" in text and "bars set aside above excluded" in text
+        assert "REJECTED: not four readings of one spread" in text
+        assert "None of these is charged" in text
 
-    def test_the_old_verdict_guessed_and_the_new_one_does_not(self, contaminated):
-        verdict = contaminated.ranking.verdict
-        assert "suspect the symbol mapping" not in verdict
-        assert "cannot say which is wrong" in verdict
-        assert "SGLD.AS" not in verdict            # keys are ISINs here...
-        assert contaminated.ranking.pairs[0][0] == "IE00B579F325"  # ...most liquid first
+    def test_what_the_specification_test_cannot_see_the_ranking_check_catches(
+            self, displaced):
+        """Both ends of the day displaced from the mid moves all four moment
+        conditions alike, so J passes on every line and the estimates on the
+        liquid lines triple. The ranking check is the gate that catches it:
+        the most liquid instruments come out widest and it refuses, without
+        guessing which of its two inputs is wrong."""
+        for symbol in PUSH:
+            isin = next(i for i, s in displaced.symbols.items() if s == symbol)
+            d = displaced.decisions[isin]
+            assert d.source == ESTIMATED, (symbol, d.source, d.reason)
+            assert not d.estimate.specification.rejects(0.01)
+            assert d.half_spread_bps > 40.0, (symbol, d.half_spread_bps)
+        check = displaced.ranking
+        assert not check.passed, check.line(displaced.names)
+        assert check.rho > 0.5
+        assert "suspect the symbol mapping" not in check.verdict
+        assert "cannot say which is wrong" in check.verdict
+        assert "SGLD.AS" not in check.verdict          # keys are ISINs here...
+        assert check.pairs[0][0] == "IE00B579F325"     # ...most liquid first
 
-    def test_a_ceiling_above_the_constant_is_not_called_safe(self, clean, contaminated):
-        for survey in (clean, contaminated):
+    def test_a_ceiling_above_the_constant_is_not_called_safe(
+            self, clean, contaminated, displaced):
+        for survey in (clean, contaminated, displaced):
             text = "\n".join(survey.lines())
             assert "intended direction" not in text
             assert "wrong error" not in text
@@ -675,8 +764,15 @@ class TestTheRunIsRecorded:
         gold = entry["instruments"]["IE00B579F325"]
         assert gold["symbol"] == "SGLD.AS"
         assert gold["bars_set_aside"]["repeated"] == int(0.2 * 505)
-        assert gold["every_bar"]["charged_bps"] > gold["clean"]["charged_bps"]
+        # Both verdicts are in the record, with what each would have implied
+        # and why: on every bar the carried line is refused by the
+        # specification test; with the carried bars set aside it resolves.
+        assert gold["every_bar"]["source"] == "assumed"
+        assert gold["specification"]["p_value"] < 0.01
+        assert gold["clean"]["source"] in ("estimated", "bounded")
+        assert gold["clean"]["verdict_bps"] > gold["every_bar"]["verdict_bps"]
         assert gold["every_bar"]["estimate"]["usable_bars"] > 0
+        assert "range_ratio" in gold and gold["range_ratio"]["ratio"] > 0
 
     def test_the_command_records_a_failed_run_before_refusing(self, tmp_path, capsys,
                                                              monkeypatch):
@@ -685,12 +781,10 @@ class TestTheRunIsRecorded:
         from portfolio import cli
         root = tmp_path / "book"
         book_at(root)
-        monkeypatch.setattr(
-            "portfolio.research._provider_named",
-            lambda name: CarriesBarsForward(
-                {"SGLD.AS": 0.3, "IUSA.AS": 0.3, "VWCE.DE": 0.25}))
+        monkeypatch.setattr("portfolio.research._provider_named",
+                            lambda name: DisplacesBothEnds(PUSH))
         code = cli.main(["spreads", "--mode", "user", "--data-root", str(root),
-                         "--provider", "fixture", "--write"])
+                         "--provider", "fixture"])
         captured = capsys.readouterr()
         assert code == 1
         assert "Recorded as run 1" in captured.out
@@ -701,8 +795,32 @@ class TestTheRunIsRecorded:
         assert not (root / "spread-runs.jsonl").exists()
         # And nothing was written to the instruments.
         store = DataStore(mode=DataMode.USER, root=root)
-        assert all(not i.spread_observed and i.spread_source != "bounded"
+        assert all(not i.spread_observed and i.spread_source == ""
+                   and i.half_spread_bps == 8.0
                    for i in store.load_instruments().values())
+
+    def test_a_passing_run_is_recorded_and_still_not_applied(self, tmp_path,
+                                                             capsys):
+        """The closed result, end to end: the survey's verdicts are printed
+        and logged, the instruments keep the declared constant, and the
+        command says so. `--write` is gone rather than refused."""
+        from portfolio import cli
+        root = tmp_path / "book"
+        book_at(root)
+        code = cli.main(["spreads", "--mode", "user", "--data-root", str(root),
+                         "--provider", "fixture"])
+        captured = capsys.readouterr()
+        assert code == 0
+        assert "Recorded as run 1" in captured.out
+        assert "Recorded, not applied" in captured.out
+        assert "declared constant of" in captured.out and "8 bps" in captured.out
+        store = DataStore(mode=DataMode.USER, root=root)
+        assert all(not i.spread_observed and i.spread_source == ""
+                   and i.half_spread_bps == 8.0
+                   for i in store.load_instruments().values())
+        with pytest.raises(SystemExit):
+            cli.main(["spreads", "--mode", "user", "--data-root", str(root),
+                      "--provider", "fixture", "--write"])
 
 
 class TestTheBarsCacheCannotLieAboutWhatItHolds:

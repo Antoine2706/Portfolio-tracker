@@ -1,8 +1,18 @@
-"""Which spread the cost model charges, and on what evidence.
+"""What the survey says about each instrument's spread, and on what evidence.
 
-`core/spread.py` estimates a spread and says how uncertain it is. This decides
-what to do with that: whether the estimate is good enough to charge, what to
-charge when it is not, and how to say which of the two happened.
+`core/spread.py` estimates a spread and says how uncertain it is. This turns
+that into a verdict per instrument: measured, bounded, or not measurable,
+with the reason said in full.
+
+None of the verdicts is charged. That is a conclusion, not an omission, and
+it is permanent: on the first real book the estimator read 19 bps for SPY,
+whose true half-spread is under one, the authors' own package gave the same
+number on the same bars, and the four moment conditions never agreed in any
+era (docs/ARCHITECTURE.md, "A closed result"). The cost model charges the
+declared constant, `agents.execution.DECLARED_HALF_SPREAD_BPS`, for every
+instrument nobody watched on a quote screen. The tiers below remain because
+the survey, the ladder and the reference tool are how that is known rather
+than believed, and a verdict needs a name.
 
 Three tiers
 -----------
@@ -20,8 +30,8 @@ provenance report totals by it:
                conditions, and any one of them failing drops the instrument to
                the tier below rather than shading the number.
 
-    bounded    not distinguishable from zero, so the *upper confidence
-               bound* is charged and labelled as a bound rather than an
+    bounded    not distinguishable from zero, so the verdict carries the
+               *upper confidence bound*, labelled as a bound rather than an
                estimate. See below: failing the significance test does not
                mean nothing was learned.
 
@@ -54,7 +64,7 @@ did first, throws away something real. ``|s^2| >= k SE(s^2)`` failing says the
 spread is not distinguishable from zero. It does not say nothing was learned:
 it puts a **ceiling** on the spread, and the ceiling is per instrument.
 
-So the upper confidence bound is charged instead:
+So the verdict carries the upper confidence bound instead:
 
     s_upper = sqrt(max(s^2 + k SE(s^2), 0))
 
@@ -72,8 +82,8 @@ holding widest. A ceiling is only as good as the bars under it; a carried
 close pushes it up, and a number that is wrong in a direction one likes is
 still wrong. The direction of an error is not evidence about its size.
 
-There is a step at the threshold -- just below it the bound is charged, just
-above it the point estimate -- and at exactly ``s^2 = k SE`` the bound is
+There is a step at the threshold -- just below it the bound is reported,
+just above it the point estimate -- and at exactly ``s^2 = k SE`` the bound is
 ``sqrt(2)`` times the estimate. That discontinuity is real and is the price of
 a hard threshold. It is not smoothed over, because the two sides answer
 different questions and the label says which is being answered.
@@ -82,6 +92,17 @@ If ``s^2 + k SE(s^2)`` is still negative, the squared spread is significantly
 *negative*, which the model does not permit. That is not a tight spread; it is
 the data contradicting the estimator, and it falls through to the constant
 with that said.
+
+Why the specification test is a gate and not a footnote
+-------------------------------------------------------
+The estimator has four moment conditions and one parameter, so whether the
+four agree is testable, and until the first real ladder run it was not
+tested. On SPY they read +14.2, +0.9, +13.0 and -5.4 bps in one era. A model
+that returns a confident number with a tight error bar while its own moment
+conditions disagree is not estimating a spread, whatever the error bar says,
+so an estimate whose Hansen J rejects at `SPECIFICATION_ALPHA` falls to the
+constant with that said, before resolution or the tick are considered. A
+ceiling from a misspecified model is not a ceiling either.
 
 Why the tick floor is a separate gate
 -------------------------------------
@@ -115,6 +136,13 @@ ASSUMED = "assumed"
 # The significance the estimate must clear, on s^2 -- see
 # `SpreadEstimate.resolved` for why it is not on s.
 SIGNIFICANCE = 2.0
+
+# The level at which the four moment conditions disagreeing is a refusal.
+# One per cent rather than five, because the test assumes independent
+# per-bar vectors and the real data shows autocorrelation of +0.13, which
+# understates their covariance and runs J high. On SPY the four read +14.2,
+# +0.9, +13.0 and -5.4 bps in one era; that is not a p of 0.04.
+SPECIFICATION_ALPHA = 0.01
 
 
 @dataclasses.dataclass(frozen=True)
@@ -153,11 +181,13 @@ def decide_spread(estimate: SpreadEstimate, *, price: float,
                   fallback_bps: float = 8.0,
                   significance: float = SIGNIFICANCE,
                   observed_bps: float | None = None) -> SpreadDecision:
-    """Turn an estimate into a charge, or decline to.
+    """Turn an estimate into a verdict, and say why.
 
-    `fallback_bps` is the declared constant, used whenever the estimate does
-    not clear every gate. `price` is a recent price for the instrument, needed
-    only to express the tick as a fraction.
+    `fallback_bps` is the declared constant, the number a verdict falls back
+    to whenever the estimate does not clear every gate. `price` is a recent
+    price for the instrument, needed only to express the tick as a fraction.
+    The number carried by the verdict is what the tier would imply; the cost
+    model does not charge it (see the module docstring).
 
     `observed_bps` is a half-spread somebody watched and recorded. It wins
     outright -- a quote screen beats an inference from daily bars, and this
@@ -188,7 +218,7 @@ def decide_spread(estimate: SpreadEstimate, *, price: float,
     >>> d.reason
     'no estimate: only 29 usable bars'
 
-    An estimate that stands clear of zero is charged:
+    An estimate that stands clear of zero is a measurement:
 
     >>> good = SpreadEstimate(0.0040, 1.6e-5, 0.0004, 500, 499,
     ...                       square_standard_error=3.2e-6)
@@ -197,7 +227,7 @@ def decide_spread(estimate: SpreadEstimate, *, price: float,
     ('estimated', 20.0)
 
     One that does not is not a narrow spread; it is a ceiling, and the
-    ceiling is charged:
+    ceiling is what the verdict carries:
 
     >>> weak = SpreadEstimate(0.0008, 6.4e-7, 0.0006, 500, 499,
     ...                       square_standard_error=9.6e-7)
@@ -237,6 +267,26 @@ def decide_spread(estimate: SpreadEstimate, *, price: float,
         return SpreadDecision(fallback_bps, ASSUMED,
                               f"no estimate: {estimate.refusal}",
                               estimate=estimate)
+
+    # The specification gate, before resolution: four moment conditions
+    # that do not agree on one spread are not a spread with an error bar,
+    # they are four numbers averaged. This is the test the estimator was
+    # missing on the first real book, where a misspecified model returned
+    # a confident number with a tight error bar -- the project's signature
+    # defect in a new costume.
+    spec = estimate.specification
+    if spec is not None and spec.rejects(SPECIFICATION_ALPHA):
+        roots = ", ".join(f"{m:+.1f}" for m in spec.moments_half_bps)
+        return SpreadDecision(
+            fallback_bps, ASSUMED,
+            f"the four moment conditions disagree: they read {roots} bps "
+            f"and\nJ = {spec.statistic:.1f} on {spec.dof} degrees of freedom "
+            f"has p = {spec.p_value:.3f}, under {SPECIFICATION_ALPHA:.0%}. "
+            f"The model is\nmisspecified on these bars, so the estimate is an "
+            f"average of four numbers that\nare not readings of one spread, "
+            f"and its error bar describes sampling noise\naround a quantity "
+            f"the model is not estimating",
+            estimate=estimate, tick=tick)
 
     got = estimate.half_spread_bps
     assert got is not None

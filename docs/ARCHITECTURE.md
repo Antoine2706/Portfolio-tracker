@@ -383,6 +383,8 @@ before rendering anything.
 | 14 | *"suspect the symbol mapping or the panel alignment"*, on a ranking check that failed at ρ = +0.89 | a guess. The check compares two numbers per instrument — an estimated spread and a volume-based liquidity proxy — and cannot tell which is wrong; the sentence picked one. The refusal was right. The verdict now prints the pairs it ranked, names the extremes, and says what it cannot tell apart |
 | 15 | a verdict of "consistent" from the ladder control on a 42 bps reading of a one-bp instrument | the interval on s² at t = 1.9 reaches below zero, so its floor is "inside any band". What was wrong was the *ceiling* — 60 bps off 5000 bars, eight times the ceiling a clean sample of that length reports at 1.5% a day — and the first version of the verdict did not look at it. Found by the test written for the real-book case before the control had been run on anything. The same-fund-two-listings check had the identical defect, found by review: when the wider line is unresolved its distance in standard errors is bounded by its own t, so two listings thirteen-fold apart "agreed within error" |
 | 16 | *"the path manufactures the autocorrelation and it says nothing about European listings"*, on the first real ladder run | SPY read +0.101 and IPRE.DE −0.459. Nothing manufactures both signs. The branch fired because one US rung crossed a threshold, and never compared sign or size against the European rungs it was drawing a conclusion about — a sentence written without reading the column it is about, #14's shape on the fix for #14 |
+| 17 | *"J on three degrees of freedom"*, a specification test on the estimator's four moment conditions | one exact identity among the four products, `p_o (a12 − a15) = p_c (a34 − a54)`, because `r2 = r4 + r5` and `r3 = r1 + r5` by construction. Four conditions are three, the covariance is singular, and the test has two degrees of freedom. Found by sabotage, not review: the pseudo-inverse read the null direction in or out at the mercy of rounding, and with three bars of five hundred set aside the de-meaning of `r3` no longer equals that of `r1` plus `r5`, so the identity holds only to parts per million and the inverse turns the residual into a t-test of the drift in close-minus-mid. On the fixture's IEMA.AS bars p went from 0.04 to under 0.01 on 29 of 30 random three-bar exclusions. The identity's direction is now projected out exactly |
+| 18 | an estimated spread on the fixture, open-based moment conditions 13 bps under the imposed spread and the close-based 7 under, J rejecting 28% of sixty symbols at the 1% level | the fixture's own bar generator, again (#11). Its Brownian bridge put the open one step into the day, which makes the overnight return a fixed positive fraction of the same day's close-to-close return; a martingale has the two independent, and the two open-based conditions assume it. The free-walk simulator at the same bars, spread and grid rejects 0%. The open now sits at the previous close, and the rate is nominal. The specification test found a fault in the fixture that seven controls and the fixture's own end-to-end test had not |
 
 Three of Group B were false sentences rather than false numbers (5, 7, and the
 "the structure cannot be fixed by contributions" that overclaimed what a search
@@ -512,12 +514,88 @@ The working rules that fall out of it, in the order they pay off:
    defect on a different estimator could push it down. The direction of an
    error is not evidence about its size.
 
-## An open result: the first real-book spread survey
+## A closed result: the bid-ask spread is not measurable from daily bars at the scale that matters here
 
-Recorded here because a failed control with its numbers preserved is a
-result, and one whose numbers scrolled off a terminal is an anecdote. Every
-subsequent run is appended to `spread-runs.jsonl` in the data root by
-`portfolio spreads`, so this is the last one that has to be written by hand.
+The conclusion first, then the record that produced it.
+
+* EDGE on Yahoo daily bars reports **19.1 bps** for SPY, confirmed identical
+  against the authors' own `bidask` package on the identical arrays
+  (+19.13 against +19.13, difference −0.0000). The true half-spread is under
+  1 bp. The dividend adjustment is not the cause: 19.13 unadjusted against
+  19.24 adjusted.
+* Across eleven instruments the estimates collapse into **8 to 34 bps** while
+  the true spreads span 1 to 20, correlating with the truth at **−0.50**.
+* By era on SPY: 1993 to 2000, eighth and sixteenth ticks, 2001 bars,
+  **12.2 ± 2.9** against a true 7 to 14, per-bar autocorrelation −0.144;
+  2001 alone, 248 bars, 25.3 ± 12.0, +0.007; 2002 to 2026, decimal, 6212
+  bars, **20.4 ± 2.3** against a true spread under 1, +0.128. In 1993 to
+  2000 the two moment conditions touching the open read **+14.2** and
+  **+13.0** while the two touching the close read **+0.9** and **−5.4**. A
+  real spread moves all four alike, so that era's 12.2 bps is an
+  open-contamination reading whose agreement with the true 7 to 14 band is
+  coincidental. In 2002 to 2026 all four are inflated together, at +17.3,
+  +13.5, +15.5 and +11.1. The moments never agreed in either era, so
+  nothing was ever measured.
+* Conclusion: **the bid-ask spread is not measurable from daily OHLC at the
+  scale that matters for a book of liquid European trackers.** The cost
+  model keeps a declared constant, permanently, and every report says so.
+
+The constant is 8 bps and is called a constant. It is not tuned to the
+ceilings the survey produced, because they were produced by the thing shown
+not to work. Nothing the survey computes is charged: `portfolio spreads`
+records its verdicts in `spread-runs.jsonl` and prints "Recorded, not
+applied"; the `--write` flag that once committed estimates and ceilings to
+the instrument records is gone; `agents.execution.instrument_costs` charges
+`DECLARED_HALF_SPREAD_BPS` for every instrument nobody watched on a quote
+screen, whatever a stale record carries. The ranking check, the ladder and
+the reference tool stay: they are the reason this is known rather than
+believed.
+
+What is in dispute is 0.092% a year. The cost figure is 0.55% a year, 21% of
+it rested on estimates, and 80% of that was spread. It is 75 times smaller
+than the 6.93% a year the ERC policy lost by, and doubling or halving it
+changes no decision in this book.
+
+Two measurements were added before the result was closed, and both stay in
+the tool:
+
+**A. The over-identifying restrictions.** EDGE has four moment conditions
+and one parameter, so their mutual consistency is testable, and until this
+existed it was not tested: a misspecified model returned a confident number
+with a tight error bar, which is this project's signature defect in a new
+costume. `core.spread.SpecificationTest` is Hansen's J, printed beside every
+estimate and a gate in `agents.spreads.decide_spread`: a rejection at 1%
+drops the verdict to the constant with the four readings quoted. The four
+products satisfy one exact identity (#17), so J has two degrees of freedom,
+and its survival function is closed-form. Calibration on clean bars is
+nominal (5% at 5%, 0% at 1% over forty runs of 2500 bars); the sabotage
+table is below. The test then found two things that were not the point of
+building it: the identity itself, and a fault in the fixture's bar generator
+(#18).
+
+**B. Whether the range is contaminated.** `core.spread.range_ratio` is
+Parkinson variance, `(1/(4 ln 2))·mean(ln(H/L)²)`, over close-to-close
+`mean(r²)`, per instrument and per block. Clean daily equity bars sit under
+one, around 0.7 to 0.9, because the range misses the overnight gap and the
+closes do not; above one means the high and low carry prices the closes
+never see, which is fatal to an estimator that reads the spread off
+`(h+l)/2`. The prediction on record before it runs: near or below 1 for SPY
+1993 to 2000, above 1 for 2002 to 2026, because US extended-hours ETF
+trading was negligible before 2000 and large after, which fits the reading
+growing from 7 to 20 bps. On the simulator at a tight spread the ratio reads
+0.80 to 0.85, and the reason is sampling rather than a gap: sixty ticks a
+day, and a discretely sampled maximum falls short of the continuous one by
+about 0.58 standard deviations of a step per side (Broadie, Glasserman and
+Kou, 1997); at a wide spread it exceeds 1 because the bounce itself widens
+`ln(H/L)`. The measurement on SPY by era is the user's to run and has not
+been run from here.
+
+### The record
+
+Kept because a failed control with its numbers preserved is a result, and
+one whose numbers scrolled off a terminal is an anecdote. Every subsequent
+run is appended to `spread-runs.jsonl` in the data root by
+`portfolio spreads`.
 
 The survey was run on a real book of seven holdings against Yahoo's daily
 bars. It believed it was reading each instrument's whole available history;
@@ -580,9 +658,8 @@ What is and is not established:
   line, and the check's old verdict would, for once, have been right for the
   wrong reason.
 
-The 8 bps constant stays, and stays described as a constant. None of the
-ceilings was written. Every number above is under investigation and none of
-them is a measurement of a spread.
+None of the ceilings was written, and none will be. Every number above is
+recorded and none of them is a measurement of a spread.
 
 ### The ladder run, and what it narrowed
 
@@ -605,28 +682,85 @@ IPRE.DE**. Opposite signs, so not one mechanism, and the note that said
 otherwise is #16. The European value remains unexplained; whatever the path
 contributes is at most what SPY shows.
 
+What each contamination does to the four moment conditions was then
+measured, so that a pattern on real bars can be read rather than guessed
+(`eval.spread_controls.specification_control`, on a one-bp instrument over
+5000 bars, signed roots in half-bps):
+
+| bars | r1r2 | r3r4 | r1r5 | r5r4 | J rejects |
+|---|---|---|---|---|---|
+| clean | ~1 | ~1 | ~1 | ~1 | 5% at 5%, 0% at 1% |
+| open displaced 50 bps on a fifth of days, inside the range | +10 | −1 | +10 | +2 | always |
+| close carried forward on a twentieth of days | +1 | +12 | +1 | +12 | always |
+| daily reversal in the price, φ = −0.15 | −1 | +20 | 0 | +20 | always |
+| open **and** close displaced, independent days | +10 | +10 | +10 | +10 | never |
+
+The reversal row overturned a sentence written from the argument: a reversal
+lives in the overnight step, which r3 and r5 span and r1 does not, so it
+wears the close signature and J catches it. What J cannot see is both ends
+of the day displaced from the mid, which moves all four alike, exactly as a
+genuine spread does. No test on these four moments separates them.
+
 The drift test was sabotaged against a break shaped like decimalisation
 (2000 bars at 30 bps, then 6000 at 1) and caught it, stopping the window at
 1000 bars with the old block at 18.3 ± 1.0 bps. What it cannot catch is a
 break smaller than its own reference: it compares every older block against
 the **most recent 250 bars**, whose floor is about 4.7 bps, so pre-decimal
 SPY at a few bps for 2000 bars followed by 6000 at one is reported as
-consistent. Both halves are tests. The reference block is the design choice
-to revisit, and it waits, with everything else, on the reference check:
+consistent. Both halves are tests. The reference block is a design choice that is no
+longer worth revisiting: the reference check came back, and it closed the
+question rather than narrowing it.
 
-* **T5** the authors' `bidask` package on the identical SPY arrays — the same
-  number means the transcription is faithful and the fault is in the input
-  or in the method's fit to daily bars; a different one means the
-  implementation diverges on real data in a way three hundred synthetic
-  panels could not show;
-* **T6** the adjusted series beside the unadjusted one, since a factor
-  constant within a bar cancels in every log ratio the estimator takes;
-* **T7** SPY on 1993 to 2000 and on 2002 onward separately.
+* **T5** the authors' `bidask` package on the identical SPY arrays gave
+  +19.13 bps against this implementation's +19.13, difference −0.0000. The
+  transcription is faithful, and the fault is not in the code.
+* **T6** unadjusted 19.13 against adjusted 19.24. The adjustment is not the
+  cause.
+* **T7** SPY by era, the finding, is the table at the top of this section:
+  the four moment conditions never agreed, in the era where the spread was
+  wide any more than in the era where it was tight.
 
-Until T5 is back nothing is corrected. Whatever produces a nineteen-fold
-error on SPY produces it on everything, and a correction tuned to one
-instrument without the mechanism is how a wrong number acquires a plausible
-face.
+Two things the reference run and the closing changed in the tool, neither
+of them a correction to the estimator. The fixture's bar generator put the
+open one fortieth into the day, which the specification test rejected on
+28% of sixty symbols; it now puts the open at the previous close and is
+rejected at the nominal rate (#18). And the moment conditions have two
+degrees of freedom, not three (#17). Whatever produces a nineteen-fold error
+on SPY produces it on everything, and no correction was tuned to it.
+
+## Volatility targeting: built to its pre-registration, not yet run
+
+`docs/PREREGISTRATION-volatility-targeting.md` was written before a line of
+the policy existed and says what would count as it working: realised
+volatility within 15% of a 15% target, the matched-risk Sharpe difference
+indistinguishable from zero at |t| < 2 on Jobson–Korkie with Memmel's
+correction, and cost under 0.50% a year, all three; and what would not count,
+a higher Sharpe ratio or a lower drawdown, which are noise with a favourable
+sign at this sample size and are not counted. It expects the run to fail,
+and says by how much.
+
+`agents/voltarget.py` implements the de-risking half, `k = min(1, σ_T / σ̂)`,
+on the same trailing 252-day covariance as equal risk contribution, every 21
+days, no band, next-close execution, leverage cap one. The frozen holding at
+the second broker cannot be scaled, so the scalar applies to the tradeable
+part and the target to the whole book; that is a quadratic in `k`, written
+out in the module, and with nothing frozen it reduces to the one-line formula
+(a doctest checks that it does). Among the tradeable lines the policy is
+buy-and-hold: it scales the held mix and never re-weights it, so the only
+trade it makes is the scaling, and after de-risking it scales the fully
+invested composition rather than the cash-diluted one, so a calm window
+brings the book back to fully invested. `research.run_volatility_target`
+runs it through the same referee and against the same benchmark as ERC and
+judges it on the three criteria and nothing else, printing the share of
+decisions on which the scalar was below one beside the first, because a
+policy that never bound has not been tested.
+
+On synthetic prices with a calm first half and a volatile second the scalar
+holds at one and then settles near `0.15 / 0.28`, the realised volatility of
+the volatile half comes out under 0.8 of buy-and-hold's, and the referee
+accepts every proposal. That is the machinery, not the result. The result is
+one trial against the deflation budget, consumed by `portfolio backtest
+voltarget --register` on real prices, and it has not been spent.
 
 ## Why not Streamlit any more
 

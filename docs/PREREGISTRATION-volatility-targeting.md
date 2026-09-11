@@ -1,11 +1,28 @@
 # Pre-registration: volatility targeting, de-risking half only
 
-**Status: written, not run.** Nothing in this document has been executed. It
-exists so that the expectation is on the record before the result is, which is
-the only thing that makes the deflated Sharpe ratio's trial count mean
-anything. It is `docs/`, not `research/registry.jsonl`, until it is approved —
-registering it would consume a trial in the deflation budget for a run that
-has not happened.
+**Status: written, built, not run against real prices.** The policy is
+`agents/voltarget.py`, the run and its three criteria are
+`research.run_volatility_target` and `portfolio backtest voltarget`, and
+every parameter below is the default there. The target is not an option at
+all; the window and the interval are the options ERC shares, and
+`--register` is refused at any value but the pre-registered ones, because a
+run at another value is another trial. It has been exercised on synthetic
+prices only, where `--register` is refused outright. The real run is the
+user's: `portfolio backtest voltarget --register` against the provider
+consumes the one trial this document declares, and nothing here is in
+`research/registry.jsonl` until then. This document was written before any of
+that code existed, so that the expectation is on the record before the
+result is, which is the only thing that makes the deflated Sharpe ratio's
+trial count mean anything.
+
+One departure from the text below, forced by the account rather than chosen:
+"scale the whole book" cannot touch the holding at the second broker, so the
+scalar applies to the tradeable part and the target to the whole book. That
+turns `k = min(1, sigma_target / sigma_hat)` into the positive root of
+`A k^2 + 2 B k + (C - V) = 0`, with `A`, `B`, `C` the tradeable, cross and
+frozen variance terms and `V` the squared target, capped at one; with nothing
+frozen it is the same formula. The frozen part alone above the target leaves
+`k = 0`, and the policy says so.
 
 ## The policy
 

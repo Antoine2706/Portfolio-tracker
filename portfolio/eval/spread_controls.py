@@ -29,7 +29,7 @@ almost surely, and any of the classical estimators would do; at 4 trades a bar
 the open is frequently itself the extreme, which is the case EDGE's `p_o` and
 `p_c` corrections exist for and the case its predecessors are biased in.
 
-Seven controls
+Eight controls
 --------------
 **Positive.** Sweep the imposed spread from 2 to 100 bps and report the bias
 and the dispersion at each rung, over many independent runs. Not a pass or a
@@ -85,6 +85,19 @@ paper's assumption of uncorrelated efficient-price increments, read from the
 other side. It is the one contamination tried that also pushes the per-bar
 autocorrelation negative, as the real book's was, though only to -0.03
 against the book's -0.40.
+
+**Specification.** The estimator has four moment conditions and one
+parameter, so whether the four agree is testable, and on SPY they did not:
++14.2, +0.9, +13.0 and -5.4 bps in the eighth-tick era. Hansen's J on the
+four is now attached to every estimate and refuses it at 1%. This control is
+the sabotage the test was asked for: a contaminated open leaves the point
+estimate looking like a spread and J rejects it, with the open-based
+products carrying the contamination and close-versus-previous-mid clean; a
+carried close and a daily reversal are rejected with the mirror signature;
+clean bars are rejected at the nominal rate and no more. The limit, also
+measured: the open and the close both displaced off the mid move all four
+products alike, exactly as a genuine spread does, and nothing on these four
+moments separates them.
 
 What these controls found
 -------------------------
@@ -218,7 +231,7 @@ __all__ = [
     "resolution_by_window_control", "refusal_control",
     "contamination_control", "contaminate", "CONTAMINATIONS",
     "simulate_reversal_bars", "REVERSALS", "ContaminationRow",
-    "run_spread_controls", "SWEEP_BPS",
+    "specification_control", "run_spread_controls", "SWEEP_BPS",
 ]
 
 
@@ -1040,8 +1053,145 @@ def contamination_control(*, runs: int = 60, bars: int = 1500, ticks: int = 60,
                  "rows": [dataclasses.asdict(r) for r in rows]})
 
 
+def specification_control(*, runs: int = 40, bars: int = 2500, ticks: int = 60,
+                          sigma: float = 0.01, seed0: int = 50_000,
+                          imposed_bps: float = 1.0, alpha: float = 0.01
+                          ) -> SpreadControlReport:
+    """Does the J test reject a misspecified model, and only that?
+
+    The sabotage the test was asked for: a one-bp instrument, the SPY shape,
+    with its open pushed 50 bps off the market on a fifth of days but kept
+    inside the day's range so the mid is untouched. The point estimate
+    becomes about ten bps -- what a real instrument shows, and resolved --
+    while the four moment conditions no longer agree. A specification test
+    that fires only when the estimate is obviously wrong is not one. Three
+    claims:
+
+      * on clean bars J rejects at 5% about 5% of the time, and at `alpha`
+        no more than a few per cent, so a refusal on real bars is not the
+        test's own noise;
+      * the contaminated open is rejected at `alpha` in at least 90% of
+        runs while the estimate stays under twenty bps, and the products
+        that use the open carry it while close-versus-previous-mid does
+        not;
+      * a carried close and a daily reversal are rejected too, with the
+        mirror signature: the two products that use the previous close
+        carry it and the open-based two sit at zero. The reversal lives in
+        the overnight step, which r3 and r5 span and r1 does not, so J
+        cannot tell a reversal from a bad close;
+      * both ends displaced -- the open AND the close pushed off the mid on
+        independent days -- is NOT rejected: all four products rise alike,
+        which is what a genuine spread does, and no test on these four
+        moments separates them. Pinned at a low rejection rate so that a
+        passing J is read as "the four agree" and nothing more.
+
+    The first version of this docstring said a reversal moves all four
+    alike and J passes it. That was the argument; the measurement said the
+    opposite, and it is the reason every row here is a criterion rather
+    than a sentence.
+
+    The contamination is pushed inside the range on purpose. Pushing the
+    open outside and widening the high or low to cover it was the first
+    version, and it moved the mid by half the displacement, so all four
+    products rose together and J had nothing to reject -- a different
+    contamination, and one `classify_bars` already flags as impossible when
+    the range is not widened.
+    """
+    def displace(values, picked, low, high, rng):
+        out = values.copy()
+        sign = np.where(rng.random(picked.size) < 0.5, 1.005, 0.995)
+        out[picked] = np.clip(out[picked] * sign, low[picked], high[picked])
+        return out
+
+    def run(kind: str):
+        estimates, rejected_5, rejected_a, moments = [], 0, 0, []
+        for i in range(runs):
+            o, h, l, c = simulate_bars(2.0 * imposed_bps / 10_000.0, bars=bars,
+                                       ticks=ticks, sigma=sigma, seed=seed0 + i)
+            rng = np.random.default_rng(seed0 + 3 * i + 1)
+            if kind == "contaminated open":
+                picked = rng.choice(np.arange(1, bars - 1), bars // 5,
+                                    replace=False)
+                o = displace(o, picked, l, h, rng)
+            elif kind == "close carried forward":
+                picked = np.sort(rng.choice(np.arange(1, bars), bars // 20,
+                                            replace=False))
+                o, h, l, c = contaminate(kind, o, h, l, c, picked)
+            elif kind == "daily reversal, phi -0.15":
+                o, h, l, c = simulate_reversal_bars(
+                    2.0 * imposed_bps / 10_000.0, bars=bars, ticks=ticks,
+                    sigma=sigma, phi=-0.15, seed=seed0 + i)
+            elif kind == "open AND close displaced":
+                i_o = rng.choice(np.arange(1, bars - 1), bars // 5, replace=False)
+                i_c = rng.choice(np.arange(1, bars - 1), bars // 5, replace=False)
+                o = displace(o, i_o, l, h, rng)
+                c = displace(c, i_c, l, h, rng)
+            e = edge(o, h, l, c)
+            t = e.specification
+            if e.spread is None or t is None:
+                continue
+            estimates.append(e.half_spread_bps)
+            rejected_5 += t.p_value < 0.05
+            rejected_a += t.p_value < alpha
+            moments.append(t.moments_half_bps)
+        n = len(estimates)
+        mean_moments = (tuple(float(x) for x in np.mean(moments, axis=0))
+                        if moments else (float("nan"),) * 4)
+        return (float(np.mean(estimates)), rejected_5 / n if n else float("nan"),
+                rejected_a / n if n else float("nan"), n, mean_moments)
+
+    kinds = ("clean", "contaminated open", "close carried forward",
+             "daily reversal, phi -0.15", "open AND close displaced")
+    rows = [(kind, *run(kind)) for kind in kinds]
+    by_kind = {r[0]: r for r in rows}
+    clean = by_kind["clean"]
+    # At 5% the rate should be near 5%; the ceiling leaves room for the
+    # sampling error of a rate over `runs` draws. At `alpha` a handful.
+    calibrated = clean[2] <= 0.15 and clean[3] <= 0.08
+    opened = by_kind["contaminated open"]
+    open_moments = opened[5]
+    catches_open = (opened[3] >= 0.90 and opened[1] < 20.0
+                    and open_moments[1] < 5.0 < min(open_moments[0], open_moments[2]))
+    carried = by_kind["close carried forward"]
+    reversed_ = by_kind["daily reversal, phi -0.15"]
+    close_shape = all(max(abs(m[0]), abs(m[2])) < 5.0 < min(m[1], m[3])
+                      for m in (carried[5], reversed_[5]))
+    catches_close = carried[3] >= 0.90 and reversed_[3] >= 0.90 and close_shape
+    both = by_kind["open AND close displaced"]
+    blind_to_both = both[3] <= 0.15 and both[1] > 8.0
+    passed = calibrated and catches_open and catches_close and blind_to_both
+
+    def roots(m) -> str:
+        return " ".join(f"{x:+6.1f}" for x in m)
+
+    detail = "\n".join(
+        [f"{runs} runs of {bars} bars at {imposed_bps:.0f} bps imposed",
+         f"  {'bars':<28} {'estimate':>8}  {'rejects 5%':>10}  "
+         f"{'at ' + format(alpha, '.0%'):>7}   r1r2   r3r4   r1r5   r5r4"]
+        + [f"  {kind:<28} {est:8.2f}  {r5:10.0%}  {ra:7.0%}  {roots(m)}"
+           for kind, est, r5, ra, _, m in rows]
+        + [f"clean bars rejected at 5% no more than 15% of the time and at "
+           f"{alpha:.0%} no more than 8%: {'yes' if calibrated else 'NO'}",
+           f"a contaminated open is rejected at {alpha:.0%} in 90% of runs, "
+           f"the estimate under 20 bps, r3r4 alone clean: "
+           f"{'yes' if catches_open else 'NO'}",
+           f"a carried close and a reversal are rejected in 90% of runs, "
+           f"r1r2 and r1r5 clean: {'yes' if catches_close else 'NO'}",
+           f"both ends displaced is NOT rejected (all four alike, the "
+           f"estimate eight times the truth): "
+           f"{'yes' if blind_to_both else 'NO'} -- the limit of any test on "
+           f"these four moments"])
+    return SpreadControlReport(
+        name="Specification: the four moment conditions must agree on one spread",
+        passed=passed, detail=detail,
+        numbers={"rows": [{"kind": k, "estimate_bps": e, "rejected_5": r5,
+                           "rejected_alpha": ra, "runs": n,
+                           "moments_half_bps": list(m)}
+                          for k, e, r5, ra, n, m in rows]})
+
+
 def run_spread_controls(*, quick: bool = False) -> list[SpreadControlReport]:
-    """All seven. This is what `portfolio controls --spread` prints."""
+    """All eight. This is what `portfolio controls --spread` prints."""
     if quick:
         return [
             positive_control(runs=20, bars=400, sweep=(2.0, 20.0, 100.0)),
@@ -1054,7 +1204,9 @@ def run_spread_controls(*, quick: bool = False) -> list[SpreadControlReport]:
                                          lengths=(250, 1000)),
             refusal_control(runs=20),
             contamination_control(runs=12, bars=800),
+            specification_control(runs=12, bars=2000),
         ]
     return [positive_control(), negative_control(), standard_error_control(),
             resolution_control(), resolution_by_window_control(),
-            refusal_control(), contamination_control()]
+            refusal_control(), contamination_control(),
+            specification_control()]

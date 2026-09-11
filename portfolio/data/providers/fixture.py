@@ -208,15 +208,29 @@ class FixtureProvider(MarketDataProvider):
 
         target = np.log(closes.to_numpy(dtype=float))
         previous = np.concatenate([[target[0]], target[:-1]])
-        fraction = np.linspace(0.0, 1.0, steps + 1)[None, 1:]
+        # The first print of the day sits AT the previous efficient close,
+        # fraction zero of the bridge, and it took the estimator's own
+        # specification test to find out why that matters. The first bridge
+        # put the open one step in, at fraction 1/40, which makes the
+        # overnight return a fixed positive fraction of the same day's
+        # close-to-close return; a martingale has the two independent, and
+        # the estimator's two open-based moment conditions assume it. Over
+        # sixty fixture symbols that version read the open-based conditions
+        # 13 bps under the imposed spread and the close-based ones 7 under,
+        # and the test rejected 28% of them at the 1% level, against 0% for
+        # the free-walk simulator at the same bars, spread and grid. With
+        # the open at fraction zero the overnight step is the bounce alone,
+        # which the model allows, and the rejection rate is the nominal one.
+        fraction = np.linspace(0.0, 1.0, steps + 1)[None, :]
         # A bridge: a walk minus its own endpoint, scaled back to zero at the
         # ends, so the intraday wander adds range without moving either close.
-        walk = rng.normal(0.0, 0.004 / np.sqrt(steps),
-                          (len(target), steps + 1)).cumsum(axis=1)
-        bridge = (walk - walk[:, -1:] * np.linspace(0.0, 1.0, steps + 1))[:, 1:]
+        increments = rng.normal(0.0, 0.004 / np.sqrt(steps), (len(target), steps))
+        walk = np.concatenate([np.zeros((len(target), 1)),
+                               increments.cumsum(axis=1)], axis=1)
+        bridge = walk - walk[:, -1:] * fraction
         path = np.exp(previous[:, None]
                       + (target - previous)[:, None] * fraction + bridge)
-        side = rng.choice((-1.0, 1.0), size=(len(target), steps))
+        side = rng.choice((-1.0, 1.0), size=(len(target), steps + 1))
         prints = path * (1.0 + side * spread / 2.0)
         # Onto a cent grid, as a European venue quotes, so that
         # `core.spread.infer_tick_size` has a grid to find.

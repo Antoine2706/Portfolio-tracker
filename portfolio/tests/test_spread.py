@@ -755,3 +755,233 @@ class TestTheContaminationControlRegeneratesTheTable:
         report = spread_controls.contamination_control(runs=6, bars=600)
         assert not report.passed
         assert "recovers the imposed spread: NO" in "\n".join(report.lines())
+
+
+class TestTheSpecificationTest:
+    """Hansen's J on the four moment conditions. The test the estimator was
+    missing: on the first real ladder run the four read +14.2, +0.9, +13.0
+    and -5.4 bps in one era and the point estimate came back with a tight
+    error bar anyway."""
+
+    def test_the_chi_square_survival_matches_the_tables(self):
+        from portfolio.core.spread import chi2_survival, chi2_survival_3dof
+        # Critical values of chi-square with three degrees of freedom.
+        assert chi2_survival_3dof(7.815) == pytest.approx(0.05, abs=5e-4)
+        assert chi2_survival_3dof(11.345) == pytest.approx(0.01, abs=5e-4)
+        assert chi2_survival_3dof(16.266) == pytest.approx(0.001, abs=2e-4)
+        assert chi2_survival_3dof(0.0) == 1.0
+        assert chi2_survival_3dof(2.366) == pytest.approx(0.5, abs=1e-3)
+        # Two, the test's own, and one.
+        assert chi2_survival(5.991, 2) == pytest.approx(0.05, abs=5e-4)
+        assert chi2_survival(9.210, 2) == pytest.approx(0.01, abs=5e-4)
+        assert chi2_survival(13.816, 2) == pytest.approx(0.001, abs=2e-4)
+        assert chi2_survival(3.841, 1) == pytest.approx(0.05, abs=5e-4)
+        assert chi2_survival(6.635, 1) == pytest.approx(0.01, abs=5e-4)
+        with pytest.raises(ValueError):
+            chi2_survival(1.0, 4)
+
+    def test_every_estimate_carries_it(self):
+        o, h, l, c = bars(10.0, n=800, seed=1)
+        e = edge(o, h, l, c)
+        assert e.specification is not None
+        assert e.specification.dof == 2 and e.specification.bars == e.usable_bars
+        assert len(e.specification.moments) == 4
+
+    def test_the_four_products_satisfy_one_exact_identity(self):
+        """r2 = r4 + r5 and r3 = r1 + r5, so p_o (a12 - a15) = p_c (a34 - a54)
+        bar by bar: four conditions, three independent, two degrees of
+        freedom. The first version of the test read J against chi-square(3)
+        on a singular covariance and got the wrong answer whenever the
+        pseudo-inverse's cutoff fell on the null direction."""
+        from portfolio.core.spread import _four_products, _per_bar_terms
+        o, h, l, c = bars(10.0, n=800, seed=1)
+        t = _per_bar_terms(o, h, l, c)
+        a12, a34, a15, a54 = _four_products(t)
+        lhs, rhs = t.p_o * (a12 - a15), t.p_c * (a34 - a54)
+        ok = np.isfinite(lhs) & np.isfinite(rhs)
+        assert np.allclose(lhs[ok], rhs[ok], rtol=1e-9, atol=1e-18)
+
+    def test_a_residual_along_the_identity_does_not_enter_j(self):
+        """The sabotage that found the identity, reduced to its mechanism.
+        With a few bars set aside the de-meaning of r3 no longer equals
+        that of r1 plus r5, the three series having lost different rows,
+        and the identity holds only to parts per million. A test that
+        inverts the full four-by-four covariance then carries a direction
+        whose variance is of order epsilon squared and whose mean is of
+        order epsilon, so its contribution to J does not vanish with
+        epsilon: on the old fixture's IEMA.AS bars p went from 0.04 to
+        under 0.01 on 29 of 30 random three-bar exclusions. Here the
+        residual is one part in a billion along the identity, with a
+        t-ratio of about twenty, and J must not see it. The pseudo-inverse
+        version read J = 479 on this matrix; the projection reads 1.4
+        with or without the residual."""
+        from portfolio.core.spread import _specification_test
+        rng = np.random.default_rng(3)
+        k, p_o, p_c = 500, 1.3, 1.4
+        a12, a34, a15 = (rng.standard_t(4, k) * 1e-6 for _ in range(3))
+        a54 = a34 - (p_o / p_c) * (a12 - a15)         # the exact identity
+        loud = 1.0 + rng.normal(0.0, 1.0, k)           # t-ratio ~ sqrt(500)
+        clean = _specification_test(np.column_stack([a12, a34, a15, a54]),
+                                    p_o, p_c)
+        sabotaged = _specification_test(
+            np.column_stack([a12, a34, a15, a54 + 1e-9 * loud]), p_o, p_c)
+        assert clean.dof == sabotaged.dof == 2
+        assert sabotaged.statistic == pytest.approx(clean.statistic, abs=0.05)
+        assert not sabotaged.rejects(0.05)
+        # And a residual that is NOT small is a disagreement, and is seen.
+        real = _specification_test(
+            np.column_stack([a12, a34, a15, a54 + 1e-6 * loud]), p_o, p_c)
+        assert real.rejects(0.01)
+
+    def test_it_is_calibrated_on_clean_bars(self):
+        """A test that rejects the model it was derived from is not a test.
+        Forty clean samples: at 5% about two rejections, at 1% about none."""
+        rejected_5 = rejected_1 = 0
+        for seed in range(40):
+            o, h, l, c = bars(10.0, n=1000, seed=100 + seed)
+            t = edge(o, h, l, c).specification
+            rejected_5 += t.p_value < 0.05
+            rejected_1 += t.p_value < 0.01
+        assert rejected_5 <= 6, rejected_5          # 15% ceiling on a 5% rate
+        assert rejected_1 <= 2, rejected_1
+
+    def test_a_contaminated_open_is_rejected_while_the_estimate_looks_plausible(self):
+        """The sabotage. Five bps imposed; an open off the market by 30 bps
+        on a fifth of days lifts the estimate to something a real instrument
+        could show, and the four moment conditions no longer agree."""
+        from portfolio.agents.spreads import ASSUMED, decide_spread
+        # A one-bp instrument over 5000 bars, the SPY shape. The open is
+        # pushed 50 bps off the market on a fifth of days but kept inside
+        # the day's range, so the mid is untouched. Pushing it outside and
+        # widening the range to cover it was tried first and moved all
+        # four products together, which is a different contamination.
+        o, h, l, c = bars(1.0, n=5000, seed=7)
+        rng = np.random.default_rng(7)
+        picked = rng.choice(np.arange(1, 4999), 1000, replace=False)
+        o2 = o.copy()
+        o2[picked] = np.clip(o2[picked] * np.where(rng.random(1000) < 0.5, 1.005, 0.995),
+                             l[picked], h[picked])
+        e = edge(o2, h, l, c)
+        assert 5.0 < e.half_spread_bps < 20.0, e.describe()   # plausible-looking
+        assert e.resolved()                                     # and "significant"
+        assert e.specification.rejects(0.01), e.specification.line()
+        roots = e.specification.moments_half_bps
+        assert roots[1] < 3.0 < min(roots[0], roots[2]), roots  # r3 r4 alone clean
+        # The decision refuses it, with the four numbers in the reason.
+        d = decide_spread(e, price=100.0)
+        assert d.source == ASSUMED
+        assert "moment conditions disagree" in d.reason
+        assert "J = " in d.reason
+
+    def test_a_contaminated_close_leaves_the_open_product_alone(self):
+        """The mirror image, which is what tells the two apart on real bars."""
+        o, h, l, c = bars(1.0, n=5000, seed=8)
+        rng = np.random.default_rng(8)
+        picked = rng.choice(np.arange(1, 4999), 1000, replace=False)
+        c2 = c.copy()
+        c2[picked] = np.clip(c2[picked] * np.where(rng.random(1000) < 0.5, 1.005, 0.995),
+                             l[picked], h[picked])
+        e = edge(o, h, l, c2)
+        assert e.specification.rejects(0.01), e.specification.line()
+        roots = e.specification.moments_half_bps
+        assert roots[0] < 3.0 < min(roots[1], roots[3]), roots  # r1 r2 alone clean
+
+    def test_a_reversal_is_caught_and_wears_the_close_signature(self):
+        """Written first as 'a reversal moves all four alike and J passes',
+        from the argument. Measured, a reversal lives in the overnight
+        step, which r3 and r5 span and r1 does not, so it loads on the two
+        products that use the previous close and leaves the open-based two
+        at zero. J rejects it and cannot tell it from a carried close.
+
+        The bound on the open side is relative, not absolute: the readings
+        are signed square roots, and a moment that is one eighth of the
+        close side's in bps squared (7 against 20 on seed 1) reads as a
+        third of it once rooted. Measured over eight seeds the ratio of
+        roots sits between 0.12 and 0.37; the bound is one half."""
+        from portfolio.eval.spread_controls import simulate_reversal_bars
+        rejected = 0
+        for seed in range(6):
+            o, h, l, c = simulate_reversal_bars(0.0002, bars=3000, phi=-0.15,
+                                                seed=seed)
+            e = edge(o, h, l, c)
+            rejected += e.specification.rejects(0.01)
+            r12, r34, r15, r54 = e.specification.moments_half_bps
+            assert min(r34, r54) > 15.0, (seed, e.specification.line())
+            assert max(abs(r12), abs(r15)) < 0.5 * min(r34, r54), (seed, e.specification.line())
+        assert rejected == 6, rejected
+
+    def test_both_ends_displaced_is_the_limit_nothing_on_these_moments_sees(self):
+        """Push the open AND the close off the mid, on independent days, and
+        all four products rise alike: the signature of a genuine spread,
+        and J passes. Pinned so that nobody reads a passing J as 'a
+        spread': it means only that the four agree."""
+        rejected, estimates = 0, []
+        for seed in range(6):
+            o, h, l, c = bars(1.0, n=5000, seed=700 + seed)
+            rng = np.random.default_rng(1700 + seed)
+            i = rng.choice(np.arange(1, 4999), 1000, replace=False)
+            j = rng.choice(np.arange(1, 4999), 1000, replace=False)
+            o2, c2 = o.copy(), c.copy()
+            o2[i] = np.clip(o2[i] * np.where(rng.random(1000) < 0.5, 1.005, 0.995),
+                            l[i], h[i])
+            c2[j] = np.clip(c2[j] * np.where(rng.random(1000) < 0.5, 1.005, 0.995),
+                            l[j], h[j])
+            e = edge(o2, h, l, c2)
+            rejected += e.specification.rejects(0.01)
+            estimates.append(e.half_spread_bps)
+            roots = e.specification.moments_half_bps
+            assert max(roots) - min(roots) < 5.0, roots      # all four alike
+        assert rejected <= 1, rejected
+        assert min(estimates) > 8.0                           # and wrong by 8x
+
+    def test_a_clean_resolved_estimate_still_passes_the_gate(self):
+        from portfolio.agents.spreads import ESTIMATED, decide_spread
+        o, h, l, c = bars(20.0, n=1000, seed=3)
+        d = decide_spread(edge(o, h, l, c), price=100.0)
+        assert d.source == ESTIMATED, d.reason
+
+    def test_the_control_regenerates_all_of_it(self):
+        from portfolio.eval.spread_controls import specification_control
+        report = specification_control(runs=12, bars=2000)
+        assert report.passed, "\n".join(report.lines())
+        rows = {r["kind"]: r for r in report.numbers["rows"]}
+        assert rows["contaminated open"]["rejected_alpha"] >= 0.9
+        assert rows["daily reversal, phi -0.15"]["rejected_alpha"] >= 0.9
+        assert rows["open AND close displaced"]["rejected_alpha"] <= 0.15
+        assert rows["clean"]["rejected_alpha"] <= 0.1
+
+
+class TestTheRangeRatio:
+    """Parkinson over close-to-close: is the range carrying prices the
+    closes never see? The prediction on record for SPY is near or below
+    one before 2000 and above one after."""
+
+    def test_clean_simulated_bars_sit_a_little_under_one(self):
+        """Written first as 'at one', from the argument that the simulator's
+        walk is continuous across the close and so has no overnight gap.
+        Measured, seeds 5 to 7 read 0.82 to 0.85. The reason is sampling,
+        not a gap: the simulator draws sixty ticks per bar, and the maximum
+        of a discretely sampled walk falls short of the continuous maximum
+        by about 0.58 standard deviations of one step per side (Broadie,
+        Glasserman and Kou, 1997), which at sixty steps puts the squared
+        range about eighteen percent low. The bound is set where the
+        simulator reads, and the line's 'overnight gap' wording is the
+        explanation for real daily bars, not for these."""
+        from portfolio.core.spread import range_ratio
+        for seed in (5, 6, 7):
+            o, h, l, c = bars(1.0, n=2000, seed=seed)
+            r = range_ratio(h, l, c)
+            assert r is not None and 0.70 < r.ratio < 0.95, r.line()
+            assert "not above 1" in r.line() and "overnight gap" in r.line()
+
+    def test_a_widened_range_goes_above_one_and_says_so(self):
+        from portfolio.core.spread import range_ratio
+        o, h, l, c = bars(1.0, n=2000, seed=5)
+        r = range_ratio(h * 1.004, l / 1.004, c)
+        assert r.ratio > 1.0
+        assert "prices the closes never see" in r.line()
+
+    def test_too_few_bars_is_none(self):
+        from portfolio.core.spread import range_ratio
+        o, h, l, c = bars(1.0, n=15, seed=5)
+        assert range_ratio(h, l, c) is None

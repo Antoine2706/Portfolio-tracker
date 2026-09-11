@@ -129,13 +129,26 @@ refused to.
 
 ```bash
 portfolio backtest erc      # equal risk contribution against buy-and-hold
+portfolio backtest voltarget   # volatility targeting, the de-risking half, at the pre-registered 15%
 ```
+
+Volatility targeting scales the tradeable book by `k = min(1, 15% / σ̂)`,
+never above one, on the same trailing-252-day covariance as ERC, every 21
+days, with no band. With a frozen holding the target applies to the whole
+book and the scalar to the tradeable part, which makes `k` the positive root
+of a quadratic written out in `agents/voltarget.py`. The run is judged on the
+three criteria fixed in `docs/PREREGISTRATION-volatility-targeting.md`
+before it was built — realised volatility within 15% of target, the
+matched-risk gap at |t| < 2, cost under 0.50% a year — all three, not any
+one; a higher Sharpe ratio does not count, in writing. `--register` counts
+it as one trial against the deflation budget and is refused on synthetic
+prices. It has been run on the fixture only; the real run is one trial and
+has not been spent.
 
 ### The bid-ask spread, which appears on no document
 
 ```bash
-portfolio spreads                  # each instrument's spread, from its own bars
-portfolio spreads --write          # commit the ones that clear every gate
+portfolio spreads                  # each instrument's spread, from its own bars: recorded, never charged
 portfolio controls --spread        # prove the estimator recovers spreads it wasn't told
 portfolio controls --spread-ladder # run the whole data path on SPY, AAPL, SU.PA...
 portfolio controls --spread-reference SPY --split-at 2001-01-01 --split-at 2002-01-01
@@ -189,25 +202,36 @@ sequence is printed, and **disjoint** older blocks are compared against the
 most recent at three standard errors. Flat means take everything; a real
 difference means the spread has moved and the window stops there.
 
-Four tiers, and the third is why any of this is useful on a tight book:
+**None of it is charged.** That is the result of running it, not a
+limitation of the design, and it is permanent: the cost model charges a
+declared constant of 8 bps for every instrument nobody watched on a quote
+screen. On the first real book the estimator read 19 bps for SPY, whose true
+half-spread is under one basis point; the authors' own `bidask` package gave
+the identical number on the identical bars; across eleven instruments the
+estimates collapsed into 8 to 34 bps while the truth spans 1 to 20,
+correlating with it at −0.50; and the estimator's four moment conditions
+never agreed with each other in any era. The full record is in
+`docs/ARCHITECTURE.md`, "A closed result". The survey, the ladder and the
+reference tool stay because they are the reason this is known rather than
+believed.
 
-| tier | meaning |
+The survey's verdict per instrument comes in four kinds:
+
+| verdict | meaning |
 |---|---|
-| `observed` | somebody watched it. Outranks everything below, and `--write` will not overwrite it |
-| `estimated` | EDGE on that instrument's own bars, clearing **all** of: two standard errors clear of zero *on s²*, at or above half a tick, off at least 60 bars |
-| `bounded` | not distinguishable from zero, so the **upper confidence bound** `√(s² + 2·SE)` is charged and labelled a ceiling |
-| `assumed` | the declared constant, for an instrument that was not measurable at all |
+| `observed` | somebody watched it. The only kind the cost model charges |
+| `estimated` | EDGE on that instrument's own bars, clearing **all** of: the four moment conditions agree (Hansen's J on two degrees of freedom, p ≥ 1%), two standard errors clear of zero *on s²*, at or above half a tick, off at least 60 bars |
+| `bounded` | not distinguishable from zero, so the verdict carries the **upper confidence bound** `√(s² + 2·SE)`, labelled a ceiling |
+| `assumed` | not measurable at all, or the four moment conditions disagree |
 
-Failing the significance test does not mean nothing was learned: it puts a
-ceiling on the spread, and that ceiling is per instrument because the standard
-error depends on that instrument's own volatility and bar count. So the
-differentiation survives even where nothing resolves, and unlike a constant it
-is falsifiable — a bound below a spread later seen on a quote screen is a bug
-report. What a ceiling is *not* is safe: it is only as good as the bars under
-it, and on the first real book this ran on, the two of seven ceilings that
-could be checked were both wrong — one twenty-fold too wide on the holding
-whose spread is least in doubt, one too tight on a thin fund. That run is
-recorded in `docs/ARCHITECTURE.md`.
+Beside every estimate the survey prints two more numbers. Hansen's J on the
+estimator's four moment conditions — four readings of one parameter, one
+exact identity among them, so two degrees of freedom — says whether the four
+agree; when it rejects, the point estimate is an average of numbers that are
+not readings of one spread, and the verdict says so. The Parkinson-over-close
+ratio, `(1/4 ln 2)·mean(ln(H/L)²) / mean(r²)`, says whether the high and low
+carry prices the closes never see: clean daily bars sit under one, because
+the range misses the overnight gap.
 
 The tick is inferred from the prices themselves (the coarsest grid essentially
 every print falls on) rather than from a table of venue rules nobody here
@@ -217,19 +241,23 @@ the tick that applies today is the one today's prices are on. A recent tail
 that is off grid means an adjusted series arrived, and an adjusted price never
 traded — that instrument is refused rather than measured.
 
-Seven controls back it, and they are the reason to believe any of the above:
+Eight controls back it, and they are the reason to believe any of the above:
 a positive sweep from 2 to 100 bps reporting bias and dispersion at each rung,
 a negative control measuring the floor and checking it thins as sampling noise
 must, a standard error checked against the dispersion it claims to predict, a
 resolution control, a resolution-by-window control that says what a longer
-history actually buys, a refusal below a minimum bar count, and a
-contamination control that regenerates the table of what each kind of
-manufactured bar does to the estimate. Plus a ranking check on the result as
-a whole: estimated spread against median daily traded value, because an
-ordering that contradicts liquidity is more likely a wiring fault than a
-market fact, and `--write` refuses when it fails.
+history actually buys, a refusal below a minimum bar count, a contamination
+control that regenerates the table of what each kind of manufactured bar does
+to the estimate, and a specification control that regenerates what each kind
+does to the four moment conditions and confirms J rejects it — a contaminated
+open, a carried close and a daily reversal every time; both ends of the day
+displaced never, which is the limit of any test on these four moments. Plus
+a ranking check on the result as a whole: estimated spread against median
+daily traded value, because an ordering that contradicts liquidity is more
+likely a wiring fault than a market fact, and the command exits non-zero
+when it fails.
 
-Those seven validate the estimator on simulated bars. They say nothing about
+Those eight validate the estimator on simulated bars. They say nothing about
 whether a provider's bars are what the estimator assumes, and the first real
 book failed the ranking check at ρ = +0.89 with the most liquid holding
 estimated widest. So the survey now runs **twice** per instrument — on every
@@ -272,7 +300,13 @@ the adjusted series beside the unadjusted one (a factor constant within a bar
 cancels in every log ratio), blocks cut at dates you give (`--split-at`), and
 the estimator's four moment conditions separately, because a contaminated
 open inflates the two that use the open and a contaminated close the one that
-uses the close. Nothing is corrected until that run is back.
+uses the close. That run came back: the transcription is faithful (19.13 bps
+against 19.13), the adjustment is not the cause (19.13 against 19.24), and
+SPY's moment conditions read +14.2, +0.9, +13.0 and −5.4 bps in the
+eighth-tick era and +17.3, +13.5, +15.5 and +11.1 after decimalisation. A
+real spread moves all four alike. Nothing was ever measured, the constant
+stays, and the section of `docs/ARCHITECTURE.md` that held this open now
+holds it closed.
 
 ### Directing new money
 
