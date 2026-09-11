@@ -1,0 +1,13 @@
+/* Entry stylesheet. Order matters: tokens → base → layout → components. */
+@import url("/static/styles/tokens.css");
+@import url("/static/styles/base.css");
+@import url("/static/styles/layout.css");
+@import url("/static/styles/components.css");
+@import url("/static/styles/pages/overview.css");
+@import url("/static/styles/pages/holdings.css");
+@import url("/static/styles/pages/performance.css");
+@import url("/static/styles/pages/risk.css");
+@import url("/static/styles/pages/simulator.css");
+@import url("/static/styles/pages/instruments.css");
+@import url("/static/styles/pages/transactions.css");
+@import url("/static/styles/pages/settings.css");

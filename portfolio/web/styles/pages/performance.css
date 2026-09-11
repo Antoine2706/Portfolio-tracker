@@ -1,0 +1,45 @@
+/* Performance page (#/performance). Page-specific layout only; every colour
+   and size is a token. */
+
+/* KPI strip: six tiles on one row, three per row below 1100px. */
+.perf-kpis {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: var(--sp-4);
+}
+@media (max-width: 1100px) {
+  .perf-kpis { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+/* Trailing / calendar tables: the period column reads as a label. */
+.perf-periods .table td:first-child { color: var(--color-text-2); }
+
+/* HTML legend above the stacked area (wraps; the canvas legend is off). */
+.perf-legend { display: flex; flex-wrap: wrap; gap: 4px 14px; padding: 0 var(--sp-2) 6px; font-size: var(--fs-xs); color: var(--color-text-2); }
+.perf-legend .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Summary: two columns of label / value rows with a plain-English note. */
+.perf-summary {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0 var(--sp-6);
+}
+@media (max-width: 1100px) {
+  .perf-summary { grid-template-columns: 1fr; }
+}
+.perf-def {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) max-content;
+  gap: 0 var(--sp-4);
+  align-items: baseline;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--color-border);
+  min-width: 0;
+}
+.perf-def-label { font-size: var(--fs-sm); color: var(--color-text); }
+.perf-def-note { display: block; font-size: var(--fs-xs); color: var(--color-text-3); line-height: 1.35; margin-top: 1px; }
+.perf-def-value { font-size: var(--fs-md); font-weight: 600; font-variant-numeric: tabular-nums; white-space: nowrap; text-align: right; }
+.perf-def-group {
+  grid-column: 1 / -1;
+  padding: 14px 0 4px;
+}

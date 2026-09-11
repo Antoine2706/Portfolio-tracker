@@ -1,0 +1,223 @@
+/* Design tokens.
+   Dark is the default theme; light is a selected palette, not an inversion.
+   The hex values are the validated palette — do not tune them here.
+
+   Theme selection: index.html sets data-theme on <html> before first paint
+   (localStorage, else prefers-color-scheme). The media query below only
+   covers the no-JS case and never overrides an explicit data-theme.
+
+   The dark block also matches [data-theme="dark"] so that theme.js can read
+   the dark palette from a probe element while light is the active theme. */
+
+:root, [data-theme="dark"] {
+  color-scheme: dark;
+
+  /* surfaces */
+  --color-page: #0f0f0e;
+  --color-surface: #161615;
+  --color-surface-2: #1d1d1b;
+  --color-surface-3: #242422;
+  --color-border: rgba(255, 255, 255, .08);
+  --color-border-strong: rgba(255, 255, 255, .14);
+  --color-hover: rgba(255, 255, 255, .045);
+  --color-active: rgba(255, 255, 255, .08);
+  --color-backdrop: rgba(0, 0, 0, .55);
+
+  /* ink */
+  --color-text: #f2f1ed;
+  --color-text-2: #b8b6ad;
+  --color-text-3: #85837b;
+  --color-text-inverse: #121211;
+
+  /* accent and status */
+  --color-accent: #3987e5;
+  --color-accent-fg: #ffffff;
+  --color-accent-soft: rgba(57, 135, 229, .16);
+  --color-accent-strong: #5a9cec;
+  --color-good: #199e70;
+  --color-good-soft: rgba(25, 158, 112, .16);
+  --color-warn: #c98500;
+  --color-warn-soft: rgba(201, 133, 0, .18);
+  --color-serious: #d95926;
+  --color-serious-soft: rgba(217, 89, 38, .16);
+  --color-bad: #e66767;
+  --color-bad-soft: rgba(230, 103, 103, .16);
+
+  /* chart furniture */
+  --color-gridline: #262624;
+  --color-chart-surface: #161615;
+  --color-axis-text: #85837b;
+
+  /* categorical — identity, fixed order, never cycled; >8 folds to Other */
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --series-7: #9085e9;
+  --series-8: #e66767;
+  --series-other: #5c5a54;
+
+  /* sequential — magnitude, one hue, low → high.
+     Reversed on dark so near-zero recedes into the surface. */
+  --seq-1: #0d366b;
+  --seq-2: #184f95;
+  --seq-3: #256abf;
+  --seq-4: #3987e5;
+  --seq-5: #6da7ec;
+  --seq-6: #9ec5f4;
+  --seq-7: #cde2fb;
+
+  /* diverging — polarity */
+  --div-cool: #3987e5;
+  --div-neutral: #383835;
+  --div-warm: #e66767;
+
+  /* elevation */
+  --shadow-pop: 0 12px 40px rgba(0, 0, 0, .5), 0 0 0 1px var(--color-border-strong);
+  --shadow-card: none;
+
+  /* typography */
+  --font-sans: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13.5px;
+  --fs-lg: 15px;
+  --fs-xl: 18px;
+  --fs-2xl: 24px;
+  --fs-3xl: 32px;
+  --lh: 1.45;
+  --lh-tight: 1.2;
+
+  /* geometry */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 24px;
+  --sp-6: 32px;
+  --radius: 6px;
+  --radius-sm: 4px;
+  --radius-card: 10px;
+  --gutter: 24px;
+  --sidebar-w: 232px;
+  --sidebar-w-collapsed: 56px;
+  --topbar-h: 48px;
+  --control-h: 28px;
+  --control-h-lg: 32px;
+
+  /* motion — quick, never bouncy */
+  --dur-fast: 120ms;
+  --dur: 160ms;
+  --dur-slow: 180ms;
+  --ease: cubic-bezier(.2, 0, 0, 1);
+  --ease-out: cubic-bezier(0, 0, .2, 1);
+
+  /* focus */
+  --focus-ring: 0 0 0 2px var(--color-page), 0 0 0 4px var(--color-accent);
+}
+
+/* Light theme — its own palette. Applies to :root[data-theme="light"] and to
+   any element carrying data-theme="light" (theme.js uses a probe element to
+   read either palette's computed tokens). */
+[data-theme="light"] {
+  color-scheme: light;
+
+  --color-page: #f6f6f3;
+  --color-surface: #ffffff;
+  --color-surface-2: #f1f1ee;
+  --color-surface-3: #e9e9e5;
+  --color-border: rgba(11, 11, 11, .09);
+  --color-border-strong: rgba(11, 11, 11, .16);
+  --color-hover: rgba(11, 11, 11, .035);
+  --color-active: rgba(11, 11, 11, .065);
+  --color-backdrop: rgba(20, 20, 18, .4);
+
+  --color-text: #121211;
+  --color-text-2: #52514e;
+  --color-text-3: #85837b;
+  --color-text-inverse: #f2f1ed;
+
+  --color-accent: #2a78d6;
+  --color-accent-fg: #ffffff;
+  --color-accent-soft: rgba(42, 120, 214, .12);
+  --color-accent-strong: #1f63b8;
+  --color-good: #157a56;
+  --color-good-soft: rgba(21, 122, 86, .12);
+  --color-warn: #a86f00;
+  --color-warn-soft: rgba(168, 111, 0, .14);
+  --color-serious: #d95926;
+  --color-serious-soft: rgba(217, 89, 38, .12);
+  --color-bad: #d03b3b;
+  --color-bad-soft: rgba(208, 59, 59, .12);
+
+  --color-gridline: #e6e5df;
+  --color-chart-surface: #ffffff;
+  --color-axis-text: #85837b;
+
+  --series-1: #2a78d6;
+  --series-2: #eb6834;
+  --series-3: #1baf7a;
+  --series-4: #eda100;
+  --series-5: #e87ba4;
+  --series-6: #008300;
+  --series-7: #4a3aa7;
+  --series-8: #e34948;
+  --series-other: #a9a79f;
+
+  --seq-1: #cde2fb;
+  --seq-2: #9ec5f4;
+  --seq-3: #6da7ec;
+  --seq-4: #3987e5;
+  --seq-5: #256abf;
+  --seq-6: #184f95;
+  --seq-7: #0d366b;
+
+  --div-cool: #3987e5;
+  --div-neutral: #e8e7e2;
+  --div-warm: #e66767;
+
+  --shadow-pop: 0 12px 40px rgba(11, 11, 11, .14), 0 0 0 1px var(--color-border-strong);
+  --shadow-card: none;
+}
+
+/* No-JS fallback: follow the OS unless an explicit choice is present. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme]) {
+    color-scheme: light;
+    --color-page: #f6f6f3;
+    --color-surface: #ffffff;
+    --color-surface-2: #f1f1ee;
+    --color-surface-3: #e9e9e5;
+    --color-border: rgba(11, 11, 11, .09);
+    --color-border-strong: rgba(11, 11, 11, .16);
+    --color-hover: rgba(11, 11, 11, .035);
+    --color-active: rgba(11, 11, 11, .065);
+    --color-backdrop: rgba(20, 20, 18, .4);
+    --color-text: #121211;
+    --color-text-2: #52514e;
+    --color-text-3: #85837b;
+    --color-text-inverse: #f2f1ed;
+    --color-accent: #2a78d6;
+    --color-accent-soft: rgba(42, 120, 214, .12);
+    --color-accent-strong: #1f63b8;
+    --color-good: #157a56;
+    --color-good-soft: rgba(21, 122, 86, .12);
+    --color-warn: #a86f00;
+    --color-warn-soft: rgba(168, 111, 0, .14);
+    --color-serious-soft: rgba(217, 89, 38, .12);
+    --color-bad: #d03b3b;
+    --color-bad-soft: rgba(208, 59, 59, .12);
+    --color-gridline: #e6e5df;
+    --color-chart-surface: #ffffff;
+    --series-1: #2a78d6; --series-2: #eb6834; --series-3: #1baf7a; --series-4: #eda100;
+    --series-5: #e87ba4; --series-6: #008300; --series-7: #4a3aa7; --series-8: #e34948;
+    --series-other: #a9a79f;
+    --seq-1: #cde2fb; --seq-2: #9ec5f4; --seq-3: #6da7ec; --seq-4: #3987e5;
+    --seq-5: #256abf; --seq-6: #184f95; --seq-7: #0d366b;
+    --div-neutral: #e8e7e2;
+    --shadow-pop: 0 12px 40px rgba(11, 11, 11, .14), 0 0 0 1px var(--color-border-strong);
+  }
+}

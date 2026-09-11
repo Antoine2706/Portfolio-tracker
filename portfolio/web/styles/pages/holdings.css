@@ -1,0 +1,153 @@
+/* Holdings page (pages/holdings.js, prefix hd-) and the holding detail drawer
+   (pages/holding-detail.js, prefix hdd-). Tokens only; 4/8 rhythm. */
+
+/* ---------- sticky summary bar ---------- */
+
+.hd-bar {
+  position: sticky; top: 0; z-index: 4;
+  display: flex; align-items: center; gap: var(--sp-4);
+  height: 40px;
+  padding: 0 14px;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+  font-size: var(--fs-sm);
+  color: var(--color-text-2);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.hd-bar-item { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; }
+.hd-bar-item b { color: var(--color-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.hd-bar-item .hd-bar-value { font-size: var(--fs-lg); font-weight: 600; color: var(--color-text); letter-spacing: -.01em; }
+.hd-bar-item .warn { color: var(--color-warn); }
+.hd-bar-sep { width: 1px; height: 16px; background: var(--color-border-strong); flex-shrink: 0; }
+.hd-bar .truncate { min-width: 0; }
+/* the table header sticks just under the bar */
+.hd-page .hd-tablebox .table thead th { top: 40px; }
+
+/* ---------- table toolbar ---------- */
+
+.hd-search { position: relative; width: 260px; max-width: 40vw; }
+.hd-search .icon { position: absolute; left: 8px; top: 50%; transform: translateY(-50%); color: var(--color-text-3); pointer-events: none; }
+.hd-search .input { padding-left: 28px; padding-right: 26px; }
+.hd-search .hd-search-clear {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  width: 20px; height: 20px; border-radius: 4px;
+  display: grid; place-items: center;
+  color: var(--color-text-3);
+}
+.hd-search .hd-search-clear:hover { color: var(--color-text); background: var(--color-hover); }
+.hd-count { font-size: var(--fs-sm); color: var(--color-text-3); white-space: nowrap; }
+
+/* ---------- table cells ---------- */
+
+/* The Instrument column absorbs the slack (max-width: 0 trick) so twelve
+   nowrap numeric columns never push the table past its card at 1440. The
+   numeric columns are trimmed to fit: 10px cell padding (48px over twelve
+   columns), a 56px sparkline and a 28px weight bar bring the natural width
+   to ~1140px against the 1158px the card offers at 1440. */
+.hd-tablebox { container-type: inline-size; }
+.hd-tablebox .table th, .hd-tablebox .table td { padding-left: 10px; padding-right: 10px; }
+.hd-tablebox .table th:first-child, .hd-tablebox .table td:first-child { padding-left: var(--sp-4); }
+.hd-tablebox .table th:last-child, .hd-tablebox .table td:last-child { padding-right: var(--sp-4); }
+.hd-tablebox .table .cell-spark { width: 56px; }
+.hd-tablebox .table th.hd-name, .hd-tablebox .table td.hd-name { max-width: 0; width: 26%; min-width: 150px; }
+.hd-name-cell { display: flex; flex-direction: column; min-width: 0; }
+.hd-name-line { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.hd-name-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; font-weight: 500; }
+.hd-name-cell .cell-sub { overflow: hidden; text-overflow: ellipsis; }
+/* Below the natural width the wrap scrolls sideways (DataTable sets
+   data-overflow on it). The column widths do not change with that state on
+   purpose: a wider name column in scroll mode would keep the table too wide
+   to ever leave scroll mode again once the window grows. */
+
+.hd-warn {
+  display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--color-warn);
+  flex-shrink: 0;
+  cursor: help;
+}
+.hd-warn:focus-visible { box-shadow: 0 0 0 2px var(--color-surface), 0 0 0 4px var(--color-accent); }
+.hd-warn[data-tip]::after { text-align: left; }
+
+.hd-weight { display: inline-flex; align-items: center; justify-content: flex-end; gap: 8px; }
+.hd-weight-bar { display: inline-block; height: 4px; width: 28px; border-radius: 2px; background: var(--color-surface-3); overflow: hidden; flex-shrink: 0; }
+.hd-weight-bar > span { display: block; height: 100%; background: var(--color-accent); border-radius: 2px; opacity: .85; }
+.hd-price-stale { display: block; margin-top: 2px; }
+.hd-price-stale .badge { height: 16px; padding: 0 5px; }
+.hd-cell-two { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
+.hd-cell-two .cell-sub { margin-top: 0; }
+/* Divergence ink lives in base.css as .div-warm / .div-cool / .div-zero,
+   bound to the chart's own tokens. It was here, bound to the status colours,
+   which is how the table came to disagree with the chart beside it. */
+
+/* footer */
+.hd-tablebox .table tfoot td { color: var(--color-text); }
+.hd-tablebox .table tfoot td .cell-sub { font-weight: 500; }
+
+/* ---------- holding detail drawer ---------- */
+
+.hdd { display: flex; flex-direction: column; gap: var(--sp-4); }
+.hdd-top { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-3); }
+.hdd-tags { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-width: 0; }
+.hdd-tags .hdd-meta { font-size: var(--fs-sm); color: var(--color-text-2); }
+.hdd-nav { display: inline-flex; align-items: center; gap: 2px; flex-shrink: 0; }
+.hdd-nav-pos { font-size: var(--fs-xs); color: var(--color-text-3); font-variant-numeric: tabular-nums; padding: 0 4px; white-space: nowrap; }
+
+.hdd-price-row { display: flex; align-items: flex-end; justify-content: space-between; gap: var(--sp-3); }
+.hdd-price { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.hdd-price-value { font-size: var(--fs-2xl); font-weight: 600; letter-spacing: -.02em; line-height: 1.1; }
+.hdd-price-day { font-size: var(--fs-md); font-weight: 500; font-variant-numeric: tabular-nums; }
+.hdd-provenance { font-size: var(--fs-xs); color: var(--color-text-3); margin-top: 4px; line-height: 1.45; }
+.hdd-actions { display: flex; gap: 6px; flex-shrink: 0; }
+
+.hdd-block {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px 16px;
+  padding: 12px 14px;
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-card);
+}
+.hdd-block.four { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.hdd-block-note { grid-column: 1 / -1; font-size: var(--fs-xs); color: var(--color-text-3); line-height: 1.45; padding-top: 2px; border-top: 1px solid var(--color-border); margin-top: 2px; }
+.hdd-stat { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.hdd-stat-label { font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--color-text-3); white-space: nowrap; }
+.hdd-stat-value { font-size: var(--fs-md); font-weight: 600; line-height: 1.2; font-variant-numeric: tabular-nums; }
+.hdd-stat-sub { font-size: var(--fs-xs); color: var(--color-text-3); line-height: 1.35; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hdd-notheld {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--sp-3);
+  padding: 12px 14px;
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius-card);
+  font-size: var(--fs-sm); color: var(--color-text-2);
+}
+.hdd-notheld strong { color: var(--color-text); font-weight: 600; }
+
+.hdd-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px 16px; padding-top: 4px; }
+.hdd-trailing { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 8px; margin-top: 6px; }
+.hdd-trail { display: flex; flex-direction: column; gap: 1px; min-width: 0; }
+.hdd-trail-label { font-size: var(--fs-xs); color: var(--color-text-3); }
+.hdd-trail-value { font-size: var(--fs-sm); font-weight: 600; font-variant-numeric: tabular-nums; }
+.hdd-section-label { font-size: 10px; font-weight: 600; letter-spacing: .06em; text-transform: uppercase; color: var(--color-text-3); margin-top: 14px; }
+
+.hdd-corr { display: flex; flex-direction: column; gap: 6px; padding-top: 4px; }
+.hdd-corr-axis {
+  display: grid; grid-template-columns: 150px minmax(0, 1fr) 44px; gap: 10px;
+  font-size: 10px; color: var(--color-text-3); font-variant-numeric: tabular-nums;
+}
+.hdd-corr-axis > span:nth-child(2) { display: flex; justify-content: space-between; }
+.hdd-corr-row { display: grid; grid-template-columns: 150px minmax(0, 1fr) 44px; gap: 10px; align-items: center; }
+.hdd-corr-name { font-size: var(--fs-sm); color: var(--color-text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.hdd-corr-name:hover { text-decoration: underline; text-underline-offset: 2px; }
+.hdd-corr-bar { position: relative; display: block; width: 100%; height: 8px; border-radius: 2px; background: var(--color-surface-3); }
+.hdd-corr-zero { position: absolute; left: 50%; top: -2px; bottom: -2px; width: 1px; background: var(--color-border-strong); }
+.hdd-corr-fill { position: absolute; top: 0; bottom: 0; border-radius: 2px; }
+.hdd-corr-fill.warm { background: var(--div-warm); }
+.hdd-corr-fill.cool { background: var(--div-cool); }
+.hdd-corr-value { font-size: var(--fs-sm); font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+.hdd-corr-value.high { color: var(--color-bad); }
+
+.hdd-void { text-decoration: line-through; opacity: .6; }
+.hdd-note { display: inline-block; max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; color: var(--color-text-2); }
+.hdd-loading { font-size: var(--fs-sm); color: var(--color-text-3); text-align: center; padding: 12px 0; }

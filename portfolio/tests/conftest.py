@@ -24,15 +24,24 @@ from portfolio.core.money import FxTable
 
 @pytest.fixture(autouse=True, scope="session")
 def _no_network():
-    """Any socket call in the suite is a bug. Fail on it."""
+    """Any network socket in the suite is a bug. Fail on it.
+
+    Only internet sockets are refused. AF_UNIX pairs are what an asyncio event
+    loop uses for its self-pipe, and FastAPI's in-process TestClient needs a
+    loop while never leaving the process -- blocking those would forbid the
+    API tests without protecting anything.
+    """
     real = socket.socket
 
-    def blocked(*args, **kwargs):
-        raise RuntimeError(
-            "network access attempted in the test suite; core/ must be testable "
-            "offline")
+    class Blocked(real):
+        def __init__(self, family=-1, type=-1, proto=-1, fileno=None):
+            if fileno is None and family in (socket.AF_INET, socket.AF_INET6):
+                raise RuntimeError(
+                    "network access attempted in the test suite; core/ must be "
+                    "testable offline")
+            super().__init__(family, type, proto, fileno)
 
-    socket.socket = blocked
+    socket.socket = Blocked
     yield
     socket.socket = real
 

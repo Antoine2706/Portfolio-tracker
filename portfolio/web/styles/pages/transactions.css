@@ -1,0 +1,92 @@
+/* Transactions page (#/transactions). Tokens only; 4/8px rhythm. */
+
+.tx-stats { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-3); }
+.tx-stat { display: flex; flex-direction: column; gap: 2px; padding: 12px 14px; min-width: 0; }
+.tx-stat .label { font-size: var(--fs-xs); color: var(--color-text-3); }
+.tx-stat .value { font-size: var(--fs-xl); font-weight: 600; letter-spacing: -.01em; color: var(--color-text); line-height: 1.15; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tx-stat .sub { font-size: var(--fs-xs); color: var(--color-text-2); }
+
+/* Filter row: one row above the table, every control scoping the same slice. */
+.tx-filters { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2) var(--sp-3); padding: 10px 14px; border-bottom: 1px solid var(--color-border); }
+.tx-filters .select.compact { min-width: 180px; }
+.tx-filters .input { height: 28px; font-size: var(--fs-sm); }
+.tx-filters .tx-search { position: relative; display: flex; align-items: center; }
+.tx-filters .tx-search .input { padding-left: 28px; width: 220px; }
+.tx-filters .tx-search > svg { position: absolute; left: 9px; color: var(--color-text-3); pointer-events: none; }
+.tx-types { display: inline-flex; gap: 4px; }
+.tx-type {
+  height: 26px; padding: 0 9px;
+  border: 1px solid var(--color-border);
+  border-radius: 13px;
+  background: transparent;
+  color: var(--color-text-2);
+  font: inherit; font-size: var(--fs-xs); font-weight: 600; letter-spacing: .02em;
+  cursor: pointer;
+}
+.tx-type:hover { border-color: var(--color-border-strong); color: var(--color-text); }
+.tx-type[aria-pressed="true"] { background: var(--color-accent-soft); border-color: var(--color-accent); color: var(--color-text); }
+.tx-type:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 1px; }
+.tx-dates { display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-xs); color: var(--color-text-3); }
+.tx-dates .input { width: 132px; }
+.tx-count { font-size: var(--fs-xs); color: var(--color-text-3); white-space: nowrap; }
+
+/* Ledger rows. */
+.table tbody tr.tx-voided td { color: var(--color-text-3); }
+.table tbody tr.tx-voided .tx-strike { text-decoration: line-through; text-decoration-color: var(--color-text-3); }
+/* Eleven columns: 10px cell padding keeps the natural width (~1120px) inside
+   the card at 1440; narrower than that, DataTable switches the wrap to
+   sideways scrolling rather than clipping the id and the row actions. */
+.tx-tablebox .table th, .tx-tablebox .table td { padding-left: 10px; padding-right: 10px; }
+.tx-tablebox .table th:first-child, .tx-tablebox .table td:first-child { padding-left: var(--sp-4); }
+.tx-tablebox .table th:last-child, .tx-tablebox .table td:last-child { padding-right: var(--sp-4); }
+.tx-id { font-family: var(--font-mono); font-size: var(--fs-xs); color: var(--color-text-3); }
+.tx-note { display: inline-block; max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: bottom; color: var(--color-text-2); }
+.tx-row-actions { display: inline-flex; justify-content: flex-end; visibility: hidden; }
+.table tbody tr:hover .tx-row-actions, .table tbody tr:focus-within .tx-row-actions { visibility: visible; }
+
+/* Record form: two columns with a live preview line. */
+.tx-form { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: var(--sp-3) var(--sp-4); }
+.tx-form .span-2 { grid-column: span 2; }
+.tx-preview {
+  grid-column: span 2;
+  display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 18px;
+  padding: 10px 12px;
+  border-radius: var(--radius);
+  background: var(--color-surface-2);
+  font-size: var(--fs-sm); color: var(--color-text-2);
+}
+.tx-preview b { color: var(--color-text); font-weight: 600; }
+.tx-preview .lead { font-size: var(--fs-md); }
+.tx-error { grid-column: span 2; }
+
+/* Import wizard. */
+.tx-steps { display: flex; align-items: center; gap: 8px; font-size: var(--fs-xs); color: var(--color-text-3); margin-bottom: var(--sp-3); }
+.tx-step { display: inline-flex; align-items: center; gap: 6px; }
+.tx-step-n { display: inline-flex; align-items: center; justify-content: center; width: 18px; height: 18px; border-radius: 50%; border: 1px solid var(--color-border-strong); font-weight: 600; font-size: 10px; }
+.tx-step[data-state="active"] { color: var(--color-text); }
+.tx-step[data-state="active"] .tx-step-n { background: var(--color-accent); border-color: var(--color-accent); color: var(--color-accent-fg, #fff); }
+.tx-step[data-state="done"] .tx-step-n { background: var(--color-good); border-color: var(--color-good); color: #fff; }
+.tx-step-sep { width: 22px; height: 1px; background: var(--color-border-strong); }
+.tx-drop {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  padding: 18px; margin-top: var(--sp-2);
+  border: 1px dashed var(--color-border-strong);
+  border-radius: var(--radius);
+  color: var(--color-text-2); font-size: var(--fs-sm);
+  cursor: pointer;
+}
+.tx-drop:hover, .tx-drop[data-over="true"] { border-color: var(--color-accent); background: var(--color-accent-soft); }
+.tx-drop input[type="file"] { display: none; }
+.tx-mapping { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: var(--sp-2) var(--sp-3); margin-bottom: var(--sp-3); }
+.tx-mapping .field-label { font-size: var(--fs-xs); }
+.tx-import-summary { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 14px; font-size: var(--fs-sm); color: var(--color-text-2); margin: var(--sp-2) 0 var(--sp-3); }
+.tx-import-summary b { color: var(--color-text); }
+.tx-preview-table { max-height: 320px; }
+.tx-row-err { color: var(--color-bad); font-size: var(--fs-xs); white-space: normal; max-width: 320px; display: inline-block; line-height: 1.35; }
+
+@media (max-width: 960px) {
+  .tx-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .tx-form { grid-template-columns: minmax(0, 1fr); }
+  .tx-form .span-2, .tx-preview, .tx-error { grid-column: span 1; }
+  .tx-mapping { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}

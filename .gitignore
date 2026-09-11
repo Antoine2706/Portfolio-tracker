@@ -4,6 +4,11 @@
 portfolio/data_store/user/
 data_store/user/
 
+# What a schema migration copies the old file to before rewriting it. Kept on
+# disk so nothing is lost, never committed: it is the previous state of
+# whichever book was loaded.
+*.before-trading-columns
+
 # Spike output: raw provider responses, may contain account-shaped metadata
 # and is regenerated on every run.
 spike/results/
@@ -15,3 +20,9 @@ venv/
 .env
 .pytest_cache/
 .DS_Store
+
+# Build metadata and the price cache are regenerated, never committed.
+*.egg-info/
+portfolio/data_store/cache/
+data_store/cache/
+build/

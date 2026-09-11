@@ -251,9 +251,19 @@ def align_returns(prices: dict[str, pd.Series],
         warnings.append(f"{e.isin} excluded: {e.reason}")
     total_dropped = sum(dropped.values())
     if total_dropped:
+        # A discard count on its own is unreadable: the reader cannot tell
+        # whether 1772 is routine or alarming without knowing what it is 1772
+        # out of and what survived. So the line carries the denominator and
+        # ends with a verdict on the window that remains.
+        raw_total = sum(raw_counts[isin] for isin in usable)
+        verdict = (f"the full {lookback}-day window requested"
+                   if len(returns) >= lookback else
+                   f"a {len(returns)}-day window, short of the {lookback} requested")
         warnings.append(
-            f"Calendar alignment discarded {total_dropped} observations across "
-            f"{len(usable)} instruments (non-overlapping trading days).")
+            f"Calendar alignment discarded {total_dropped} of {raw_total} price "
+            f"observations, on dates when not every instrument traded. The "
+            f"{len(returns)} returns that remain are {verdict}, shared by all "
+            f"{len(usable)} instruments.")
 
     report = AlignmentReport(
         instruments=tuple(returns.columns),

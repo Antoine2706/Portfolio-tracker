@@ -35,6 +35,7 @@ import uuid
 from decimal import Decimal
 
 from .money import BASE_CURRENCY, Money, normalise_currency
+from .naming import derive_issuer, shorten_name
 
 __all__ = [
     "AssetClass", "TransactionType", "AmendmentAction", "Transaction",
@@ -254,12 +255,78 @@ class Instrument:
     dotted paths into `provider_symbols` such as "provider_symbols.eodhd".
     Re-resolution must not overwrite those: an automatic resolver that silently
     reverts a correction is worse than one that never runs.
+
+    `tradeable` is False for a holding whose weight no automated policy may
+    change. The motivating case is a position held at a different broker from
+    the rest of the book: moving weight between two institutions means selling
+    at one, waiting for settlement, transferring cash and buying at the other
+    -- roughly a week, out of position throughout, and two sets of costs. A
+    rebalancing policy assumes weight can move between holdings, and across
+    brokers it cannot. The position still belongs in the risk model, because
+    it is genuinely part of the portfolio and affects every covariance,
+    correlation and risk contribution; what it cannot do is be traded against
+    the others. Making that a field rather than a filter applied afterwards is
+    deliberate -- a filter gets forgotten the first time a policy is added.
     """
     isin: str
     name: str
     asset_class: AssetClass = AssetClass.ETF
     base_currency: str = BASE_CURRENCY
     issuer: str = ""
+    short_name: str = ""                     # blank means "derive from name"
+
+    # -- where it is held, and what trading it costs ------------------------
+    # These are facts about this specific holding at this specific broker,
+    # not global settings, because they differ per holding in ways that
+    # change decisions. The transaction tax band depends on whether the
+    # instrument is a fund or a debt security and where it is registered; the
+    # commission depends entirely on which broker holds it; the spread is a
+    # property of the instrument's liquidity. A single global number would be
+    # wrong for every holding at once.
+    #
+    # `None` means NOT RECORDED, and the cost model refuses to price a trade
+    # rather than substituting a plausible default. That refusal is the point:
+    # this project's convention is to fail loudly rather than compute
+    # something that looks like a measurement.
+    broker: str = ""                         # "" = not recorded
+    tradeable: bool = True                   # False = weight is exogenous
+    # Whether NEW money may go into it, which is a different question from
+    # whether its weight can be rebalanced against the rest of the book.
+    # The gold ETC at the second broker is the case that forces them apart:
+    # moving weight between it and the others means a cash transfer between
+    # institutions taking about a week, so `tradeable` is False -- but a fresh
+    # purchase there is an ordinary order at that broker, so `buyable` is
+    # True. Reading one flag as the other gets the constraint wrong in one
+    # direction or the other: either the allocator proposes a rebalance that
+    # cannot settle, or it refuses a purchase that is perfectly available.
+    buyable: bool = True                     # False = new money may not go in
+    tob_rate: float | None = None            # transaction tax, each way
+    tob_observed: bool = False               # read off a contract note?
+    half_spread_bps: float | None = None     # paid inside the execution price
+    spread_observed: bool = False            # DEPRECATED: see spread_source
+    # Three tiers, not two. "observed" is read off a document; "estimated" is
+    # computed from this instrument's own price history; "assumed" is a
+    # constant somebody typed. The distinction between the last two is the
+    # whole point: a spread estimated from an instrument's own prices varies
+    # across holdings the way the real cost does, and a constant identical
+    # across all of them cancels out of every comparison the allocator makes.
+    # A number that cannot influence any decision is not a conservative
+    # estimate, it is a decorative one.
+    spread_source: str = ""                  # "" = not set; observed/estimated/assumed
+    buy_tax_rate: float = 0.0                # one-sided taxes, e.g. the French FTT
+    # The commission the broker actually charged, read off a confirmation.
+    # Per instrument rather than per broker because the same broker charges
+    # differently by instrument type: MeDirect charges nothing on five ETFs
+    # and 7.00 EUR flat on a share, on the same account in the same month.
+    commission: float | None = None          # None = use the broker schedule
+    commission_observed: bool = False
+    # The MIC the trade actually executes on, off the confirmation. Not the
+    # same as `exchange`, which is the primary listing used to fetch prices:
+    # DE000A2QP372 is fetched from Amsterdam and IE00BMC38736 executed on
+    # XETA in February and JPEU in June. It is the right key for tick size,
+    # which is what a spread floor is computed from.
+    venue: str = ""                          # MIC, from the confirmation
+
     primary_symbol: str = ""
     exchange: str = ""                       # MIC of the primary listing
     quote_currency: str = ""                 # currency of the primary listing
@@ -280,6 +347,27 @@ class Instrument:
             self.quote_currency, _ = normalise_currency(self.quote_currency)
         if not self.name.strip():
             raise ValidationError("an instrument needs a name")
+        if not self.issuer.strip():
+            # An issuer breakdown reading "Unknown 12%" is a data quality
+            # report wearing the costume of a portfolio insight. Almost every
+            # fund name begins with its provider, so derive rather than
+            # display the gap. Not recorded as a manual override: a later
+            # resolution is welcome to replace it with the registered name.
+            derived = derive_issuer(self.name)
+            if not derived and self.asset_class is AssetClass.EQUITY:
+                # A single stock is its own issuer, minus the legal form.
+                derived = shorten_name(self.name, limit=64)
+            self.issuer = derived
+
+    @property
+    def display_name(self) -> str:
+        """The name to put on a chart axis or in a dense table.
+
+        Derived when `short_name` is blank rather than stored eagerly, so that
+        editing the legal name updates the label too -- unless the user has
+        pinned a short name of their own, in which case theirs stands.
+        """
+        return self.short_name.strip() or shorten_name(self.name, self.issuer)
 
     # -- manual override bookkeeping ---------------------------------------
 

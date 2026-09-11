@@ -111,6 +111,90 @@ class YahooProvider(MarketDataProvider):
         series.name = symbol
         return series
 
+    def bars(self, symbol: str, start: dt.date | None = None, *,
+             period: str = "2y") -> pd.DataFrame:
+        """Unadjusted OHLC. See `MarketDataProvider.bars` for why unadjusted.
+
+        The same call `history` makes, with `auto_adjust=False` and three more
+        columns kept. Yahoo has been returning them all along; this fetch
+        simply stops throwing them away.
+
+        `auto_adjust=False` leaves dividends out of the prices, which is what
+        the tick-grid inference needs. It does **not** undo splits: yfinance
+        applies those whatever this flag says, so a series spanning a split
+        has its older half divided by the split ratio and off the grid. That
+        is why `core.spread.infer_tick_size` is given only recent bars --
+        the tick that matters is today's anyway.
+        """
+        ticker = self._ticker(symbol)
+        try:
+            hist = ticker.history(start=start.isoformat() if start else None,
+                                  period=None if start else period,
+                                  interval="1d", auto_adjust=False)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                self.name,
+                f"could not load bars for {symbol}: {_explain(exc)}") from exc
+        if hist is None or hist.empty:
+            raise ProviderError(self.name, f"no bars returned for {symbol}")
+        missing = [c for c in ("Open", "High", "Low", "Close")
+                   if c not in hist.columns]
+        if missing:
+            raise ProviderError(
+                self.name,
+                f"{symbol} came back without {', '.join(missing)}; a spread "
+                f"cannot be estimated from closes alone")
+        wanted = ["Open", "High", "Low", "Close"]
+        # Volume is wanted, not required: it feeds a plausibility check, and
+        # refusing the bars over a missing check would trade the estimate for
+        # the thing that verifies it.
+        if "Volume" in hist.columns:
+            wanted.append("Volume")
+        frame = hist[wanted].astype(float)
+        frame.columns = [c.lower() for c in wanted]
+        if "volume" not in frame.columns:
+            frame["volume"] = float("nan")
+        frame.index = pd.DatetimeIndex([d.date() for d in frame.index])
+        return frame
+
+    def adjusted_bars(self, symbol: str, *, period: str = "max") -> pd.DataFrame:
+        """The same bars with `auto_adjust=True`: every price scaled back
+        through the dividend history.
+
+        Not for the survey, which wants prices that traded. For the
+        reference check only: the estimator reads log ratios between the
+        open, the close and the mid-range, and a multiplicative factor that
+        is constant within a bar cancels in every one of them, so an
+        adjusted series should give the SAME estimate except around each
+        ex-date, where the factor steps between one bar and the next. Two
+        numbers that differ by more than that step accounts for are a
+        finding about the adjustment, not about the spread.
+        """
+        ticker = self._ticker(symbol)
+        try:
+            hist = ticker.history(period=period, interval="1d",
+                                  auto_adjust=True)
+        except ProviderError:
+            raise
+        except Exception as exc:
+            raise ProviderError(
+                self.name,
+                f"could not load adjusted bars for {symbol}: "
+                f"{_explain(exc)}") from exc
+        if hist is None or hist.empty:
+            raise ProviderError(self.name, f"no adjusted bars for {symbol}")
+        wanted = ["Open", "High", "Low", "Close"]
+        missing = [c for c in wanted if c not in hist.columns]
+        if missing:
+            raise ProviderError(self.name, f"{symbol} adjusted bars came "
+                                           f"back without {', '.join(missing)}")
+        frame = hist[wanted].astype(float)
+        frame.columns = [c.lower() for c in wanted]
+        frame.index = pd.DatetimeIndex([d.date() for d in frame.index])
+        return frame
+
     def quote(self, symbol: str) -> Quote:
         """Latest price, or a clearly-marked last close.
 

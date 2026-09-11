@@ -40,6 +40,7 @@ __all__ = [
     "portfolio_return_series", "portfolio_value_series", "normalise_weights",
     "standalone_volatilities", "HIGH_CORRELATION_THRESHOLD",
     "BROAD_EUROPEAN_EQUITY_VOLATILITY",
+    "CorrelationCluster", "correlation_clusters",
 ]
 
 # Above this, two holdings are likely the same exposure wearing two tickers.
@@ -324,6 +325,88 @@ def high_correlation_pairs(corr: pd.DataFrame,
             if rho >= threshold:
                 out.append(CorrelationPair(cols[i], cols[j], rho))
     return sorted(out, key=lambda p: p.correlation, reverse=True)
+
+
+@dataclasses.dataclass(frozen=True)
+class CorrelationCluster:
+    """A group of holdings that move together: one bet across several lines.
+
+    This is what the pairwise list structurally cannot say (see the note on
+    HIGH_CORRELATION_THRESHOLD). Four defence ETFs mutually correlated at
+    0.9 produce six pair warnings that read as six separate facts; they are
+    one fact, and this names it once.
+    """
+    members: tuple[str, ...]
+    mean_correlation: float          # over every pair inside the cluster
+    min_correlation: float           # the weakest pair inside it
+    combined_weight: float | None    # sum of the members' weights, if given
+
+    @property
+    def size(self) -> int:
+        return len(self.members)
+
+    def sentence(self, names: dict[str, str] | None = None) -> str:
+        names = names or {}
+        listed = ", ".join(names.get(m, m) for m in self.members)
+        weight = (f" Together they are {self.combined_weight:.0%} of the portfolio."
+                  if self.combined_weight is not None else "")
+        return (f"{listed} move together (mean correlation "
+                f"{self.mean_correlation:.0%}, weakest pair {self.min_correlation:.0%}). "
+                f"For risk purposes they are one position.{weight}")
+
+
+def correlation_clusters(corr: pd.DataFrame,
+                         threshold: float = HIGH_CORRELATION_THRESHOLD,
+                         weights: dict[str, float] | None = None,
+                         ) -> list[CorrelationCluster]:
+    """Connected components of the graph whose edges are pairs at or above the threshold.
+
+    Connected components rather than cliques: if A~B and B~C are both above
+    the threshold, A and C are in the same cluster even when their own
+    correlation is not, and `min_correlation` reports that weaker link so
+    the reader can see it. A clique rule would split such a chain into
+    overlapping pairs, which is the pairwise list again. Hierarchical
+    clustering on a correlation distance was the other candidate; it needs
+    a cut height, which is a second threshold to explain.
+
+    Singletons are dropped. Members are sorted; clusters are ordered by
+    combined weight (largest first), then by size, then by members, so the
+    order is stable. A member absent from `weights` contributes nothing to
+    the combined weight -- it is typically a holding outside the risk model.
+    """
+    cols = [str(c) for c in corr.columns]
+    values = corr.to_numpy(dtype=float)
+    n = len(cols)
+    parent = list(range(n))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if values[i, j] >= threshold:
+                parent[find(i)] = find(j)
+
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    out: list[CorrelationCluster] = []
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        pairwise = [float(values[a, b]) for k, a in enumerate(members) for b in members[k + 1:]]
+        names = tuple(sorted(cols[i] for i in members))
+        combined = (float(sum(weights.get(m, 0.0) for m in names))
+                    if weights is not None else None)
+        out.append(CorrelationCluster(names, float(np.mean(pairwise)), float(min(pairwise)),
+                                      combined))
+    return sorted(out, key=lambda c: (-(c.combined_weight if c.combined_weight is not None
+                                         else float("-inf")),
+                                      -len(c.members), c.members))
 
 
 @dataclasses.dataclass(frozen=True)

@@ -1,0 +1,118 @@
+/* Risk page (#/risk). Page-specific layout only; every colour and size is a
+   token. Colour here means polarity (warm = more risk than capital, cool =
+   less) and status (warning) — never decoration. */
+
+/* Headline: the one sentence, the one hero figure. */
+.risk-headline {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--sp-4) var(--sp-6);
+  align-items: start;
+}
+@media (max-width: 1100px) {
+  .risk-headline { grid-template-columns: 1fr; }
+}
+.risk-headline-sentence {
+  font-size: var(--fs-xl);
+  font-weight: 600;
+  letter-spacing: -.01em;
+  line-height: 1.3;
+  max-width: 820px;
+}
+.risk-headline-window { margin-top: 8px; font-size: var(--fs-sm); color: var(--color-text-2); line-height: 1.5; max-width: 820px; }
+.risk-headline-metric {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 240px;
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  background: var(--color-surface-2);
+}
+.risk-headline-value {
+  font-size: var(--fs-3xl);
+  font-weight: 600;
+  letter-spacing: -.02em;
+  line-height: 1.1;
+}
+.risk-headline-sub { font-size: var(--fs-xs); color: var(--color-text-3); }
+
+/* Divergence swatch beside the signed number in the table. */
+.risk-div { display: inline-flex; align-items: center; gap: 6px; }
+
+/* Metric cards: the lead card (effective holdings) spans both columns. */
+.risk-metrics {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--sp-3);
+}
+.risk-metric { padding: 12px 14px; display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.risk-metric.lead { grid-column: span 2; }
+.risk-metric-label { font-size: var(--fs-xs); color: var(--color-text-2); display: flex; align-items: center; gap: 6px; }
+.risk-metric-value { font-size: var(--fs-2xl); font-weight: 600; letter-spacing: -.02em; line-height: 1.1; }
+.risk-metric-sentence { font-size: var(--fs-sm); color: var(--color-text-2); line-height: 1.45; }
+.risk-metric-warning { display: flex; align-items: flex-start; gap: 6px; font-size: var(--fs-xs); color: var(--color-warn); line-height: 1.4; margin-top: 2px; }
+.risk-metric-warning svg { flex-shrink: 0; margin-top: 2px; }
+
+/* Correlation: the pairs notice and the cluster chips under the heatmap. */
+.risk-corr-foot { padding: 8px var(--sp-2) 4px; display: flex; flex-direction: column; gap: 8px; }
+.risk-cluster { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: var(--fs-sm); color: var(--color-text-2); }
+.risk-cluster .caps { margin-right: 2px; }
+.risk-chip {
+  display: inline-flex; align-items: center;
+  height: 22px; padding: 0 8px;
+  border-radius: 11px;
+  background: var(--color-surface-2);
+  border: 1px solid var(--color-border-strong);
+  font-size: var(--fs-xs);
+  color: var(--color-text);
+  max-width: 220px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.risk-quiet { display: flex; align-items: center; gap: 8px; font-size: var(--fs-sm); color: var(--color-text-2); padding: 2px 0; }
+
+/* Grouped tables (VaR by horizon, worst periods by length). */
+.risk-table .risk-group td {
+  height: 28px;
+  padding-top: 10px;
+  font-size: var(--fs-xs);
+  font-weight: 600;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--color-text-3);
+  border-bottom: 0;
+}
+.risk-table tbody tr.risk-group:hover { background: transparent; }
+.risk-table .method { text-transform: capitalize; }
+.risk-note {
+  font-size: var(--fs-sm);
+  color: var(--color-text-2);
+  line-height: 1.55;
+  padding: 12px var(--sp-4) 14px;
+  border-top: 1px solid var(--color-border);
+}
+.risk-note strong { color: var(--color-text); font-weight: 600; }
+
+/* Scenarios: description wraps under the label; a diverging bar per row. */
+.risk-scen-label { font-weight: 500; color: var(--color-text); }
+.risk-scen-desc { display: block; white-space: normal; font-size: var(--fs-xs); color: var(--color-text-3); line-height: 1.4; max-width: 460px; margin-top: 2px; }
+.risk-table td.risk-scen-cell { padding-top: 8px; padding-bottom: 8px; height: auto; vertical-align: top; }
+.risk-bar {
+  position: relative;
+  display: inline-block;
+  width: 112px; height: 6px;
+  vertical-align: middle;
+  margin-right: 10px;
+  border-radius: 3px;
+  background: var(--color-surface-3);
+}
+.risk-bar::before {
+  content: "";
+  position: absolute;
+  left: 50%; top: -3px; bottom: -3px;
+  width: 1px;
+  background: var(--color-border-strong);
+}
+.risk-bar-fill { position: absolute; top: 0; height: 100%; border-radius: 3px; }
+.risk-bar-fill.neg { background: var(--color-bad); }
+.risk-bar-fill.pos { background: var(--color-good); }

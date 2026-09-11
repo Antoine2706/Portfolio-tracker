@@ -22,13 +22,13 @@ import pytest
 
 CORE = pathlib.Path(__file__).resolve().parents[1] / "core"
 DATA = pathlib.Path(__file__).resolve().parents[1] / "data"
-APP = pathlib.Path(__file__).resolve().parents[1] / "app"
+APP = pathlib.Path(__file__).resolve().parents[1] / "api"
 
 FORBIDDEN_IN_CORE = {
-    "streamlit",            # the UI layer must be replaceable
+    "streamlit", "fastapi", "starlette", "pydantic",   # the UI layer must be replaceable
     "requests", "httpx", "urllib", "urllib3", "http", "socket",
     "yfinance",             # no provider-specific anything
-    "aiohttp",
+    "aiohttp", "sqlite3",   # storage is data/'s job
 }
 
 
@@ -71,43 +71,45 @@ def test_core_does_not_import_upward(path):
     assert not bad, f"{path.name} imports {sorted(bad)}; core/ must not depend on outer layers"
 
 
-def test_core_imports_with_streamlit_unavailable():
-    """Import all of core in a subprocess where streamlit cannot be imported.
+def test_core_imports_with_web_framework_unavailable():
+    """Import all of core in a subprocess where no UI framework can be imported.
 
     A subprocess rather than monkeypatching this one: reloading modules in
     place rebinds their classes, so every already-imported test module would
     keep the old `Money` and equality checks elsewhere would start failing for
     reasons unrelated to what is being tested. Isolation is also the stronger
-    check -- it is genuinely a fresh interpreter with no Streamlit.
+    check -- it is genuinely a fresh interpreter with no web framework.
     """
     script = textwrap.dedent("""
-        import sys
-        class Blocker:
-            def find_module(self, name, path=None):
-                if name.split(".")[0] == "streamlit":
-                    raise ImportError("streamlit is not installed (simulated)")
+        import sys, importlib.abc
+        BLOCKED = {"streamlit", "fastapi", "starlette", "pydantic"}
+        class Blocker(importlib.abc.MetaPathFinder):
+            def find_spec(self, name, path=None, target=None):
+                if name.split(".")[0] in BLOCKED:
+                    raise ImportError(f"{name} is not installed (simulated)")
                 return None
         sys.meta_path.insert(0, Blocker())
         import portfolio.core.money, portfolio.core.models
         import portfolio.core.positions, portfolio.core.universe
-        assert "streamlit" not in sys.modules
+        import portfolio.core.risk, portfolio.core.returns, portfolio.core.report
+        assert not (BLOCKED & set(m.split(".")[0] for m in sys.modules))
         print("core imported cleanly")
     """)
     repo_root = pathlib.Path(__file__).resolve().parents[2]
     result = subprocess.run([sys.executable, "-c", script], capture_output=True,
                             text=True, cwd=repo_root)
     assert result.returncode == 0, (
-        f"core/ failed to import without Streamlit:\n{result.stderr}")
+        f"core/ failed to import without a web framework:\n{result.stderr}")
     assert "core imported cleanly" in result.stdout
 
 
 # The other direction, and the one that actually erodes. The AST guard above
-# stops core importing UI; nothing stops arithmetic drifting into a view, where
-# it would be untested and invisible. This is a partial defence -- pandas is
-# allowed because building a display frame needs it -- so the real protection is
-# that core.report leaves views nothing to compute.
+# stops core importing UI; nothing stops arithmetic drifting into the API layer,
+# where it would be untested and invisible. This is a partial defence -- pandas
+# is allowed because projecting a frame into JSON needs it -- so the real
+# protection is that core leaves the API nothing to compute.
 FORBIDDEN_IN_APP = {
-    "numpy",        # the maths library: a view has no business importing it
+    "numpy",        # the maths library: a projection has no business importing it
     "scipy",
     "statistics",
 }
@@ -116,20 +118,20 @@ APP_FILES = sorted(APP.rglob("*.py"))
 
 
 def test_app_has_modules_to_check():
-    assert APP_FILES, "no app modules found; the guard would pass vacuously"
+    assert APP_FILES, "no api modules found; the guard would pass vacuously"
 
 
 @pytest.mark.parametrize("path", APP_FILES, ids=lambda p: p.name)
 def test_app_does_not_import_maths_libraries(path):
     offenders = imported_modules(path) & FORBIDDEN_IN_APP
     assert not offenders, (
-        f"{path.name} imports {sorted(offenders)}. Views render; they do not "
-        f"compute. Move the calculation into core/ with a test.")
+        f"{path.name} imports {sorted(offenders)}. The API projects; it does "
+        f"not compute. Move the calculation into core/ with a test.")
 
 
 @pytest.mark.parametrize("path", APP_FILES, ids=lambda p: p.name)
 def test_app_does_not_reach_into_private_helpers(path):
-    """A view importing a private function is logic leaking out of its module."""
+    """The API importing a private function is logic leaking out of its module."""
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     private: set[str] = set()
     for node in ast.walk(tree):
@@ -140,6 +142,139 @@ def test_app_does_not_reach_into_private_helpers(path):
     assert not private, (
         f"{path.name} imports private {sorted(private)}. If a view needs it, "
         f"it belongs in the module's public interface.")
+
+
+# --------------------------------------------------------------------------
+# The evaluation layer
+# --------------------------------------------------------------------------
+# `agents/` holds decision policies and `eval/` the harness that measures
+# them. Two rules matter here, and only one of them is obvious.
+#
+# The obvious one: neither may reach the network or a UI framework. A policy
+# that fetched a price would be untestable and non-reproducible, and a
+# backtest that fetched anything would give a different answer on Tuesday.
+#
+# The one that actually matters: `agents/` may not import `eval/`. A policy
+# must not be able to tell that it is being backtested. If it could, it could
+# behave differently under evaluation than in production -- which is the
+# single most expensive bug available in this domain, because the backtest
+# would be measuring something that will never happen. So `agents/` defines
+# both its input type (MarketView) and its output type (Proposal), `eval/`
+# imports `agents/`, and the arrow never points back.
+
+AGENTS = pathlib.Path(__file__).resolve().parents[1] / "agents"
+EVAL = pathlib.Path(__file__).resolve().parents[1] / "eval"
+
+FORBIDDEN_IN_EVALUATION = {
+    "streamlit", "fastapi", "starlette", "pydantic",
+    "requests", "httpx", "urllib", "urllib3", "http", "socket",
+    "yfinance", "aiohttp", "sqlite3",
+}
+
+AGENT_FILES = sorted(AGENTS.glob("*.py"))
+EVAL_FILES = sorted(EVAL.glob("*.py"))
+
+
+def test_evaluation_layer_has_modules_to_check():
+    assert AGENT_FILES and EVAL_FILES, (
+        "no agents/ or eval/ modules found; these guards would pass vacuously")
+
+
+@pytest.mark.parametrize("path", AGENT_FILES + EVAL_FILES, ids=lambda p: p.name)
+def test_evaluation_layer_is_offline(path):
+    offenders = imported_modules(path) & FORBIDDEN_IN_EVALUATION
+    assert not offenders, (
+        f"{path.name} imports {sorted(offenders)}. A policy or a backtest that "
+        f"reaches the network is not reproducible, and a result that cannot be "
+        f"reproduced is not a result.")
+
+
+@pytest.mark.parametrize("path", AGENT_FILES, ids=lambda p: p.name)
+def test_agents_do_not_know_they_are_being_evaluated(path):
+    bad = {m for m in imported_modules(path) if m.lstrip(".") == "eval"}
+    assert not bad, (
+        f"{path.name} imports from eval/. A policy that can tell it is inside "
+        f"a backtest can behave differently there, and then the backtest "
+        f"measures something that will never happen in production.")
+
+
+@pytest.mark.parametrize("path", AGENT_FILES + EVAL_FILES, ids=lambda p: p.name)
+def test_the_evaluation_layer_does_not_import_the_composition_root(path):
+    """`research.py` wires the data layer to the harness, so it may import
+    anything. Nothing may import it back: an arrow from eval/ to research
+    would drag the network into a package whose whole value is being offline.
+    """
+    bad = {m for m in imported_modules(path) if m.lstrip(".") == "research"}
+    assert not bad, (
+        f"{path.name} imports research, reversing the composition arrow and "
+        f"pulling the data layer into code that must stay offline.")
+
+
+# The data layer sits under both of those. It reads and writes files, and it
+# is allowed the network; what it may not do is depend on the code that makes
+# decisions. The temptation is concrete: the schema migration in
+# `data/migrations.py` needs the Belgian transaction tax bands, which are also
+# what `agents/execution.py` prices a trade with. Importing them across would
+# have made the storage layer depend on the decision layer for three
+# constants, and the next thing imported along that edge would not be three
+# constants. They live in `core/taxes.py` instead, and both layers reach in.
+
+DATA_FILES = sorted(DATA.rglob("*.py"))
+ABOVE_THE_DATA_LAYER = {"agents", "eval", "research", "api"}
+
+
+def upward_imports(path: pathlib.Path) -> set[str]:
+    """Relative imports from a file into a layer that sits above data/."""
+    return {m for m in imported_modules(path)
+            if m.startswith(".") and m.lstrip(".") in ABOVE_THE_DATA_LAYER}
+
+
+def test_the_data_layer_has_modules_to_check():
+    assert DATA_FILES, "no data modules found; the guard would pass vacuously"
+
+
+@pytest.mark.parametrize("path", DATA_FILES, ids=lambda p: p.name)
+def test_the_data_layer_does_not_depend_on_the_decision_layer(path):
+    bad = upward_imports(path)
+    assert not bad, (
+        f"{path.name} imports {sorted(bad)}. Storage sits under the decision "
+        f"layer, not beside it. Shared reference data belongs in core/.")
+
+
+def test_the_layering_guard_actually_bites(tmp_path):
+    """Sabotage, because a guard that has never failed proves nothing.
+
+    This project has hit the same class of bug three times: a check that
+    looked like it worked without exercising what it claimed. The rule here
+    is that no guard is trusted until it has been shown to fail on a file
+    that violates it.
+    """
+    offender = tmp_path / "leaky_policy.py"
+    offender.write_text(
+        "import requests\n"
+        "from ..eval.harness import walk_forward\n", encoding="utf-8")
+    found = imported_modules(offender)
+    assert found & FORBIDDEN_IN_EVALUATION == {"requests"}, (
+        "the network guard did not flag a deliberate `import requests`")
+    assert {m for m in found if m.lstrip(".") == "eval"}, (
+        "the arrow-direction guard did not flag a deliberate import of eval/")
+
+    clean = tmp_path / "clean_policy.py"
+    clean.write_text(
+        "import numpy as np\n"
+        "from ..agents.base import Proposal\n", encoding="utf-8")
+    assert not imported_modules(clean) & FORBIDDEN_IN_EVALUATION, (
+        "the guard flags a clean file, so it is not testing what it claims")
+
+    # And the data-layer rule, sabotaged the same way: the exact import the
+    # schema migration was one line away from needing.
+    upward = tmp_path / "leaky_migration.py"
+    upward.write_text(
+        "from ..agents.execution import BELGIAN_TOB_BANDS\n"
+        "from ..core.taxes import FRENCH_FTT_RATE\n", encoding="utf-8")
+    assert upward_imports(upward) == {"..agents"}, (
+        "the data-layer guard did not flag a deliberate import of agents/, or "
+        "flagged the core/ import it must allow")
 
 
 def test_data_layer_may_use_the_network_but_core_may_not():

@@ -144,3 +144,46 @@ class MarketDataProvider(abc.ABC):
     @abc.abstractmethod
     def quote(self, symbol: str) -> Quote:
         """Latest price, with its as-of timestamp and stated delay."""
+
+    def bars(self, symbol: str, start: dt.date | None = None, *,
+             period: str = "2y") -> pd.DataFrame:
+        """Open, high, low, close and volume per day, indexed by date.
+
+        `period` is how far back to reach when `start` is not given. The
+        spread survey asks for "max", because a spread is a microstructure
+        property of the instrument rather than of the holding period, and the
+        estimator's noise floor thins as the fourth root of the sample: on a
+        one-year window nothing under about 9 bps resolves, which is most of
+        a European ETF book.
+
+        `volume` is shares traded, and is here rather than in a separate call
+        because it arrives in the same response and because the spread survey
+        needs it: ranking instruments by estimated spread is only a check on
+        the wiring if there is an independent ordering to check it against,
+        and traded value is that ordering. It may be absent -- some venues
+        report no volume for some funds -- and absent is a valid answer.
+
+        Concrete rather than abstract so that a provider which cannot supply
+        intraday extremes stays a valid provider; it declines here instead of
+        failing to exist.
+
+        **Unadjusted, unlike `history`, and the difference is the point.**
+        `history` must be adjusted because a distribution read as a return
+        would inflate every volatility in the risk model. This must not be,
+        because it is consumed by `core.spread`, which asks two questions the
+        adjustment destroys:
+
+          * Was the open equal to the high? Adjustment multiplies every price
+            in a bar by the same factor, so it preserves ties within a bar --
+            but it also moves every price off the venue's tick grid, and the
+            grid is what `core.spread.infer_tick_size` reads to establish how
+            narrow a spread is even physically possible.
+          * How large was the bar's range relative to its level? Preserved.
+
+        The cost of using unadjusted prices is that an ex-dividend drop enters
+        the cross-bar returns as a real move. On a fund distributing 1.5% a
+        year that is four bars in five hundred, and it enters the estimator's
+        products against a de-meaned factor of random sign, so it adds
+        variance rather than bias. That is the cheaper of the two errors.
+        """
+        raise ProviderError(self.name, "does not supply open/high/low bars")

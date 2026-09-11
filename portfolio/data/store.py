@@ -30,6 +30,7 @@ import datetime as dt
 import enum
 import os
 import pathlib
+import sys
 from decimal import Decimal
 
 from ..core.models import (Amendment, AmendmentAction, AssetClass, Instrument,
@@ -59,9 +60,45 @@ def resolve_mode(explicit: str | DataMode | None = None) -> DataMode:
     return DataMode(os.environ.get(MODE_ENV_VAR, DataMode.SEED.value).strip().lower())
 
 
-INSTRUMENT_COLUMNS = ["isin", "name", "issuer", "asset_class", "base_currency",
-                      "primary_symbol", "exchange", "quote_currency",
-                      "provider_symbols", "active", "manual_overrides", "note"]
+# short_name is appended rather than inserted, and read with a default, so a
+# CSV written by an older build still loads: a blank short name means "derive
+# it from the legal name", which is what an absent column should mean too.
+INSTRUMENT_COLUMNS = ["isin", "name", "short_name", "issuer", "asset_class",
+                      "base_currency", "primary_symbol", "exchange",
+                      "quote_currency", "provider_symbols", "active",
+                      "manual_overrides", "note",
+                      # where it is held and what trading it costs; appended
+                      # so a CSV written by an older build still loads
+                      "broker", "tradeable", "tob_rate", "tob_observed",
+                      "half_spread_bps", "spread_observed", "buy_tax_rate",
+                      # the venue the trade executes on, the commission the
+                      # broker actually charged, and which of the three
+                      # evidence tiers the spread came from
+                      "venue", "commission", "commission_observed",
+                      "spread_source",
+                      # whether NEW money may go in, which is not the same
+                      # question as whether the weight can be rebalanced
+                      "buyable"]
+
+
+def _opt_float(raw: str | None) -> float | None:
+    """A blank cell means NOT RECORDED, which is not the same as zero.
+
+    A transaction tax read as 0.0 when the cell was empty would price every
+    trade in that instrument as tax-free -- a plausible number, silently
+    wrong, which is the failure mode this column exists to prevent.
+    """
+    text = (raw or "").strip()
+    return float(text) if text else None
+
+
+def _bool(raw: str | None, default: bool = False) -> bool:
+    text = (raw or "").strip().lower()
+    if not text:
+        return default
+    return text not in {"false", "0", "no"}
+
+
 TRANSACTION_COLUMNS = ["id", "date", "isin", "type", "quantity", "price_per_unit",
                        "currency", "fees", "note"]
 AMENDMENT_COLUMNS = ["id", "target_id", "action", "at", "reason"]
@@ -85,6 +122,12 @@ class DataStore:
     """CSV-backed store. Deliberately boring: the data must outlive the tool."""
     mode: DataMode = DataMode.SEED
     root: pathlib.Path = DEFAULT_ROOT
+
+    # Set by `load_instruments` when it had to migrate the file it read, so a
+    # caller can print what changed. Not a constructor argument and not part
+    # of the store's identity: it is a fact about the last read.
+    last_migration: object = dataclasses.field(default=None, init=False,
+                                               repr=False, compare=False)
 
     @classmethod
     def open(cls, mode: str | DataMode | None = None,
@@ -131,6 +174,7 @@ class DataStore:
                 inst = Instrument(
                     isin=row["isin"],
                     name=row["name"],
+                    short_name=row.get("short_name", "") or "",
                     issuer=row.get("issuer", ""),
                     asset_class=AssetClass(row.get("asset_class") or "ETF"),
                     base_currency=row.get("base_currency") or "EUR",
@@ -142,9 +186,56 @@ class DataStore:
                             not in {"false", "0", "no"}),
                     manual_overrides={f for f in (row.get("manual_overrides") or "").split("|") if f},
                     note=row.get("note", ""),
+                    broker=row.get("broker", "") or "",
+                    tradeable=_bool(row.get("tradeable"), default=True),
+                    buyable=_bool(row.get("buyable"), default=True),
+                    tob_rate=_opt_float(row.get("tob_rate")),
+                    tob_observed=_bool(row.get("tob_observed")),
+                    half_spread_bps=_opt_float(row.get("half_spread_bps")),
+                    spread_observed=_bool(row.get("spread_observed")),
+                    spread_source=row.get("spread_source", "") or "",
+                    buy_tax_rate=float(row.get("buy_tax_rate") or 0.0),
+                    venue=row.get("venue", "") or "",
+                    commission=_opt_float(row.get("commission")),
+                    commission_observed=_bool(row.get("commission_observed")),
                 )
                 out[inst.isin] = inst
+        if out:
+            self._migrate_instruments(out)
         return out
+
+    # The file this reads may predate the trading-cost columns. Left alone, a
+    # book like that loads with every tax rate NOT RECORDED, which makes every
+    # instrument unpriceable and every backtest impossible -- graceful loading
+    # and refusing to guess, each correct alone, composing into a tool that
+    # cannot run. See `migrations.py` for why the trigger is the header rather
+    # than a blank cell.
+    BACKUP_SUFFIX = ".before-trading-columns"
+
+    def _migrate_instruments(self, instruments: dict[str, Instrument]) -> None:
+        from .migrations import backfill_trading_facts, missing_columns
+
+        missing = missing_columns(self.instruments_path)
+        if not missing:
+            return
+        report = backfill_trading_facts(instruments, self.instruments_path,
+                                        fillable=set(missing))
+        backup = self.instruments_path.parent / (
+            self.instruments_path.name + self.BACKUP_SUFFIX)
+        try:
+            if not backup.exists():
+                backup.write_bytes(self.instruments_path.read_bytes())
+            self.save_instruments(instruments)
+        except OSError as exc:
+            # A read-only install directory must not stop the application
+            # starting. The derived values still apply for this run; they are
+            # simply derived again next time.
+            report = dataclasses.replace(report, persisted=False, backup=None,
+                                         error=f"{type(exc).__name__}: {exc}.")
+        else:
+            report = dataclasses.replace(report, backup=backup)
+        self.last_migration = report
+        print("\n".join(report.lines()), file=sys.stderr)
 
     def save_instruments(self, instruments: dict[str, Instrument]) -> None:
         """Reference data is rewritten wholesale -- unlike the ledger, it is a
@@ -155,7 +246,8 @@ class DataStore:
             w.writeheader()
             for inst in sorted(instruments.values(), key=lambda i: i.isin):
                 w.writerow({
-                    "isin": inst.isin, "name": inst.name, "issuer": inst.issuer,
+                    "isin": inst.isin, "name": inst.name,
+                    "short_name": inst.short_name, "issuer": inst.issuer,
                     "asset_class": inst.asset_class.value,
                     "base_currency": inst.base_currency,
                     "primary_symbol": inst.primary_symbol,
@@ -165,6 +257,21 @@ class DataStore:
                     "active": "true" if inst.active else "false",
                     "manual_overrides": "|".join(sorted(inst.manual_overrides)),
                     "note": inst.note.replace("\n", "; "),
+                    "broker": inst.broker,
+                    "tradeable": "true" if inst.tradeable else "false",
+                    "buyable": "true" if inst.buyable else "false",
+                    "tob_rate": "" if inst.tob_rate is None else inst.tob_rate,
+                    "tob_observed": "true" if inst.tob_observed else "false",
+                    "half_spread_bps": ("" if inst.half_spread_bps is None
+                                        else inst.half_spread_bps),
+                    "spread_observed": "true" if inst.spread_observed else "false",
+                    "spread_source": inst.spread_source,
+                    "buy_tax_rate": inst.buy_tax_rate,
+                    "venue": inst.venue,
+                    "commission": ("" if inst.commission is None
+                                   else inst.commission),
+                    "commission_observed": ("true" if inst.commission_observed
+                                            else "false"),
                 })
 
     # -- ledger ------------------------------------------------------------
